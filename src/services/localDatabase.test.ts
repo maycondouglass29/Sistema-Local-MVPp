@@ -22,6 +22,19 @@ test('LocalDatabaseService atomic scan commit writes event and outbox item', () 
   assert.equal(res.allowed, true);
   assert.ok(res.student);
 
+  // Test compound ESCHZ token format for simulated badges & scanners
+  const resEschz = db.resolveScanInput('ESCHZ:V1:stu_006:2024-006', 'entry', 'qr');
+  assert.ok(resEschz.student, 'Student stu_006 should be found via compound token');
+  assert.equal(resEschz.student.enrollment_code, '2024-006');
+  assert.equal(resEschz.allowed, false, 'Inactive student access should be denied by business rule');
+  assert.match(resEschz.message, /inativa/i);
+
+  // Test numeric barcode matching
+  const resBarcode = db.resolveScanInput('2024001', 'entry', 'barcode');
+  assert.ok(resBarcode.student, 'Student should be found by digits barcode');
+  assert.equal(resBarcode.student.enrollment_code, '2024-001');
+  assert.equal(resBarcode.allowed, true);
+
   // Commit scan
   const event = db.commitAttendanceScan(res.student.id, 'entry', 'enrollment', '2024-001');
   assert.equal(event.student_id, res.student.id);

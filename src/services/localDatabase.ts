@@ -168,6 +168,20 @@ function generateSeedData(): DatabaseSchema {
       active: 1,
       issued_at: nowIso,
     });
+
+    // Also register legacy / institutional ESCHZ format for hardware scanners & simulators
+    const institutionalToken = `ESCHZ:V1:${studentId}:${raw.code}`;
+    student_identifiers.push({
+      id: `ident_eschz_${String(idx + 1).padStart(3, '0')}`,
+      school_id: school.id,
+      student_id: studentId,
+      kind: 'qr',
+      value_hash: hashValue(institutionalToken),
+      value_last4: institutionalToken.slice(-6),
+      raw_token: institutionalToken,
+      active: 1,
+      issued_at: nowIso,
+    });
   });
 
   // Seed sample morning attendance events (in the past today)
@@ -549,10 +563,60 @@ export class LocalDatabaseService {
     // 3. If still not found, search by direct student_id or raw token string match
     if (!detectedStudent) {
       detectedIdentifier = this.data.student_identifiers.find(
-        (i) => i.raw_token === cleanInput && i.active === 1
+        (i) => (i.raw_token === cleanInput || i.value_hash === hashValue(cleanInput)) && i.active === 1
       );
       if (detectedIdentifier) {
         detectedStudent = this.data.students.find((s) => s.id === detectedIdentifier?.student_id);
+      }
+    }
+
+    // 4. Try parsing compound token formats (e.g. "ESCHZ:V1:stu_006:2024-006" or tokens separated by ':')
+    if (!detectedStudent && cleanInput.includes(':')) {
+      const parts = cleanInput.split(':').map((p) => p.trim());
+      // Check if any part matches student ID (e.g. stu_006)
+      for (const part of parts) {
+        if (!part) continue;
+        const byId = this.data.students.find(
+          (s) => s.id.toLowerCase() === part.toLowerCase() && !s.deleted_at
+        );
+        if (byId) {
+          detectedStudent = byId;
+          detectedIdentifier = this.getActiveIdentifier(byId.id);
+          break;
+        }
+        // Check if any part matches enrollment code (e.g. 2024-006)
+        const byCode = this.data.students.find(
+          (s) => s.enrollment_code.toLowerCase() === part.toLowerCase() && !s.deleted_at
+        );
+        if (byCode) {
+          detectedStudent = byCode;
+          detectedIdentifier = this.getActiveIdentifier(byCode.id);
+          break;
+        }
+      }
+    }
+
+    // 5. Try direct match by student ID (e.g. "stu_001")
+    if (!detectedStudent) {
+      const byId = this.data.students.find(
+        (s) => s.id.toLowerCase() === cleanInput.toLowerCase() && !s.deleted_at
+      );
+      if (byId) {
+        detectedStudent = byId;
+        detectedIdentifier = this.getActiveIdentifier(byId.id);
+      }
+    }
+
+    // 6. Try numeric barcode matching (e.g. "2024001" against "2024-001")
+    if (!detectedStudent && /^\d+$/.test(cleanInput)) {
+      const digitsOnly = cleanInput;
+      const byNumeric = this.data.students.find(
+        (s) => s.enrollment_code.replace(/\D/g, '') === digitsOnly && !s.deleted_at
+      );
+      if (byNumeric) {
+        detectedStudent = byNumeric;
+        source = 'barcode';
+        detectedIdentifier = this.getActiveIdentifier(byNumeric.id);
       }
     }
 

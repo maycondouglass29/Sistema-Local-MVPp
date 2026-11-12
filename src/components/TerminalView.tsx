@@ -520,10 +520,43 @@ export const TerminalView: React.FC = () => {
   const students = localDb.getStudents();
 
   const demoBadges = [
-    { code: '2024-001', name: 'Lucas Silva Santos', class: '1º Ano A', desc: 'Ativo • Avó autorizada a buscar', token: 'ESCHZ:V1:stu_001:2024-001' },
-    { code: '2024-004', name: 'Mariana Duarte Souza', class: '1º Ano A', desc: 'Alerta médico: Alergia severa a amendoim', token: 'ESCHZ:V1:stu_004:2024-004' },
-    { code: '2024-003', name: 'Gabriel Rodrigues Lima', class: '1º Ano A', desc: 'Bloqueado: Suspensão temporária', isBlocked: true, token: 'ESCHZ:V1:stu_003:2024-003' },
-    { code: '2024-006', name: 'Sophia Martins Castro', class: '2º Ano B', desc: 'Matrícula inativa / Transferência', isInactive: true, token: 'ESCHZ:V1:stu_006:2024-006' },
+    {
+      code: '2024-001',
+      name: 'Lucas Silva Santos',
+      class: '1º Ano A',
+      desc: 'Ativo • Acesso normal de portaria',
+      token: localDb.getActiveIdentifier('stu_001')?.raw_token || 'ESCHZ:V1:stu_001:2024-001',
+    },
+    {
+      code: '2024-004',
+      name: 'Mariana Duarte Souza',
+      class: '1º Ano A',
+      desc: 'Alerta médico: Alergia severa a amendoim',
+      token: localDb.getActiveIdentifier('stu_004')?.raw_token || 'ESCHZ:V1:stu_004:2024-004',
+    },
+    {
+      code: '2024-003',
+      name: 'Gabriel Rodrigues Lima',
+      class: '1º Ano A',
+      desc: 'Bloqueado: Suspensão temporária / Coordenação',
+      isBlocked: true,
+      token: localDb.getActiveIdentifier('stu_003')?.raw_token || 'ESCHZ:V1:stu_003:2024-003',
+    },
+    {
+      code: '2024-006',
+      name: 'Sophia Martins Castro',
+      class: '2º Ano B',
+      desc: 'Matrícula inativa / Transferência em andamento',
+      isInactive: true,
+      token: localDb.getActiveIdentifier('stu_006')?.raw_token || 'ESCHZ:V1:stu_006:2024-006',
+    },
+    {
+      code: '2024-002',
+      name: 'Beatriz Almeida Costa',
+      class: '1º Ano A',
+      desc: 'Ativo • Retirada autorizada pelo responsável',
+      token: localDb.getActiveIdentifier('stu_002')?.raw_token || 'ESCHZ:V1:stu_002:2024-002',
+    },
   ];
 
   const isEntry = eventType === 'entry';
