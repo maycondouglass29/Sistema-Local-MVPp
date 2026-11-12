@@ -63,6 +63,9 @@ export const AttendanceHistoryView: React.FC = () => {
   // A4 Printable Report Options
   const [includeSignatures, setIncludeSignatures] = useState<boolean>(true);
   const [includeNotes, setIncludeNotes] = useState<boolean>(true);
+  const [includeClassBreakdown, setIncludeClassBreakdown] = useState<boolean>(true);
+  const [includeHourlyDistribution, setIncludeHourlyDistribution] = useState<boolean>(true);
+  const [includeStudentSummary, setIncludeStudentSummary] = useState<boolean>(true);
   const [reportOrientation, setReportOrientation] = useState<'portrait' | 'landscape'>('portrait');
 
   // Manual Attendance Form State
@@ -1319,419 +1322,513 @@ export const AttendanceHistoryView: React.FC = () => {
         </div>
       )}
 
-      {/* MODAL 4: Relatório Oficial de Frequência para Impressão A4 */}
-      {showPdfModal && (
-        <div className="fixed inset-0 bg-neutral-900/70 backdrop-blur-xs z-50 flex flex-col items-center justify-start p-2 sm:p-4 overflow-y-auto print:p-0 print:bg-white print:overflow-visible">
-          {/* Estilos calibrados para impressão A4 */}
-          <style>{`
-            @media print {
-              body * {
-                visibility: hidden !important;
-              }
-              #printable-attendance-report, #printable-attendance-report * {
-                visibility: visible !important;
-              }
-              #printable-attendance-report {
-                position: absolute !important;
-                left: 0 !important;
-                top: 0 !important;
-                width: 100% !important;
-                max-width: none !important;
-                margin: 0 !important;
-                padding: 8mm 12mm !important;
-                box-shadow: none !important;
-                border: none !important;
-                background: white !important;
-                color: #111827 !important;
-              }
-              @page {
-                size: ${reportOrientation === 'landscape' ? 'A4 landscape' : 'A4 portrait'};
-                margin: 8mm 10mm;
-              }
-              .print-hide {
-                display: none !important;
-              }
-              table {
-                width: 100% !important;
-                border-collapse: collapse !important;
-                page-break-inside: auto !important;
-              }
-              tr {
-                page-break-inside: avoid !important;
-                page-break-after: auto !important;
-              }
-              thead {
-                display: table-header-group !important;
-              }
-              tfoot {
-                display: table-footer-group !important;
-              }
-              th, td {
-                border: 1px solid #d1d5db !important;
-              }
-            }
-          `}</style>
+      {/* MODAL 4: Relatório Oficial de Frequência para Impressão A4 — Versão Elaborada */}
+      {showPdfModal && (() => {
+        // Dados analíticos computados para o relatório
+        const uniqueStudentIds = new Set(filteredEvents.map((e) => e.student_id));
 
-          {/* Barra de Ferramentas Superior (Oculta na Impressão) */}
-          <div className="print-hide bg-white rounded-t-xl border border-neutral-300 border-b-0 max-w-4xl w-full p-4 flex flex-wrap items-center justify-between gap-3 shadow-lg shrink-0">
-            <div className="flex items-center gap-2.5">
-              <div className="w-8 h-8 rounded-lg bg-[#0f766e]/10 text-[#0f766e] flex items-center justify-center">
-                <FileText className="w-4 h-4" />
+        // Quebra por turma
+        const classSummary = classrooms
+          .map((cls) => {
+            const clsEvents = filteredEvents.filter((ev) => {
+              const stu = students.find((s) => s.id === ev.student_id);
+              return stu?.class_id === cls.id;
+            });
+            const clsStudents = new Set(clsEvents.map((ev) => ev.student_id));
+            const totalEnrolled = students.filter((s) => s.class_id === cls.id).length;
+            return {
+              name: cls.name,
+              totalEvents: clsEvents.length,
+              entries: clsEvents.filter((e) => e.event_type === 'entry').length,
+              exits: clsEvents.filter((e) => e.event_type === 'exit').length,
+              corrections: clsEvents.filter((e) => e.event_type === 'correction').length,
+              uniqueStudents: clsStudents.size,
+              totalEnrolled,
+              presenceRate: totalEnrolled > 0 ? Math.round((clsStudents.size / totalEnrolled) * 100) : 0,
+            };
+          })
+          .filter((c) => c.totalEvents > 0);
+
+        // Distribuição horária (blocos de 1 hora)
+        const hourlyBuckets: Record<number, { entries: number; exits: number }> = {};
+        filteredEvents.forEach((ev) => {
+          const h = new Date(ev.occurred_at_device).getHours();
+          if (!hourlyBuckets[h]) hourlyBuckets[h] = { entries: 0, exits: 0 };
+          if (ev.event_type === 'entry') hourlyBuckets[h].entries++;
+          else if (ev.event_type === 'exit') hourlyBuckets[h].exits++;
+        });
+        const hourlyRows = Object.entries(hourlyBuckets)
+          .sort(([a], [b]) => Number(a) - Number(b))
+          .map(([h, v]) => ({ hour: Number(h), ...v, total: v.entries + v.exits }));
+        const maxHourly = Math.max(...hourlyRows.map((r) => r.total), 1);
+
+        // Resumo por aluno
+        const studentSummary = Array.from(uniqueStudentIds).map((sid) => {
+          const stu = students.find((s) => s.id === sid);
+          const cls = stu ? classrooms.find((c) => c.id === stu.class_id) : null;
+          const stuEvents = filteredEvents.filter((ev) => ev.student_id === sid);
+          const firstEntry = stuEvents
+            .filter((ev) => ev.event_type === 'entry')
+            .sort((a, b) => a.occurred_at_device.localeCompare(b.occurred_at_device))[0];
+          const lastExit = stuEvents
+            .filter((ev) => ev.event_type === 'exit')
+            .sort((a, b) => b.occurred_at_device.localeCompare(a.occurred_at_device))[0];
+          return {
+            name: stu?.full_name || 'Desconhecido',
+            enrollment: stu?.enrollment_code || '—',
+            className: cls?.name || 'Geral',
+            entries: stuEvents.filter((ev) => ev.event_type === 'entry').length,
+            exits: stuEvents.filter((ev) => ev.event_type === 'exit').length,
+            corrections: stuEvents.filter((ev) => ev.event_type === 'correction').length,
+            firstEntry: firstEntry ? new Date(firstEntry.occurred_at_device).toLocaleTimeString('pt-BR') : '—',
+            lastExit: lastExit ? new Date(lastExit.occurred_at_device).toLocaleTimeString('pt-BR') : '—',
+          };
+        }).sort((a, b) => a.className.localeCompare(b.className) || a.name.localeCompare(b.name));
+
+        const protocolNumber = `REL-FREQ-${todayIso.replace(/-/g, '')}-${filteredEvents.length.toString().padStart(3, '0')}`;
+
+        return (
+          <div className="fixed inset-0 bg-neutral-900/70 backdrop-blur-xs z-50 flex flex-col items-center justify-start p-2 sm:p-4 overflow-y-auto print:p-0 print:bg-white print:overflow-visible">
+            {/* Estilos calibrados para impressão A4 */}
+            <style>{`
+              @media print {
+                body * { visibility: hidden !important; }
+                #printable-attendance-report, #printable-attendance-report * { visibility: visible !important; }
+                #printable-attendance-report {
+                  position: absolute !important;
+                  left: 0 !important; top: 0 !important;
+                  width: 100% !important; max-width: none !important;
+                  margin: 0 !important; padding: 10mm 12mm !important;
+                  box-shadow: none !important; border: none !important;
+                  background: white !important; color: #111827 !important;
+                }
+                @page {
+                  size: ${reportOrientation === 'landscape' ? 'A4 landscape' : 'A4 portrait'};
+                  margin: 10mm 12mm;
+                }
+                .print-hide { display: none !important; }
+                .print-break-before { page-break-before: always !important; }
+                .print-avoid-break { page-break-inside: avoid !important; }
+                table { width: 100% !important; border-collapse: collapse !important; }
+                tr { page-break-inside: avoid !important; page-break-after: auto !important; }
+                thead { display: table-header-group !important; }
+                tfoot { display: table-footer-group !important; }
+                th, td { border: 1px solid #d1d5db !important; }
+                .bar-chart-cell { background: #e5e7eb !important; }
+                .bar-entry { background: #065f46 !important; }
+                .bar-exit { background: #92400e !important; }
+              }
+            `}</style>
+
+            {/* ── Barra de Ferramentas Superior (oculta na impressão) ── */}
+            <div className="print-hide bg-white rounded-t-xl border border-neutral-300 border-b-0 max-w-5xl w-full p-3 flex flex-wrap items-center justify-between gap-3 shadow-lg shrink-0">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-[#0f766e]/10 text-[#0f766e] flex items-center justify-center shrink-0">
+                  <FileText className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-semibold text-neutral-900 text-sm">Relatório Oficial de Frequência (A4)</h3>
+                  <p className="text-[11px] text-neutral-500">Protocolo {protocolNumber}</p>
+                </div>
               </div>
-              <div>
-                <h3 className="font-semibold text-neutral-900 text-sm">
-                  Relatório Oficial de Frequência (Folha A4)
-                </h3>
-                <p className="text-[11px] text-neutral-500">
-                  Pré-visualização fiel do documento pronto para impressão ou PDF
-                </p>
+
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                {/* Orientação */}
+                <div className="flex items-center bg-neutral-100 rounded-lg p-0.5 border border-neutral-200">
+                  {(['portrait', 'landscape'] as const).map((o) => (
+                    <button key={o} type="button" onClick={() => setReportOrientation(o)}
+                      className={`px-2.5 py-1 rounded text-xs font-medium cursor-pointer transition-colors ${reportOrientation === o ? 'bg-white text-neutral-900 font-semibold shadow-2xs' : 'text-neutral-600 hover:text-neutral-900'}`}>
+                      {o === 'portrait' ? 'Retrato' : 'Paisagem'}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Checkboxes de seções */}
+                {[
+                  { label: 'Assinaturas', state: includeSignatures, set: setIncludeSignatures },
+                  { label: 'Observações', state: includeNotes, set: setIncludeNotes },
+                  { label: 'Por Turma', state: includeClassBreakdown, set: setIncludeClassBreakdown },
+                  { label: 'Horários', state: includeHourlyDistribution, set: setIncludeHourlyDistribution },
+                  { label: 'Por Aluno', state: includeStudentSummary, set: setIncludeStudentSummary },
+                ].map(({ label, state, set }) => (
+                  <label key={label} className="flex items-center gap-1 cursor-pointer text-neutral-700 select-none">
+                    <input type="checkbox" checked={state} onChange={(e) => set(e.target.checked)}
+                      className="rounded text-[#0f766e] focus:ring-0 w-3 h-3" />
+                    <span>{label}</span>
+                  </label>
+                ))}
+
+                <div className="flex items-center gap-2 border-l border-neutral-200 pl-2">
+                  <button type="button" onClick={() => setShowPdfModal(false)}
+                    className="px-3 py-1.5 rounded-lg border border-neutral-300 text-neutral-700 hover:bg-neutral-50 font-medium cursor-pointer text-xs">
+                    Fechar
+                  </button>
+                  <button type="button" onClick={() => window.print()}
+                    className="px-4 py-1.5 rounded-lg bg-[#0f766e] hover:bg-[#0d5f59] text-white font-medium flex items-center gap-1.5 cursor-pointer shadow-xs text-xs">
+                    <Printer className="w-3.5 h-3.5" />
+                    Imprimir / PDF
+                  </button>
+                </div>
               </div>
             </div>
 
-            {/* Controles de Configuração da Folha */}
-            <div className="flex flex-wrap items-center gap-3 text-xs">
-              <div className="flex items-center bg-neutral-100 rounded-lg p-0.5 border border-neutral-200">
-                <button
-                  type="button"
-                  onClick={() => setReportOrientation('portrait')}
-                  className={`px-2.5 py-1 rounded text-xs font-medium cursor-pointer transition-colors ${
-                    reportOrientation === 'portrait'
-                      ? 'bg-white text-neutral-900 font-semibold shadow-2xs'
-                      : 'text-neutral-600 hover:text-neutral-900'
-                  }`}
-                >
-                  Retrato (A4)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setReportOrientation('landscape')}
-                  className={`px-2.5 py-1 rounded text-xs font-medium cursor-pointer transition-colors ${
-                    reportOrientation === 'landscape'
-                      ? 'bg-white text-neutral-900 font-semibold shadow-2xs'
-                      : 'text-neutral-600 hover:text-neutral-900'
-                  }`}
-                >
-                  Paisagem (A4)
-                </button>
-              </div>
+            {/* ── Folha A4 Documento ── */}
+            <div className="bg-neutral-200/90 p-4 sm:p-6 w-full max-w-5xl flex justify-center rounded-b-xl border border-neutral-300 border-t-0 shadow-lg overflow-y-auto max-h-[calc(90vh-70px)] print:bg-white print:p-0 print:border-none print:shadow-none print:max-h-none print:max-w-none">
+              <div
+                id="printable-attendance-report"
+                className={`bg-white text-neutral-900 shadow-md border border-neutral-300 w-full px-10 py-8 space-y-5 ${
+                  reportOrientation === 'landscape' ? 'max-w-[297mm] min-h-[210mm]' : 'max-w-[210mm] min-h-[297mm]'
+                }`}
+                style={{ fontFamily: "'Arial', 'Helvetica Neue', sans-serif" }}
+              >
 
-              <label className="flex items-center gap-1.5 cursor-pointer text-neutral-700 select-none">
-                <input
-                  type="checkbox"
-                  checked={includeSignatures}
-                  onChange={(e) => setIncludeSignatures(e.target.checked)}
-                  className="rounded text-[#0f766e] focus:ring-0"
-                />
-                <span>Assinaturas formais</span>
-              </label>
-
-              <label className="flex items-center gap-1.5 cursor-pointer text-neutral-700 select-none">
-                <input
-                  type="checkbox"
-                  checked={includeNotes}
-                  onChange={(e) => setIncludeNotes(e.target.checked)}
-                  className="rounded text-[#0f766e] focus:ring-0"
-                />
-                <span>Observações</span>
-              </label>
-
-              <div className="flex items-center gap-2 border-l border-neutral-200 pl-3">
-                <button
-                  type="button"
-                  onClick={() => setShowPdfModal(false)}
-                  className="px-3 py-1.5 rounded-lg border border-neutral-300 text-neutral-700 hover:bg-neutral-50 font-medium cursor-pointer"
-                >
-                  Fechar
-                </button>
-                <button
-                  type="button"
-                  onClick={() => window.print()}
-                  className="px-4 py-1.5 rounded-lg bg-[#0f766e] hover:bg-[#0d5f59] text-white font-medium flex items-center gap-1.5 cursor-pointer shadow-xs"
-                >
-                  <Printer className="w-3.5 h-3.5" />
-                  <span>Imprimir (A4 / PDF)</span>
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {/* Área de Visualização da Folha A4 */}
-          <div className="bg-neutral-200/90 p-4 sm:p-6 w-full max-w-4xl flex justify-center rounded-b-xl border border-neutral-300 border-t-0 shadow-lg overflow-y-auto max-h-[calc(90vh-80px)] print:bg-white print:p-0 print:border-none print:shadow-none print:max-h-none print:max-w-none">
-            {/* Folha A4 Documento */}
-            <div
-              id="printable-attendance-report"
-              className={`bg-white text-neutral-900 shadow-md border border-neutral-300 w-full p-8 sm:p-10 space-y-6 ${
-                reportOrientation === 'landscape'
-                  ? 'max-w-[297mm] min-h-[210mm]'
-                  : 'max-w-[210mm] min-h-[297mm]'
-              }`}
-            >
-              {/* 1. Cabeçalho Oficial Escolar */}
-              <div className="border-b-2 border-neutral-800 pb-4">
-                <div className="flex items-start justify-between gap-4">
-                  <div className="flex items-center gap-3">
-                    <div className="w-12 h-12 rounded-lg bg-neutral-900 text-white flex items-center justify-center font-bold text-base tracking-wider shrink-0">
-                      EH
-                    </div>
-                    <div>
-                      <h2 className="text-lg font-bold text-neutral-900 tracking-tight uppercase">
-                        {school.name}
-                      </h2>
-                      <div className="text-xs text-neutral-600 font-medium">
-                        Portaria Escolar Local-First &bull; Sistema de Controle de Acesso e Segurança
+                {/* ════ SEÇÃO 1 — CABEÇALHO INSTITUCIONAL ════ */}
+                <div className="border-b-2 border-[#142024] pb-4 print-avoid-break">
+                  <div className="flex items-start justify-between gap-4">
+                    {/* Logo + nome */}
+                    <div className="flex items-center gap-3">
+                      <div className="w-14 h-14 rounded bg-[#142024] text-white flex items-center justify-center font-black text-xl tracking-widest shrink-0">
+                        EH
                       </div>
-                      <div className="text-[10px] text-neutral-400 font-mono mt-0.5">
-                        CNPJ: 12.345.678/0001-90 &bull; Rua das Acácias, 150 &bull; São Paulo, SP
+                      <div>
+                        <div className="text-[9px] font-semibold text-neutral-500 uppercase tracking-widest mb-0.5">
+                          Documento Oficial — Uso Interno Restrito
+                        </div>
+                        <h2 className="text-base font-black text-neutral-900 tracking-tight uppercase leading-tight">
+                          {school.name}
+                        </h2>
+                        <div className="text-[10px] text-neutral-600 mt-0.5">
+                          Portaria Escolar Local-First &bull; Controle de Acesso e Movimentação
+                        </div>
+                        <div className="text-[9px] text-neutral-400 font-mono mt-0.5">
+                          CNPJ: 12.345.678/0001-90 &bull; Rua das Acácias, 150, São Paulo — SP &bull; Tel: (11) 3000-0000
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Metadados do documento */}
+                    <div className="text-[9px] font-mono border border-neutral-300 bg-neutral-50 px-3 py-2 rounded space-y-1 shrink-0 text-right">
+                      <div className="text-[8px] text-neutral-500 uppercase font-bold tracking-wider">Protocolo</div>
+                      <div className="font-black text-neutral-900 text-[11px]">{protocolNumber}</div>
+                      <div className="border-t border-neutral-200 pt-1 space-y-0.5 text-neutral-600">
+                        <div>Emitido em: <strong>{new Date().toLocaleString('pt-BR')}</strong></div>
+                        <div>Emitido por: <strong>{currentOperator.name}</strong></div>
+                        <div>Perfil: <strong>{currentOperator.role.toUpperCase()}</strong></div>
+                        <div>Matrícula OP: <strong>{currentOperator.badge_number || '—'}</strong></div>
                       </div>
                     </div>
                   </div>
 
-                  <div className="text-right text-[11px] font-mono border border-neutral-200 bg-neutral-50 p-2.5 rounded-lg space-y-0.5 shrink-0">
-                    <div>
-                      <strong className="text-neutral-500 uppercase text-[9px] block">Protocolo:</strong>
-                      <span className="font-semibold text-neutral-900">
-                        REL-FREQ-{todayIso.replace(/-/g, '')}-{filteredEvents.length.toString().padStart(3, '0')}
-                      </span>
+                  {/* Faixa título */}
+                  <div className="mt-3 bg-[#142024] text-white px-3 py-2 rounded flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase tracking-widest">
+                      Relatório de Frequência e Movimentação de Portaria
+                    </span>
+                    <span className="text-[9px] font-mono opacity-70">
+                      {datePreset === 'today' ? 'HOJE' : datePreset === 'yesterday' ? 'ONTEM' : datePreset === 'week' ? 'ÚLTIMOS 7 DIAS' : datePreset === 'month' ? 'ESTE MÊS' : 'PERÍODO PERSONALIZADO'}
+                    </span>
+                  </div>
+                </div>
+
+                {/* ════ SEÇÃO 2 — PARÂMETROS DO RELATÓRIO ════ */}
+                <div className="print-avoid-break">
+                  <div className="text-[9px] font-bold uppercase tracking-widest text-neutral-500 mb-1.5">
+                    § 1 — Parâmetros e Critérios de Filtragem
+                  </div>
+                  <div className="grid grid-cols-4 gap-px bg-neutral-300 border border-neutral-300 rounded overflow-hidden text-[10px]">
+                    {[
+                      { label: 'Data Inicial', value: startDate ? new Date(`${startDate}T00:00:00`).toLocaleDateString('pt-BR') : 'Início do histórico' },
+                      { label: 'Data Final', value: endDate ? new Date(`${endDate}T00:00:00`).toLocaleDateString('pt-BR') : new Date().toLocaleDateString('pt-BR') },
+                      { label: 'Turma / Série', value: classFilter === 'all' ? 'Todas as turmas' : classrooms.find((c) => c.id === classFilter)?.name || 'Geral' },
+                      { label: 'Tipo de Evento', value: typeFilter === 'all' ? 'Todos os tipos' : typeFilter === 'entry' ? 'Apenas entradas' : typeFilter === 'exit' ? 'Apenas saídas' : 'Apenas retificações' },
+                    ].map(({ label, value }) => (
+                      <div key={label} className="bg-white px-2 py-2">
+                        <div className="text-[8px] text-neutral-500 uppercase font-bold tracking-wide">{label}</div>
+                        <div className="font-semibold text-neutral-900 mt-0.5">{value}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* ════ SEÇÃO 3 — INDICADORES EXECUTIVOS (KPIs) ════ */}
+                <div className="print-avoid-break">
+                  <div className="text-[9px] font-bold uppercase tracking-widest text-neutral-500 mb-1.5">
+                    § 2 — Quadro de Indicadores Consolidados
+                  </div>
+                  <div className="grid grid-cols-5 gap-px bg-neutral-300 border border-neutral-300 rounded overflow-hidden">
+                    {[
+                      { label: 'Total de Registros', value: summaryStats.totalRecords, color: 'text-neutral-900', bg: 'bg-neutral-50' },
+                      { label: 'Entradas (Check-in)', value: summaryStats.totalEntries, color: 'text-emerald-800', bg: 'bg-emerald-50' },
+                      { label: 'Saídas (Check-out)', value: summaryStats.totalExits, color: 'text-amber-800', bg: 'bg-amber-50' },
+                      { label: 'Retificações RF-05', value: summaryStats.totalCorrections, color: 'text-neutral-600', bg: 'bg-neutral-50' },
+                      { label: 'Alunos Presentes', value: uniqueStudentIds.size, color: 'text-[#0f766e]', bg: 'bg-teal-50' },
+                    ].map(({ label, value, color, bg }) => (
+                      <div key={label} className={`${bg} px-2 py-2.5 text-center`}>
+                        <div className="text-[8px] text-neutral-500 uppercase font-bold tracking-wide leading-tight">{label}</div>
+                        <div className={`text-2xl font-black font-mono ${color} mt-1 leading-none`}>{value}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* ════ SEÇÃO 4 — ANÁLISE POR TURMA ════ */}
+                {includeClassBreakdown && classSummary.length > 0 && (
+                  <div className="print-avoid-break">
+                    <div className="text-[9px] font-bold uppercase tracking-widest text-neutral-500 mb-1.5">
+                      § 3 — Distribuição por Turma / Série
                     </div>
-                    <div className="text-neutral-500 pt-0.5">
-                      Emissão: <strong>{new Date().toLocaleString('pt-BR')}</strong>
-                    </div>
-                    <div className="text-neutral-500">
-                      Operador: <strong>{currentOperator.name}</strong> ({currentOperator.role.toUpperCase()})
-                    </div>
-                  </div>
-                </div>
-
-                {/* Banner do Título */}
-                <div className="mt-4 pt-3 border-t border-neutral-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                  <h1 className="text-sm font-bold text-neutral-900 tracking-wide uppercase">
-                    Relatório Oficial de Frequência e Movimentação de Portaria
-                  </h1>
-                  <span className="text-xs font-mono text-neutral-500">
-                    Filtro: {datePreset === 'today' ? 'Hoje' : datePreset === 'yesterday' ? 'Ontem' : datePreset === 'week' ? 'Últimos 7 dias' : datePreset === 'month' ? 'Este mês' : 'Personalizado'}
-                  </span>
-                </div>
-              </div>
-
-              {/* 2. Parâmetros e Filtros Apurados */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] bg-neutral-50 border border-neutral-200 p-2.5 rounded-lg">
-                <div>
-                  <span className="text-neutral-500 block text-[10px] uppercase font-semibold">Período Apurado</span>
-                  <span className="font-medium text-neutral-900">
-                    {startDate ? new Date(`${startDate}T00:00:00`).toLocaleDateString('pt-BR') : 'Início'} até{' '}
-                    {endDate ? new Date(`${endDate}T00:00:00`).toLocaleDateString('pt-BR') : 'Hoje'}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-neutral-500 block text-[10px] uppercase font-semibold">Turma Filtrada</span>
-                  <span className="font-medium text-neutral-900">
-                    {classFilter === 'all'
-                      ? 'Todas as Turmas'
-                      : classrooms.find((c) => c.id === classFilter)?.name || 'Geral'}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-neutral-500 block text-[10px] uppercase font-semibold">Tipo de Registro</span>
-                  <span className="font-medium text-neutral-900">
-                    {typeFilter === 'all'
-                      ? 'Todos (Entradas e Saídas)'
-                      : typeFilter === 'entry'
-                      ? 'Apenas Entradas'
-                      : typeFilter === 'exit'
-                      ? 'Apenas Saídas'
-                      : 'Apenas Retificações'}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-neutral-500 block text-[10px] uppercase font-semibold">Total Consolidado</span>
-                  <span className="font-medium text-neutral-900 font-mono">
-                    {filteredEvents.length} registro(s)
-                  </span>
-                </div>
-              </div>
-
-              {/* 3. Quadro Executivo de Indicadores (KPIs no A4) */}
-              <div className="grid grid-cols-5 gap-2 text-center border border-neutral-300 rounded-lg p-2.5 bg-neutral-50/50">
-                <div className="p-1 border-r border-neutral-200">
-                  <div className="text-[10px] text-neutral-500 uppercase font-semibold">Total Geral</div>
-                  <div className="text-lg font-bold font-mono text-neutral-900 mt-0.5">
-                    {summaryStats.totalRecords}
-                  </div>
-                </div>
-                <div className="p-1 border-r border-neutral-200">
-                  <div className="text-[10px] text-neutral-500 uppercase font-semibold">Entradas</div>
-                  <div className="text-lg font-bold font-mono text-emerald-800 mt-0.5">
-                    {summaryStats.totalEntries}
-                  </div>
-                </div>
-                <div className="p-1 border-r border-neutral-200">
-                  <div className="text-[10px] text-neutral-500 uppercase font-semibold">Saídas</div>
-                  <div className="text-lg font-bold font-mono text-amber-800 mt-0.5">
-                    {summaryStats.totalExits}
-                  </div>
-                </div>
-                <div className="p-1 border-r border-neutral-200">
-                  <div className="text-[10px] text-neutral-500 uppercase font-semibold">Retificações</div>
-                  <div className="text-lg font-bold font-mono text-neutral-700 mt-0.5">
-                    {summaryStats.totalCorrections}
-                  </div>
-                </div>
-                <div className="p-1">
-                  <div className="text-[10px] text-neutral-500 uppercase font-semibold">Alunos Únicos</div>
-                  <div className="text-lg font-bold font-mono text-[#0f766e] mt-0.5">
-                    {new Set(filteredEvents.map((e) => e.student_id)).size}
-                  </div>
-                </div>
-              </div>
-
-              {/* 4. Tabela Analítica Completa para Análise de Dados */}
-              <div className="space-y-1.5">
-                <div className="text-xs font-semibold text-neutral-800 uppercase tracking-wide flex items-center justify-between">
-                  <span>Listagem Analítica de Ocorrências</span>
-                  <span className="text-[10px] font-mono text-neutral-400">
-                    Ordem cronológica reversa
-                  </span>
-                </div>
-
-                <table className="w-full text-left text-[11px] border border-neutral-300">
-                  <thead className="bg-neutral-100 text-neutral-700 border-b border-neutral-300 font-semibold uppercase text-[10px]">
-                    <tr>
-                      <th className="py-1.5 px-2 text-center w-8">#</th>
-                      <th className="py-1.5 px-2.5">Horário / Data</th>
-                      <th className="py-1.5 px-2.5">Matrícula</th>
-                      <th className="py-1.5 px-3">Estudante</th>
-                      <th className="py-1.5 px-2.5">Turma</th>
-                      <th className="py-1.5 px-2 text-center">Movimento</th>
-                      <th className="py-1.5 px-2 text-center">Origem</th>
-                      <th className="py-1.5 px-2">Operador</th>
-                      {includeNotes && (
-                        <th className="py-1.5 px-3">Observação / Justificativa</th>
-                      )}
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-neutral-200">
-                    {filteredEvents.length === 0 ? (
-                      <tr>
-                        <td
-                          colSpan={includeNotes ? 9 : 8}
-                          className="py-8 text-center text-neutral-400 italic"
-                        >
-                          Nenhum evento registrado no intervalo selecionado.
-                        </td>
-                      </tr>
-                    ) : (
-                      filteredEvents.map((ev, index) => {
-                        const stu = students.find((s) => s.id === ev.student_id);
-                        const c = stu ? classrooms.find((cl) => cl.id === stu.class_id) : null;
-                        const isEntry = ev.event_type === 'entry';
-                        const isExit = ev.event_type === 'exit';
-
-                        return (
-                          <tr
-                            key={ev.id}
-                            className={`h-8 ${index % 2 === 1 ? 'bg-neutral-50/70' : 'bg-white'}`}
-                          >
-                            <td className="py-1.5 px-2 text-center font-mono text-neutral-400 text-[10px]">
-                              {index + 1}
-                            </td>
-                            <td className="py-1.5 px-2.5 font-mono text-neutral-700 whitespace-nowrap">
-                              <strong>{new Date(ev.occurred_at_device).toLocaleTimeString('pt-BR')}</strong>
-                              <span className="text-[10px] text-neutral-400 ml-1">
-                                {new Date(ev.occurred_at_device).toLocaleDateString('pt-BR')}
+                    <table className="w-full text-[10px] border border-neutral-300">
+                      <thead>
+                        <tr className="bg-neutral-100 border-b border-neutral-300">
+                          <th className="py-1.5 px-2 text-left font-bold text-[9px] uppercase text-neutral-600">Turma</th>
+                          <th className="py-1.5 px-2 text-center font-bold text-[9px] uppercase text-neutral-600">Total</th>
+                          <th className="py-1.5 px-2 text-center font-bold text-[9px] uppercase text-emerald-700">Entradas</th>
+                          <th className="py-1.5 px-2 text-center font-bold text-[9px] uppercase text-amber-700">Saídas</th>
+                          <th className="py-1.5 px-2 text-center font-bold text-[9px] uppercase text-neutral-600">Retific.</th>
+                          <th className="py-1.5 px-2 text-center font-bold text-[9px] uppercase text-neutral-600">Alunos Únicos</th>
+                          <th className="py-1.5 px-2 text-center font-bold text-[9px] uppercase text-neutral-600">Matriculados</th>
+                          <th className="py-1.5 px-2 text-center font-bold text-[9px] uppercase text-[#0f766e]">% Presença</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-neutral-200">
+                        {classSummary.map((cls, i) => (
+                          <tr key={cls.name} className={i % 2 === 1 ? 'bg-neutral-50/60' : 'bg-white'}>
+                            <td className="py-1.5 px-2 font-semibold text-neutral-900">{cls.name}</td>
+                            <td className="py-1.5 px-2 text-center font-mono font-bold">{cls.totalEvents}</td>
+                            <td className="py-1.5 px-2 text-center font-mono text-emerald-800">{cls.entries}</td>
+                            <td className="py-1.5 px-2 text-center font-mono text-amber-800">{cls.exits}</td>
+                            <td className="py-1.5 px-2 text-center font-mono text-neutral-500">{cls.corrections}</td>
+                            <td className="py-1.5 px-2 text-center font-mono">{cls.uniqueStudents}</td>
+                            <td className="py-1.5 px-2 text-center font-mono text-neutral-500">{cls.totalEnrolled}</td>
+                            <td className="py-1.5 px-2 text-center">
+                              <span className={`font-bold font-mono ${cls.presenceRate >= 80 ? 'text-emerald-800' : cls.presenceRate >= 60 ? 'text-amber-700' : 'text-rose-700'}`}>
+                                {cls.presenceRate}%
                               </span>
                             </td>
-                            <td className="py-1.5 px-2.5 font-mono text-neutral-700 whitespace-nowrap">
-                              {stu?.enrollment_code || '—'}
-                            </td>
-                            <td className="py-1.5 px-3 font-medium text-neutral-900">
-                              {stu?.full_name || 'Não identificado'}
-                            </td>
-                            <td className="py-1.5 px-2.5 text-neutral-600 whitespace-nowrap">
-                              {c?.name || 'Geral'}
-                            </td>
-                            <td className="py-1.5 px-2 text-center">
-                              {isEntry ? (
-                                <span className="inline-block px-1.5 py-0.2 rounded text-[10px] font-bold border border-emerald-300 text-emerald-800 bg-emerald-50">
-                                  ENTRADA
-                                </span>
-                              ) : isExit ? (
-                                <span className="inline-block px-1.5 py-0.2 rounded text-[10px] font-bold border border-amber-300 text-amber-800 bg-amber-50">
-                                  SAÍDA
-                                </span>
-                              ) : (
-                                <span className="inline-block px-1.5 py-0.2 rounded text-[10px] font-bold border border-neutral-300 text-neutral-700 bg-neutral-100">
-                                  RETIFICAÇÃO
-                                </span>
-                              )}
-                            </td>
-                            <td className="py-1.5 px-2 text-center font-mono text-[9px] uppercase text-neutral-500">
-                              {ev.source}
-                            </td>
-                            <td className="py-1.5 px-2 font-mono text-[10px] text-neutral-600">
-                              {ev.operator_id}
-                            </td>
-                            {includeNotes && (
-                              <td className="py-1.5 px-3 text-[10px] text-neutral-600 italic">
-                                {ev.notes || ev.correction_reason || '—'}
-                                {ev.guardian_name && (
-                                  <span className="block text-neutral-500 not-italic font-sans text-[9px]">
-                                    (Autorizado: {ev.guardian_name})
-                                  </span>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {/* ════ SEÇÃO 5 — DISTRIBUIÇÃO HORÁRIA ════ */}
+                {includeHourlyDistribution && hourlyRows.length > 0 && (
+                  <div className="print-avoid-break">
+                    <div className="text-[9px] font-bold uppercase tracking-widest text-neutral-500 mb-1.5">
+                      § 4 — Distribuição Horária de Movimentações (Picos de Fluxo)
+                    </div>
+                    <table className="w-full text-[10px] border border-neutral-300">
+                      <thead>
+                        <tr className="bg-neutral-100 border-b border-neutral-300">
+                          <th className="py-1 px-2 text-left font-bold text-[9px] uppercase text-neutral-600 w-16">Horário</th>
+                          <th className="py-1 px-2 text-center font-bold text-[9px] uppercase text-emerald-700 w-16">Entradas</th>
+                          <th className="py-1 px-2 text-center font-bold text-[9px] uppercase text-amber-700 w-16">Saídas</th>
+                          <th className="py-1 px-2 text-center font-bold text-[9px] uppercase text-neutral-600 w-14">Total</th>
+                          <th className="py-1 px-2 text-left font-bold text-[9px] uppercase text-neutral-500">Gráfico de Fluxo</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-neutral-100">
+                        {hourlyRows.map((row) => {
+                          const pct = Math.round((row.total / maxHourly) * 100);
+                          const entryPct = Math.round((row.entries / maxHourly) * 100);
+                          const exitPct = Math.round((row.exits / maxHourly) * 100);
+                          return (
+                            <tr key={row.hour} className="bg-white">
+                              <td className="py-1 px-2 font-mono font-bold text-neutral-700">
+                                {String(row.hour).padStart(2, '0')}:00 – {String(row.hour).padStart(2, '0')}:59
+                              </td>
+                              <td className="py-1 px-2 text-center font-mono text-emerald-800 font-semibold">{row.entries}</td>
+                              <td className="py-1 px-2 text-center font-mono text-amber-800 font-semibold">{row.exits}</td>
+                              <td className="py-1 px-2 text-center font-mono font-bold text-neutral-900">{row.total}</td>
+                              <td className="py-1 px-2">
+                                <div className="flex items-center gap-0.5 h-4 bar-chart-cell rounded overflow-hidden" style={{ background: '#e5e7eb' }}>
+                                  {entryPct > 0 && (
+                                    <div className="h-full bar-entry rounded-l" style={{ width: `${entryPct}%`, background: '#065f46' }} title={`${row.entries} entradas`} />
+                                  )}
+                                  {exitPct > 0 && (
+                                    <div className="h-full bar-exit" style={{ width: `${exitPct}%`, background: '#92400e' }} title={`${row.exits} saídas`} />
+                                  )}
+                                </div>
+                                <div className="flex gap-2 mt-0.5 text-[8px] text-neutral-400">
+                                  {entryPct > 0 && <span className="text-emerald-700">■ Entradas</span>}
+                                  {exitPct > 0 && <span className="text-amber-700">■ Saídas</span>}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {/* ════ SEÇÃO 6 — RESUMO INDIVIDUAL POR ALUNO ════ */}
+                {includeStudentSummary && studentSummary.length > 0 && (
+                  <div>
+                    <div className="text-[9px] font-bold uppercase tracking-widest text-neutral-500 mb-1.5">
+                      § 5 — Resumo Individual de Frequência por Estudante
+                    </div>
+                    <table className="w-full text-[10px] border border-neutral-300">
+                      <thead>
+                        <tr className="bg-neutral-100 border-b border-neutral-300">
+                          <th className="py-1.5 px-2 text-left font-bold text-[9px] uppercase text-neutral-600">#</th>
+                          <th className="py-1.5 px-2 text-left font-bold text-[9px] uppercase text-neutral-600">Estudante</th>
+                          <th className="py-1.5 px-2 text-left font-bold text-[9px] uppercase text-neutral-600">Matrícula</th>
+                          <th className="py-1.5 px-2 text-left font-bold text-[9px] uppercase text-neutral-600">Turma</th>
+                          <th className="py-1.5 px-2 text-center font-bold text-[9px] uppercase text-emerald-700">Ent.</th>
+                          <th className="py-1.5 px-2 text-center font-bold text-[9px] uppercase text-amber-700">Saí.</th>
+                          <th className="py-1.5 px-2 text-center font-bold text-[9px] uppercase text-neutral-600">Ret.</th>
+                          <th className="py-1.5 px-2 text-center font-bold text-[9px] uppercase text-neutral-600">1ª Entrada</th>
+                          <th className="py-1.5 px-2 text-center font-bold text-[9px] uppercase text-neutral-600">Últ. Saída</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-neutral-200">
+                        {studentSummary.map((s, i) => (
+                          <tr key={`${s.enrollment}-${i}`} className={i % 2 === 1 ? 'bg-neutral-50/60' : 'bg-white'}>
+                            <td className="py-1 px-2 font-mono text-neutral-400 text-[9px]">{i + 1}</td>
+                            <td className="py-1 px-2 font-semibold text-neutral-900 text-[10px]">{s.name}</td>
+                            <td className="py-1 px-2 font-mono text-neutral-600 text-[9px]">{s.enrollment}</td>
+                            <td className="py-1 px-2 text-neutral-600">{s.className}</td>
+                            <td className="py-1 px-2 text-center font-mono text-emerald-800 font-bold">{s.entries}</td>
+                            <td className="py-1 px-2 text-center font-mono text-amber-800 font-bold">{s.exits}</td>
+                            <td className="py-1 px-2 text-center font-mono text-neutral-500">{s.corrections}</td>
+                            <td className="py-1 px-2 text-center font-mono text-[9px] text-neutral-600">{s.firstEntry}</td>
+                            <td className="py-1 px-2 text-center font-mono text-[9px] text-neutral-600">{s.lastExit}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {/* ════ SEÇÃO 7 — LISTAGEM ANALÍTICA COMPLETA ════ */}
+                <div>
+                  <div className="text-[9px] font-bold uppercase tracking-widest text-neutral-500 mb-1.5">
+                    § {includeClassBreakdown ? (includeHourlyDistribution ? (includeStudentSummary ? '6' : '5') : (includeStudentSummary ? '5' : '4')) : (includeHourlyDistribution ? (includeStudentSummary ? '5' : '4') : (includeStudentSummary ? '4' : '3'))} — Listagem Analítica Completa de Ocorrências
+                    <span className="ml-2 text-neutral-400 normal-case font-normal font-mono">(cronologia reversa · {filteredEvents.length} eventos)</span>
+                  </div>
+                  <table className="w-full text-[10px] border border-neutral-300">
+                    <thead>
+                      <tr className="bg-neutral-100 border-b border-neutral-300">
+                        <th className="py-1.5 px-1.5 text-center font-bold text-[9px] uppercase text-neutral-600 w-6">#</th>
+                        <th className="py-1.5 px-2 text-left font-bold text-[9px] uppercase text-neutral-600">Horário &amp; Data</th>
+                        <th className="py-1.5 px-2 text-left font-bold text-[9px] uppercase text-neutral-600">Matrícula</th>
+                        <th className="py-1.5 px-2 text-left font-bold text-[9px] uppercase text-neutral-600">Estudante</th>
+                        <th className="py-1.5 px-2 text-left font-bold text-[9px] uppercase text-neutral-600">Turma</th>
+                        <th className="py-1.5 px-2 text-center font-bold text-[9px] uppercase text-neutral-600">Tipo</th>
+                        <th className="py-1.5 px-2 text-center font-bold text-[9px] uppercase text-neutral-600">Origem</th>
+                        <th className="py-1.5 px-2 text-left font-bold text-[9px] uppercase text-neutral-600">Operador</th>
+                        {includeNotes && (
+                          <th className="py-1.5 px-2 text-left font-bold text-[9px] uppercase text-neutral-600">Obs. / Justificativa</th>
+                        )}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-neutral-100">
+                      {filteredEvents.length === 0 ? (
+                        <tr>
+                          <td colSpan={includeNotes ? 9 : 8} className="py-6 text-center text-neutral-400 italic text-[11px]">
+                            Nenhum evento registrado no intervalo selecionado.
+                          </td>
+                        </tr>
+                      ) : (
+                        filteredEvents.map((ev, index) => {
+                          const stu = students.find((s) => s.id === ev.student_id);
+                          const c = stu ? classrooms.find((cl) => cl.id === stu.class_id) : null;
+                          const isEntry = ev.event_type === 'entry';
+                          const isExit = ev.event_type === 'exit';
+                          return (
+                            <tr key={ev.id} className={index % 2 === 1 ? 'bg-neutral-50/70' : 'bg-white'}>
+                              <td className="py-1 px-1.5 text-center font-mono text-neutral-400 text-[9px]">{index + 1}</td>
+                              <td className="py-1 px-2 font-mono text-neutral-700 whitespace-nowrap text-[9px]">
+                                <strong className="text-[10px]">{new Date(ev.occurred_at_device).toLocaleTimeString('pt-BR')}</strong>
+                                <span className="text-neutral-400 ml-1">{new Date(ev.occurred_at_device).toLocaleDateString('pt-BR')}</span>
+                              </td>
+                              <td className="py-1 px-2 font-mono text-neutral-600 text-[9px] whitespace-nowrap">{stu?.enrollment_code || '—'}</td>
+                              <td className="py-1 px-2 font-semibold text-neutral-900 text-[10px]">{stu?.full_name || 'Não identificado'}</td>
+                              <td className="py-1 px-2 text-neutral-600 text-[9px] whitespace-nowrap">{c?.name || 'Geral'}</td>
+                              <td className="py-1 px-2 text-center">
+                                {isEntry ? (
+                                  <span className="inline-block px-1.5 rounded text-[9px] font-bold border border-emerald-300 text-emerald-800 bg-emerald-50 whitespace-nowrap">ENTRADA</span>
+                                ) : isExit ? (
+                                  <span className="inline-block px-1.5 rounded text-[9px] font-bold border border-amber-300 text-amber-800 bg-amber-50 whitespace-nowrap">SAÍDA</span>
+                                ) : (
+                                  <span className="inline-block px-1.5 rounded text-[9px] font-bold border border-neutral-300 text-neutral-700 bg-neutral-100 whitespace-nowrap">RETIFIC.</span>
                                 )}
                               </td>
-                            )}
-                          </tr>
-                        );
-                      })
-                    )}
-                  </tbody>
-                </table>
-              </div>
+                              <td className="py-1 px-2 text-center font-mono text-[8px] uppercase text-neutral-500">{ev.source}</td>
+                              <td className="py-1 px-2 font-mono text-[9px] text-neutral-600">{ev.operator_id}</td>
+                              {includeNotes && (
+                                <td className="py-1 px-2 text-[9px] text-neutral-600 italic">
+                                  {ev.notes || ev.correction_reason || '—'}
+                                  {ev.guardian_name && (
+                                    <span className="block text-neutral-500 not-italic text-[8px]">(Autorizado: {ev.guardian_name})</span>
+                                  )}
+                                </td>
+                              )}
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
 
-              {/* 5. Termo de Conformidade e Assinaturas Formais */}
-              {includeSignatures && (
-                <div className="pt-6 space-y-6 break-inside-avoid">
-                  <div className="p-3 bg-neutral-50 border border-neutral-200 rounded-lg text-[10px] text-neutral-600 leading-relaxed">
-                    <strong>DECLARAÇÃO DE CONFORMIDADE E AUDITORIA:</strong> Documento extraído da base de dados transacional offline SQLite WAL da instituição. Registros imutáveis protegidos com carimbo cronológico de dispositivo e hash criptográfico, em estrita observância à Lei Geral de Proteção de Dados (LGPD) e às diretrizes operacionais de segurança da portaria.
-                  </div>
+                {/* ════ SEÇÃO 8 — DECLARAÇÃO DE CONFORMIDADE E ASSINATURAS ════ */}
+                {includeSignatures && (
+                  <div className="pt-4 space-y-4 print-avoid-break">
+                    <div className="p-3 bg-neutral-50 border border-neutral-300 rounded text-[9px] text-neutral-600 leading-relaxed">
+                      <strong className="text-neutral-800">DECLARAÇÃO DE CONFORMIDADE E AUDITORIA (LGPD / RFC-05):</strong>{' '}
+                      Documento extraído da base de dados transacional offline SQLite WAL da instituição, com registros imutáveis protegidos por carimbo cronológico de dispositivo (<em>device timestamp</em>) e hash criptográfico de integridade. Dados tratados em estrita observância à Lei Geral de Proteção de Dados (Lei nº 13.709/2018) e às diretrizes operacionais de segurança e controle de acesso escolar. A divulgação não autorizada deste documento é vedada.
+                    </div>
 
-                  <div className="grid grid-cols-2 gap-10 pt-4 text-center">
-                    <div className="space-y-1">
-                      <div className="border-b border-neutral-400 w-3/4 mx-auto pb-1" />
-                      <div className="text-xs font-semibold text-neutral-900">
-                        {currentOperator.name}
+                    <div className="grid grid-cols-3 gap-6 pt-2 text-center">
+                      <div className="space-y-2">
+                        <div className="border-b border-neutral-500 pb-6" />
+                        <div className="text-[10px] font-bold text-neutral-900">{currentOperator.name}</div>
+                        <div className="text-[9px] text-neutral-500">
+                          Operador de Portaria &bull; Matrícula {currentOperator.badge_number || 'N/A'}
+                        </div>
                       </div>
-                      <div className="text-[10px] text-neutral-500">
-                        Operador de Portaria &bull; Matrícula {currentOperator.badge_number}
+                      <div className="space-y-2">
+                        <div className="border-b border-neutral-500 pb-6" />
+                        <div className="text-[10px] font-bold text-neutral-900">Coordenação Pedagógica</div>
+                        <div className="text-[9px] text-neutral-500">
+                          Visto de Supervisão &bull; Carimbo Institucional
+                        </div>
+                      </div>
+                      <div className="space-y-2">
+                        <div className="border-b border-neutral-500 pb-6" />
+                        <div className="text-[10px] font-bold text-neutral-900">Direção da Unidade Escolar</div>
+                        <div className="text-[9px] text-neutral-500">
+                          Visto da Direção &bull; Carimbo Oficial
+                        </div>
                       </div>
                     </div>
 
-                    <div className="space-y-1">
-                      <div className="border-b border-neutral-400 w-3/4 mx-auto pb-1" />
-                      <div className="text-xs font-semibold text-neutral-900">
-                        Coordenação Pedagógica / Direção
-                      </div>
-                      <div className="text-[10px] text-neutral-500">
-                        Visto Institucional &bull; Carimbo Oficial
-                      </div>
+                    <div className="text-center text-[9px] text-neutral-400 mt-2">
+                      Data e Local: São Paulo, SP, {new Date().toLocaleDateString('pt-BR', { day: '2-digit', month: 'long', year: 'numeric' })}
                     </div>
                   </div>
-                </div>
-              )}
+                )}
 
-              {/* 6. Rodapé do Documento */}
-              <div className="border-t border-neutral-300 pt-3 flex items-center justify-between text-[10px] text-neutral-400 font-mono">
-                <div>
-                  Escola Horizonte &bull; Sistema de Portaria Local-First &bull; Modo Offline
-                </div>
-                <div>
-                  Página 1 de 1 &bull; Documento Oficial
+                {/* ════ RODAPÉ DO DOCUMENTO ════ */}
+                <div className="border-t-2 border-[#142024] pt-2 flex items-center justify-between text-[9px] text-neutral-400 font-mono">
+                  <div>
+                    {school.name} &bull; Portaria Escolar Local-First &bull; SQLite WAL &bull; Laya Engine
+                  </div>
+                  <div className="text-center text-neutral-500 font-bold">
+                    {protocolNumber}
+                  </div>
+                  <div>
+                    Documento Oficial &bull; Página 1 de 1
+                  </div>
                 </div>
               </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
     </div>
   );
 };
