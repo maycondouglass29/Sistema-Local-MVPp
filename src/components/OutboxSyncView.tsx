@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -1000,7 +1000,7 @@ export const OutboxSyncView: React.FC = () => {
 
       {/* SECTION 3: COORDENAÇÃO PEDAGÓGICA (Restrições RBAC) */}
       {activePersona === 'coordenacao' && (
-        <div className="bg-white rounded-xl border border-neutral-200 p-5 space-y-5 shadow-2xs">
+        <div className="space-y-4">
           {!isCoordinator && (
             <div className="p-3 bg-amber-50 border border-amber-200 text-amber-800 rounded-xl text-xs flex items-center gap-2">
               <Lock className="w-4 h-4 text-amber-600 shrink-0" />
@@ -1010,34 +1010,44 @@ export const OutboxSyncView: React.FC = () => {
             </div>
           )}
 
-          <div>
-            <h2 className="text-sm font-semibold text-neutral-900">
-              Políticas de horários e tolerância da portaria
-            </h2>
-            <p className="text-xs text-neutral-500 mt-0.5">
-              Defina as diretrizes pedagógicas para entrada tardia, janelas de turno e bloqueios automáticos
-            </p>
-          </div>
+          {/* Header */}
+          <div className="bg-white rounded-xl border border-neutral-200 p-5 shadow-2xs space-y-5">
+            <div className="pb-3 border-b border-neutral-100">
+              <h2 className="text-sm font-semibold text-neutral-900">Políticas de horários e tolerância da portaria</h2>
+              <p className="text-xs text-neutral-500 mt-0.5">Defina as diretrizes pedagógicas para entrada tardia, janelas de turno e bloqueios automáticos</p>
+            </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-5 pt-2 border-t border-neutral-100">
-            {/* Rule 1: Atraso */}
-            <div className="space-y-1.5 text-xs">
-              <label className="block font-medium text-neutral-800">
-                Tolerância de atraso na entrada:
-              </label>
-              <div className="flex items-center gap-3">
-                <input
-                  type="range"
-                  min="5"
-                  max="30"
-                  step="5"
-                  disabled={!isCoordinator}
-                  value={morningToleranceMins}
-                  onChange={(e) => setMorningToleranceMins(Number(e.target.value))}
-                  className="flex-1 accent-[#0f766e] disabled:opacity-50"
-                />
-                <span className="font-mono tabular-nums font-semibold text-[#0f766e] text-xs w-16 text-right">
+            {/* Rule 1: Tolerância de Atraso — com indicador visual */}
+            <div className="space-y-2.5 text-xs">
+              <div className="flex items-center justify-between">
+                <label className="font-medium text-neutral-800">Tolerância de atraso na entrada</label>
+                <span className="font-mono tabular-nums font-semibold text-[#0f766e] text-xs bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded">
                   {morningToleranceMins} min
+                </span>
+              </div>
+              <input
+                type="range"
+                min="5"
+                max="30"
+                step="5"
+                disabled={!isCoordinator}
+                value={morningToleranceMins}
+                onChange={(e) => setMorningToleranceMins(Number(e.target.value))}
+                className="w-full accent-[#0f766e] disabled:opacity-50"
+              />
+              {/* Tick marks */}
+              <div className="flex justify-between text-[10px] font-mono text-neutral-400 px-0.5">
+                {[5, 10, 15, 20, 25, 30].map((v) => (
+                  <span key={v} className={v === morningToleranceMins ? 'text-[#0f766e] font-semibold' : ''}>{v}min</span>
+                ))}
+              </div>
+              {/* Visual range indicator */}
+              <div className="flex items-center gap-2 mt-1">
+                <div className="flex-1 h-2 rounded-full bg-neutral-100 overflow-hidden relative">
+                  <div className="h-full bg-amber-400/60 rounded-full absolute left-0" style={{ width: `${((morningToleranceMins - 5) / 25) * 100}%` }} />
+                </div>
+                <span className="text-[11px] text-neutral-500 shrink-0">
+                  Janela de atraso: <strong className="text-amber-700">07:00 → 07:{String(morningToleranceMins).padStart(2,'0')}</strong>
                 </span>
               </div>
               <p className="text-neutral-500 text-[11px]">
@@ -1045,24 +1055,38 @@ export const OutboxSyncView: React.FC = () => {
               </p>
             </div>
 
-            {/* Rule 2: Anti-duplicidade */}
-            <div className="space-y-1.5 text-xs">
-              <label className="block font-medium text-neutral-800">
-                Janela anti-duplicidade de leitura (Anti-Passback):
-              </label>
-              <div className="flex items-center gap-3">
-                <input
-                  type="range"
-                  min="30"
-                  max="120"
-                  step="15"
-                  disabled={!isCoordinator}
-                  value={duplicitySeconds}
-                  onChange={(e) => setDuplicitySeconds(Number(e.target.value))}
-                  className="flex-1 accent-[#0f766e] disabled:opacity-50"
-                />
-                <span className="font-mono tabular-nums font-semibold text-[#0f766e] text-xs w-16 text-right">
+            <div className="border-t border-neutral-100 pt-4" />
+
+            {/* Rule 2: Anti-Passback */}
+            <div className="space-y-2.5 text-xs">
+              <div className="flex items-center justify-between">
+                <label className="font-medium text-neutral-800">Janela anti-duplicidade de leitura (Anti-Passback)</label>
+                <span className="font-mono tabular-nums font-semibold text-[#0f766e] text-xs bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded">
                   {duplicitySeconds}s
+                </span>
+              </div>
+              <input
+                type="range"
+                min="30"
+                max="120"
+                step="15"
+                disabled={!isCoordinator}
+                value={duplicitySeconds}
+                onChange={(e) => setDuplicitySeconds(Number(e.target.value))}
+                className="w-full accent-[#0f766e] disabled:opacity-50"
+              />
+              <div className="flex justify-between text-[10px] font-mono text-neutral-400 px-0.5">
+                {[30, 45, 60, 75, 90, 105, 120].map((v) => (
+                  <span key={v} className={v === duplicitySeconds ? 'text-[#0f766e] font-semibold' : ''}>{v}s</span>
+                ))}
+              </div>
+              {/* Visual cooldown bar */}
+              <div className="flex items-center gap-2 mt-1">
+                <div className="flex-1 h-2 rounded-full bg-neutral-100 overflow-hidden relative">
+                  <div className="h-full bg-sky-400/60 rounded-full absolute left-0" style={{ width: `${((duplicitySeconds - 30) / 90) * 100}%` }} />
+                </div>
+                <span className="text-[11px] text-neutral-500 shrink-0">
+                  Cooldown: <strong className="text-sky-700">{duplicitySeconds}s</strong> por crachá
                 </span>
               </div>
               <p className="text-neutral-500 text-[11px]">
@@ -1070,50 +1094,47 @@ export const OutboxSyncView: React.FC = () => {
               </p>
             </div>
 
-            {/* Rule 3: Saída com Responsável */}
-            <div className="space-y-1.5 text-xs">
-              <label className="flex items-start gap-2.5 cursor-pointer">
+            <div className="border-t border-neutral-100 pt-4" />
+
+            {/* Rule 3 & 4: Checkbox + mensagem lado a lado */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+              <div className="space-y-1.5 text-xs">
+                <label className="flex items-start gap-2.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    disabled={!isCoordinator}
+                    checked={requireGuardianOnEarlyExit}
+                    onChange={(e) => setRequireGuardianOnEarlyExit(e.target.checked)}
+                    className="mt-0.5 rounded text-[#0f766e] focus:ring-0 disabled:opacity-50"
+                  />
+                  <div>
+                    <span className="font-medium text-neutral-900 block">Exigir autorização de responsável para saídas antecipadas</span>
+                    <span className="text-neutral-500 text-[11px]">Exibe instantaneamente os responsáveis autorizados via camada Mem0.</span>
+                  </div>
+                </label>
+              </div>
+
+              <div className="space-y-1.5 text-xs">
+                <label className="block font-medium text-neutral-800">Mensagem padrão para alunos retidos ou com alerta:</label>
                 <input
-                  type="checkbox"
+                  type="text"
                   disabled={!isCoordinator}
-                  checked={requireGuardianOnEarlyExit}
-                  onChange={(e) => setRequireGuardianOnEarlyExit(e.target.checked)}
-                  className="mt-0.5 rounded text-[#0f766e] focus:ring-0 disabled:opacity-50"
+                  value={retentionMessage}
+                  onChange={(e) => setRetentionMessage(e.target.value)}
+                  className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-1.5 text-xs text-neutral-900 focus:outline-none focus:border-[#0f766e] disabled:bg-neutral-100"
                 />
-                <div>
-                  <span className="font-medium text-neutral-900 block">
-                    Exigir autorização de responsável para saídas antecipadas
-                  </span>
-                  <span className="text-neutral-500 text-[11px]">
-                    Exibe instantaneamente os responsáveis autorizados via camada Mem0.
-                  </span>
-                </div>
-              </label>
+              </div>
             </div>
 
-            {/* Rule 4: Mensagem de Retenção */}
-            <div className="space-y-1.5 text-xs">
-              <label className="block font-medium text-neutral-800">
-                Mensagem padrão para alunos retidos ou com alerta:
-              </label>
-              <input
-                type="text"
+            <div className="pt-2 flex justify-end border-t border-neutral-100">
+              <button
                 disabled={!isCoordinator}
-                value={retentionMessage}
-                onChange={(e) => setRetentionMessage(e.target.value)}
-                className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-1.5 text-xs text-neutral-900 focus:outline-none focus:border-[#0f766e] disabled:bg-neutral-100"
-              />
+                onClick={() => showNotification('Regras da coordenação salvas com sucesso.')}
+                className="bg-[#0f766e] hover:bg-[#0d5f59] disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-medium px-4 py-2 rounded-lg transition-colors cursor-pointer shadow-2xs"
+              >
+                Salvar regras da coordenação
+              </button>
             </div>
-          </div>
-
-          <div className="pt-2 flex justify-end">
-            <button
-              disabled={!isCoordinator}
-              onClick={() => showNotification('Regras da coordenação salvas com sucesso.')}
-              className="bg-[#0f766e] hover:bg-[#0d5f59] disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-medium px-4 py-2 rounded-lg transition-colors cursor-pointer shadow-2xs"
-            >
-              Salvar regras da coordenação
-            </button>
           </div>
         </div>
       )}
@@ -1231,129 +1252,6 @@ export const OutboxSyncView: React.FC = () => {
             </div>
           </div>
 
-          {/* Interactive Laya Simulation Box */}
-          <div className="bg-white rounded-xl border border-neutral-200 p-5 space-y-4 shadow-2xs">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div>
-                <h3 className="text-sm font-semibold text-neutral-900 flex items-center gap-2">
-                  <Activity className="w-4 h-4 text-[#0f766e]" />
-                  <span>Simulador Didático Interativo do Motor Laya</span>
-                </h3>
-                <p className="text-xs text-neutral-500 mt-0.5">
-                  Selecione um aluno e simule a tomada de decisão em tempo real para visualizar cada etapa
-                </p>
-              </div>
-
-              <div className="flex items-center gap-2">
-                <select
-                  value={simStudentId}
-                  onChange={(e) => {
-                    setSimStudentId(e.target.value);
-                    handleRunLayaSimulation(e.target.value);
-                  }}
-                  className="bg-white border border-neutral-300 rounded-lg px-2.5 py-1.5 text-xs text-neutral-800 focus:outline-none focus:border-[#0f766e]"
-                >
-                  {students.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.full_name} ({s.status === 'blocked' ? 'BLOQUEADO' : 'ATIVO'} - {s.enrollment_code})
-                    </option>
-                  ))}
-                </select>
-
-                <div className="flex rounded-lg border border-neutral-300 p-0.5 text-xs bg-neutral-50">
-                  <button
-                    onClick={() => setSimEventType('entry')}
-                    className={`px-2 py-1 rounded text-xs font-medium cursor-pointer ${simEventType === 'entry' ? 'bg-[#0f766e] text-white' : 'text-neutral-600'
-                      }`}
-                  >
-                    Entrada
-                  </button>
-                  <button
-                    onClick={() => setSimEventType('exit')}
-                    className={`px-2 py-1 rounded text-xs font-medium cursor-pointer ${simEventType === 'exit' ? 'bg-[#0f766e] text-white' : 'text-neutral-600'
-                      }`}
-                  >
-                    Saída
-                  </button>
-                </div>
-
-                <button
-                  onClick={() => handleRunLayaSimulation()}
-                  disabled={isSimulating}
-                  className="px-3.5 py-1.5 rounded-lg bg-[#0f766e] hover:bg-[#0d5f59] text-white text-xs font-medium flex items-center gap-1.5 cursor-pointer shadow-xs"
-                >
-                  <Play className="w-3.5 h-3.5" />
-                  <span>Testar Decisão</span>
-                </button>
-              </div>
-            </div>
-
-            {/* Simulation Results Display */}
-            {simResult && (
-              <div className="p-4 rounded-xl border border-neutral-200 bg-neutral-50 space-y-4">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-neutral-200">
-                  <div className="flex items-center gap-3">
-                    <span
-                      className={`px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider ${simResult.allowed
-                          ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
-                          : 'bg-rose-100 text-rose-800 border border-rose-300'
-                        }`}
-                    >
-                      {simResult.decision}
-                    </span>
-                    <div>
-                      <span className="font-semibold text-xs text-neutral-900">
-                        {simResult.studentName}
-                      </span>
-                      <span className="text-neutral-500 text-xs ml-2">
-                        &bull; {simResult.reason}
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-3 text-xs font-mono">
-                    <span className="text-neutral-500">
-                      Latência: <strong className="text-emerald-700">{simResult.latencyMs}ms</strong>
-                    </span>
-                    <span className="text-neutral-500">
-                      Confiança: <strong className="text-[#0f766e]">{(simResult.confidence * 100).toFixed(1)}%</strong>
-                    </span>
-                  </div>
-                </div>
-
-                {/* 4 Steps Breakdown */}
-                <div className="space-y-2">
-                  <span className="text-[11px] font-semibold text-neutral-500 uppercase tracking-wider block">
-                    Etapas do Processamento Não-Autoregressivo Laya:
-                  </span>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
-                    {simResult.steps.map((step, idx) => (
-                      <div
-                        key={idx}
-                        className={`p-2.5 rounded-lg border flex items-start gap-2 ${step.ok
-                            ? 'bg-white border-neutral-200 text-neutral-800'
-                            : 'bg-rose-50 border-rose-200 text-rose-900'
-                          }`}
-                      >
-                        {step.ok ? (
-                          <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                        ) : (
-                          <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-                        )}
-                        <div>
-                          <div className="font-semibold text-xs">{step.label}</div>
-                          <div className="text-[11px] text-neutral-500 mt-0.5">
-                            {step.detail}
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
-
           {/* Comparativo Didático: Motor Laya vs. Nuvem / LLMs Lentos */}
           <div className="bg-white rounded-xl border border-neutral-200 p-5 space-y-4 shadow-2xs">
             <div>
@@ -1429,133 +1327,6 @@ export const OutboxSyncView: React.FC = () => {
             </div>
           </div>
 
-          {/* Destaque às Ferramentas Auxiliares (@Ferramentas) */}
-          <div className="bg-white rounded-xl border border-neutral-200 p-5 space-y-4 shadow-2xs">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div>
-                <h3 className="text-sm font-semibold text-neutral-900 flex items-center gap-2">
-                  <ShieldCheck className="w-4 h-4 text-[#0f766e]" />
-                  <span>Ecossistema de Ferramentas Especializadas (@Ferramentas)</span>
-                </h3>
-                <p className="text-xs text-neutral-500 mt-0.5">
-                  Conheça o conjunto de ferramentas e padrões que sustentam a alta confiabilidade do sistema escolar
-                </p>
-              </div>
-              <span className="text-[11px] font-mono text-neutral-500 bg-neutral-100 px-2 py-0.5 rounded border border-neutral-200">
-                Padrão Local-First &bull; 6 Módulos Ativos
-              </span>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3.5">
-              {/* Tool 1: Laya Decision Engine */}
-              <div className="p-3.5 rounded-xl border border-emerald-200 bg-emerald-50/40 space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <span className="font-semibold text-xs text-emerald-950 font-mono">
-                    laya-main
-                  </span>
-                  <span className="text-[10px] bg-emerald-700 text-white font-mono px-1.5 py-0.2 rounded font-bold">
-                    System 1
-                  </span>
-                </div>
-                <h4 className="text-xs font-semibold text-neutral-900">
-                  Motor Laya de Decisão
-                </h4>
-                <p className="text-[11px] text-neutral-600 leading-relaxed">
-                  Motor determinístico não-autorregressivo de sub-35ms. Valida carteirinhas, anti-passback e restrições de custódia instantaneamente.
-                </p>
-              </div>
-
-              {/* Tool 2: Impeccable & Unslop */}
-              <div className="p-3.5 rounded-xl border border-neutral-200 bg-neutral-50/70 space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <span className="font-semibold text-xs text-neutral-900 font-mono">
-                    impeccable + unslop
-                  </span>
-                  <span className="text-[10px] bg-neutral-200 text-neutral-800 font-mono px-1.5 py-0.2 rounded font-medium">
-                    Anti-Slop UI
-                  </span>
-                </div>
-                <h4 className="text-xs font-semibold text-neutral-900">
-                  Design Ergonômico de Alta Atenção
-                </h4>
-                <p className="text-[11px] text-neutral-600 leading-relaxed">
-                  Sem poluição visual, popups invasivos ou gradientes lentos. Foco total em contrastes altos, tipografia e resposta imediata para o operador.
-                </p>
-              </div>
-
-              {/* Tool 3: Hallmark */}
-              <div className="p-3.5 rounded-xl border border-neutral-200 bg-neutral-50/70 space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <span className="font-semibold text-xs text-neutral-900 font-mono">
-                    hallmark-main
-                  </span>
-                  <span className="text-[10px] bg-sky-100 text-sky-800 font-mono px-1.5 py-0.2 rounded font-medium">
-                    Editorial
-                  </span>
-                </div>
-                <h4 className="text-xs font-semibold text-neutral-900">
-                  Padrão Gráfico de Carteirinhas & A4
-                </h4>
-                <p className="text-[11px] text-neutral-600 leading-relaxed">
-                  Calibração milimétrica para impressões físicas: Crachás CR-80 (85×54mm) com QR Code seguro e Relatório Oficial de Frequência em Folha A4.
-                </p>
-              </div>
-
-              {/* Tool 4: Scroll-Craft */}
-              <div className="p-3.5 rounded-xl border border-neutral-200 bg-neutral-50/70 space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <span className="font-semibold text-xs text-neutral-900 font-mono">
-                    scroll-craft-main
-                  </span>
-                  <span className="text-[10px] bg-purple-100 text-purple-800 font-mono px-1.5 py-0.2 rounded font-medium">
-                    Ergonomia
-                  </span>
-                </div>
-                <h4 className="text-xs font-semibold text-neutral-900">
-                  Rolagem Vertical Isolada
-                </h4>
-                <p className="text-[11px] text-neutral-600 leading-relaxed">
-                  Isolamento mecânico de scroll entre o menu lateral fixo e o corpo de visualização, prevenindo perda de contexto e cabeçalhos cortados.
-                </p>
-              </div>
-
-              {/* Tool 5: Security Audit Skill */}
-              <div className="p-3.5 rounded-xl border border-neutral-200 bg-neutral-50/70 space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <span className="font-semibold text-xs text-neutral-900 font-mono">
-                    security-audit-skill
-                  </span>
-                  <span className="text-[10px] bg-amber-100 text-amber-800 font-mono px-1.5 py-0.2 rounded font-medium">
-                    RBAC & WAL
-                  </span>
-                </div>
-                <h4 className="text-xs font-semibold text-neutral-900">
-                  Blindagem de Segurança Local
-                </h4>
-                <p className="text-[11px] text-neutral-600 leading-relaxed">
-                  Proteção estrita por papéis (RBAC), sanitização de inputs de leitores de código de barras e integridade com SQLite WAL e chaves UUIDv7.
-                </p>
-              </div>
-
-              {/* Tool 6: Spec-Kit */}
-              <div className="p-3.5 rounded-xl border border-neutral-200 bg-neutral-50/70 space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <span className="font-semibold text-xs text-neutral-900 font-mono">
-                    spec-kit-main
-                  </span>
-                  <span className="text-[10px] bg-neutral-200 text-neutral-800 font-mono px-1.5 py-0.2 rounded font-medium">
-                    PRD & RFs
-                  </span>
-                </div>
-                <h4 className="text-xs font-semibold text-neutral-900">
-                  Conformidade com Requisitos (PRD)
-                </h4>
-                <p className="text-[11px] text-neutral-600 leading-relaxed">
-                  Matriz de rastreabilidade de requisitos funcionais: RF-01 a RF-12 cobertos por testes automatizados e validações de negócios da escola.
-                </p>
-              </div>
-            </div>
-          </div>
         </div>
       )}
 
@@ -1723,348 +1494,6 @@ export const OutboxSyncView: React.FC = () => {
                   <div className="text-lg font-mono tabular-nums font-semibold text-[#0f766e]">{ackedCount} itens</div>
                   <div className="text-[11px] text-neutral-400">Idempotência garantida</div>
                 </div>
-              </div>
-
-              {/* CARD 1: Parâmetros Técnicos do Motor SQLite & Diretivas PRAGMA */}
-              <div className="bg-white rounded-xl border border-neutral-200 p-5 space-y-4 shadow-2xs">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-neutral-100">
-                  <div>
-                    <h3 className="font-semibold text-sm text-neutral-900 flex items-center gap-2">
-                      <HardDrive className="w-4 h-4 text-[#0f766e]" />
-                      <span>Configuração do Motor SQLite & Diretivas PRAGMA</span>
-                    </h3>
-                    <p className="text-xs text-neutral-500 mt-0.5">
-                      Ajuste parâmetros de baixo nível do banco local para balancear velocidade de escrita e durabilidade em disco
-                    </p>
-                  </div>
-                  <button
-                    onClick={handleSaveSystemSettings}
-                    className="bg-[#0f766e] hover:bg-[#0d5f59] text-white text-xs font-medium px-3.5 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs self-start sm:self-auto"
-                  >
-                    <Check className="w-3.5 h-3.5" />
-                    <span>Salvar Parâmetros SQLite</span>
-                  </button>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 text-xs">
-                  {/* Journal Mode */}
-                  <div className="space-y-1.5">
-                    <label className="block font-medium text-neutral-800">
-                      PRAGMA journal_mode:
-                    </label>
-                    <select
-                      value={systemSettings.journal_mode}
-                      onChange={(e) =>
-                        setSystemSettings({
-                          ...systemSettings,
-                          journal_mode: e.target.value as any,
-                        })
-                      }
-                      className="w-full bg-white border border-neutral-300 rounded-lg px-2.5 py-1.5 text-xs text-neutral-800 font-mono focus:outline-none focus:border-[#0f766e]"
-                    >
-                      <option value="WAL">WAL (Write-Ahead Logging - Recomendado)</option>
-                      <option value="DELETE">DELETE (Padrão Clássico)</option>
-                      <option value="TRUNCATE">TRUNCATE (Zera arquivo de journal)</option>
-                      <option value="MEMORY">MEMORY (Journal volátil em RAM)</option>
-                    </select>
-                    <span className="text-[10px] text-neutral-400 block">
-                      Permite leituras concorrentes durante escritas de crachá.
-                    </span>
-                  </div>
-
-                  {/* Synchronous */}
-                  <div className="space-y-1.5">
-                    <label className="block font-medium text-neutral-800">
-                      PRAGMA synchronous:
-                    </label>
-                    <select
-                      value={systemSettings.synchronous}
-                      onChange={(e) =>
-                        setSystemSettings({
-                          ...systemSettings,
-                          synchronous: e.target.value as any,
-                        })
-                      }
-                      className="w-full bg-white border border-neutral-300 rounded-lg px-2.5 py-1.5 text-xs text-neutral-800 font-mono focus:outline-none focus:border-[#0f766e]"
-                    >
-                      <option value="NORMAL">NORMAL (Seguro e ultra-rápido para WAL)</option>
-                      <option value="FULL">FULL (Máxima segurança contra falta de energia)</option>
-                      <option value="OFF">OFF (Sem fsync - velocidade pura)</option>
-                    </select>
-                    <span className="text-[10px] text-neutral-400 block">
-                      Controla a frequência de sincronização física com o SSD.
-                    </span>
-                  </div>
-
-                  {/* Cache Size */}
-                  <div className="space-y-1.5">
-                    <label className="block font-medium text-neutral-800">
-                      PRAGMA cache_size:
-                    </label>
-                    <select
-                      value={systemSettings.cache_size}
-                      onChange={(e) =>
-                        setSystemSettings({
-                          ...systemSettings,
-                          cache_size: Number(e.target.value),
-                        })
-                      }
-                      className="w-full bg-white border border-neutral-300 rounded-lg px-2.5 py-1.5 text-xs text-neutral-800 font-mono focus:outline-none focus:border-[#0f766e]"
-                    >
-                      <option value={-2000}>-2000 páginas (~2 MB em RAM)</option>
-                      <option value={-4000}>-4000 páginas (~4 MB em RAM)</option>
-                      <option value={-8000}>-8000 páginas (~8 MB em RAM)</option>
-                      <option value={-16000}>-16000 páginas (~16 MB em RAM)</option>
-                    </select>
-                    <span className="text-[10px] text-neutral-400 block">
-                      Mantém tabelas de alunos e carteirinhas quentes na memória.
-                    </span>
-                  </div>
-
-                  {/* Busy Timeout */}
-                  <div className="space-y-1.5">
-                    <label className="block font-medium text-neutral-800">
-                      PRAGMA busy_timeout (ms):
-                    </label>
-                    <input
-                      type="number"
-                      step="500"
-                      min="1000"
-                      max="30000"
-                      value={systemSettings.busy_timeout}
-                      onChange={(e) =>
-                        setSystemSettings({
-                          ...systemSettings,
-                          busy_timeout: Number(e.target.value) || 5000,
-                        })
-                      }
-                      className="w-full bg-white border border-neutral-300 rounded-lg px-2.5 py-1.5 text-xs text-neutral-800 font-mono focus:outline-none focus:border-[#0f766e]"
-                    />
-                    <span className="text-[10px] text-neutral-400 block">
-                      Tempo de espera antes de retornar SQLITE_BUSY em concorrência.
-                    </span>
-                  </div>
-
-                  {/* Foreign Keys */}
-                  <div className="space-y-1.5">
-                    <label className="block font-medium text-neutral-800">
-                      PRAGMA foreign_keys:
-                    </label>
-                    <div className="flex items-center gap-3 pt-1">
-                      <label className="flex items-center gap-1.5 cursor-pointer text-xs">
-                        <input
-                          type="radio"
-                          name="fk_toggle"
-                          checked={systemSettings.foreign_keys === true}
-                          onChange={() =>
-                            setSystemSettings({ ...systemSettings, foreign_keys: true })
-                          }
-                          className="text-[#0f766e]"
-                        />
-                        <span className="font-semibold text-emerald-800">ON (Ativo)</span>
-                      </label>
-                      <label className="flex items-center gap-1.5 cursor-pointer text-xs">
-                        <input
-                          type="radio"
-                          name="fk_toggle"
-                          checked={systemSettings.foreign_keys === false}
-                          onChange={() =>
-                            setSystemSettings({ ...systemSettings, foreign_keys: false })
-                          }
-                          className="text-neutral-500"
-                        />
-                        <span className="text-neutral-600">OFF (Inativo)</span>
-                      </label>
-                    </div>
-                    <span className="text-[10px] text-neutral-400 block">
-                      Impede orfandade entre alunos, turmas e registros de frequência.
-                    </span>
-                  </div>
-
-                  {/* Auto Vacuum */}
-                  <div className="space-y-1.5">
-                    <label className="block font-medium text-neutral-800">
-                      PRAGMA auto_vacuum:
-                    </label>
-                    <select
-                      value={systemSettings.auto_vacuum}
-                      onChange={(e) =>
-                        setSystemSettings({
-                          ...systemSettings,
-                          auto_vacuum: e.target.value as any,
-                        })
-                      }
-                      className="w-full bg-white border border-neutral-300 rounded-lg px-2.5 py-1.5 text-xs text-neutral-800 font-mono focus:outline-none focus:border-[#0f766e]"
-                    >
-                      <option value="NONE">NONE (Manual via botão VACUUM)</option>
-                      <option value="FULL">FULL (Automático a cada exclusão)</option>
-                      <option value="INCREMENTAL">INCREMENTAL (Via pragma incremental_vacuum)</option>
-                    </select>
-                    <span className="text-[10px] text-neutral-400 block">
-                      Gerenciamento de páginas livres no arquivo físico .sqlite3.
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* CARD 2: Terminal & Console SQL Interativo (Query Runner) */}
-              <div className="bg-white rounded-xl border border-neutral-200 p-5 space-y-4 shadow-2xs">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                  <div>
-                    <h3 className="font-semibold text-sm text-neutral-900 flex items-center gap-2">
-                      <Terminal className="w-4 h-4 text-[#0f766e]" />
-                      <span>Console & Query Runner SQL (Acesso Técnico Direto)</span>
-                    </h3>
-                    <p className="text-xs text-neutral-500 mt-0.5">
-                      Execute consultas SELECT, inspeções de PRAGMA, contagens agregadas e manutenção direta no banco local
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={handleExecuteSql}
-                      disabled={isExecutingSql}
-                      className="bg-[#0f766e] hover:bg-[#0d5f59] disabled:opacity-50 text-white text-xs font-semibold px-4 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
-                    >
-                      <Play className={`w-3.5 h-3.5 ${isExecutingSql ? 'animate-spin' : ''}`} />
-                      <span>Executar Instrução SQL</span>
-                    </button>
-                  </div>
-                </div>
-
-                {/* Templates Rápidos */}
-                <div className="space-y-1.5">
-                  <span className="text-[11px] font-semibold text-neutral-500 uppercase tracking-wider block">
-                    Templates Rápidos de Consulta:
-                  </span>
-                  <div className="flex flex-wrap gap-1.5">
-                    {[
-                      {
-                        label: 'Alunos Ativos (Limit 5)',
-                        query: "SELECT * FROM students WHERE status = 'active' LIMIT 5;",
-                      },
-                      {
-                        label: 'Frequência por Tipo',
-                        query: 'SELECT event_type, COUNT(*) as total FROM attendance_events GROUP BY event_type;',
-                      },
-                      {
-                        label: 'Turmas & Capacidade',
-                        query: 'SELECT name, capacity, shift FROM classrooms;',
-                      },
-                      {
-                        label: 'Responsáveis',
-                        query: 'SELECT * FROM guardians LIMIT 5;',
-                      },
-                      {
-                        label: 'PRAGMA integrity_check',
-                        query: 'PRAGMA integrity_check;',
-                      },
-                      {
-                        label: 'PRAGMA page_count',
-                        query: 'PRAGMA page_count;',
-                      },
-                      {
-                        label: 'VACUUM',
-                        query: 'VACUUM;',
-                      },
-                      {
-                        label: 'REINDEX',
-                        query: 'REINDEX;',
-                      },
-                    ].map((tmpl, idx) => (
-                      <button
-                        key={idx}
-                        type="button"
-                        onClick={() => {
-                          setSqlQuery(tmpl.query);
-                        }}
-                        className="px-2.5 py-1 rounded-md text-[11px] font-mono bg-neutral-100 hover:bg-neutral-200 border border-neutral-200 text-neutral-700 cursor-pointer transition-colors"
-                      >
-                        {tmpl.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* SQL Code Box */}
-                <div className="relative rounded-xl overflow-hidden border border-neutral-800 bg-neutral-950">
-                  <div className="bg-neutral-900 px-3.5 py-1.5 flex items-center justify-between text-[11px] text-neutral-400 font-mono border-b border-neutral-800">
-                    <span className="flex items-center gap-1.5">
-                      <span className="w-2.5 h-2.5 rounded-full bg-rose-500/80 inline-block" />
-                      <span className="w-2.5 h-2.5 rounded-full bg-amber-500/80 inline-block" />
-                      <span className="w-2.5 h-2.5 rounded-full bg-emerald-500/80 inline-block" />
-                      <span className="ml-2 text-neutral-300">sqlite3_cli &bull; portaria_escolar.sqlite3</span>
-                    </span>
-                    <span>Modo Local-First</span>
-                  </div>
-                  <textarea
-                    rows={3}
-                    value={sqlQuery}
-                    onChange={(e) => setSqlQuery(e.target.value)}
-                    placeholder="Digite a consulta SQL aqui..."
-                    className="w-full bg-transparent text-emerald-400 font-mono text-xs p-3.5 focus:outline-none resize-none leading-relaxed selection:bg-emerald-900 selection:text-white"
-                  />
-                </div>
-
-                {/* SQL Results Table */}
-                {sqlResult && (
-                  <div className="space-y-2 pt-2 border-t border-neutral-100">
-                    <div className="flex items-center justify-between text-xs">
-                      <div className="flex items-center gap-2">
-                        <span className="font-semibold text-neutral-800 font-mono">
-                          Resultado da Query:
-                        </span>
-                        <span
-                          className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold uppercase ${sqlResult.error
-                              ? 'bg-rose-100 text-rose-800 border border-rose-200'
-                              : 'bg-emerald-100 text-emerald-800 border border-emerald-200'
-                            }`}
-                        >
-                          {sqlResult.commandType}
-                        </span>
-                        <span className="text-neutral-500 tabular-nums">
-                          {sqlResult.rowCount} registro(s) retornado(s)
-                        </span>
-                      </div>
-                      <span className="font-mono text-neutral-500 text-[11px] tabular-nums">
-                        Latência: <strong className="text-emerald-700">{sqlResult.executionTimeMs}ms</strong>
-                      </span>
-                    </div>
-
-                    {sqlResult.error ? (
-                      <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-rose-800 text-xs font-mono">
-                        {sqlResult.error}
-                      </div>
-                    ) : (
-                      <div className="overflow-x-auto border border-neutral-200 rounded-lg max-h-60 overflow-y-auto">
-                        <table className="w-full text-left text-xs font-mono">
-                          <thead className="bg-neutral-50 text-neutral-700 font-semibold border-b border-neutral-200 sticky top-0">
-                            <tr>
-                              {sqlResult.columns.map((col, idx) => (
-                                <th key={idx} className="py-2 px-3 whitespace-nowrap">
-                                  {col}
-                                </th>
-                              ))}
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y divide-neutral-100 bg-white">
-                            {sqlResult.rows.map((row, rIdx) => (
-                              <tr key={rIdx} className="hover:bg-neutral-50 transition-colors">
-                                {row.map((cell, cIdx) => (
-                                  <td
-                                    key={cIdx}
-                                    className="py-1.5 px-3 text-neutral-800 whitespace-nowrap text-[11px]"
-                                  >
-                                    {String(cell)}
-                                  </td>
-                                ))}
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    )}
-                  </div>
-                )}
               </div>
 
               {/* CARD 3: Parâmetros Institucionais e Horários de Turno (Modificação Real) */}
@@ -2287,14 +1716,6 @@ export const OutboxSyncView: React.FC = () => {
                     >
                       <Download className="w-3.5 h-3.5" />
                       <span>Baixar backup (.JSON)</span>
-                    </button>
-                    <button
-                      onClick={handleResetToSeed}
-                      className="bg-rose-50 hover:bg-rose-100 border border-rose-300 text-rose-700 text-xs font-medium px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer ml-auto"
-                      title="Restaurar registros originais"
-                    >
-                      <Trash2 className="w-3.5 h-3.5 text-rose-600" />
-                      <span>Restaurar Padrão de Fábrica</span>
                     </button>
                   </div>
                 </div>

@@ -169,6 +169,10 @@ export default function App() {
         isOpen={showTourModal}
         onClose={() => setShowTourModal(false)}
         currentTab={currentTab}
+        onNavigateTab={(tab) => {
+          setCurrentTab(tab);
+          setShowTourModal(false);
+        }}
       />
 
       {/* Change-profile modal (optional, opened from TopNav) */}
