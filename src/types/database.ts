@@ -18,6 +18,9 @@ export interface School {
   cnpj?: string;
   address?: string;
   school_year?: string;
+  phone?: string;
+  email?: string;
+  director?: string;
   morning_start?: string;
   morning_tolerance?: string;
   morning_end?: string;

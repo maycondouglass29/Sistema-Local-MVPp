@@ -527,10 +527,10 @@ export const OutboxSyncView: React.FC = () => {
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-neutral-200">
         <div>
           <h1 className="text-xl font-semibold text-neutral-900 tracking-tight flex items-center gap-2">
-            Configurações e Banco de Dados
+            Configurações
           </h1>
           <p className="text-xs text-neutral-500 mt-1">
-            Parâmetros de leitura, motor Laya, controle de acesso RBAC e gestão de persistência local (SQLite WAL)
+            Operador de portaria, câmeras, políticas pedagógicas, motor Laya e dados da escola
           </p>
         </div>
 
@@ -676,13 +676,8 @@ export const OutboxSyncView: React.FC = () => {
               : 'text-neutral-600 hover:text-neutral-900'
             }`}
         >
-          <HardDrive className="w-3.5 h-3.5 text-neutral-600" />
-          <span>Administração TI & SQLite</span>
-          {!isAdmin && (
-            <span title="Área restrita a Administrador">
-              <Lock className="w-3 h-3 text-amber-600" />
-            </span>
-          )}
+          <Building2 className="w-3.5 h-3.5 text-neutral-600" />
+          <span>Dados da Escola</span>
         </button>
       </div>
 
@@ -1330,492 +1325,281 @@ export const OutboxSyncView: React.FC = () => {
         </div>
       )}
 
-      {/* SECTION 5: ADMINISTRAÇÃO TI, SQLITE & HIERARQUIA RBAC */}
+      {/* SECTION 5: DADOS DA ESCOLA */}
       {activePersona === 'ti' && (
-        <div className="space-y-5">
-          {/* Check if current user is admin */}
-          {!isAdmin ? (
-            <div className="bg-white rounded-xl border border-neutral-200 p-8 text-center space-y-4 shadow-2xs">
-              <div className="w-14 h-14 rounded-2xl bg-amber-50 text-amber-600 flex items-center justify-center mx-auto border border-amber-200">
-                <ShieldAlert className="w-7 h-7" />
-              </div>
-              <div className="max-w-md mx-auto space-y-1">
-                <h3 className="text-base font-semibold text-neutral-900">
-                  Área Restrita a Administradores do Sistema
+        <div className="space-y-4">
+
+          {/* Card: Identificação da Instituição */}
+          <form
+            onSubmit={handleSaveSchoolParameters}
+            className="bg-white rounded-xl border border-neutral-200 shadow-2xs"
+          >
+            {/* Header */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-5 pb-4 border-b border-neutral-100">
+              <div>
+                <h3 className="text-sm font-semibold text-neutral-900 flex items-center gap-2">
+                  <Building2 className="w-4 h-4 text-[#0f766e]" />
+                  <span>Identificação da Instituição</span>
                 </h3>
-                <p className="text-xs text-neutral-500 leading-relaxed">
-                  Você está conectado como <strong className="text-neutral-800">{currentOperator.name}</strong> ({currentOperator.role === 'coordinator' ? 'Coordenação' : 'Operador de Portaria'}). As funções de persistência SQLite, auditoria de integridade e gestão de permissões globais exigem credencial de Administrador (TI).
+                <p className="text-xs text-neutral-500 mt-0.5">
+                  Dados que aparecem nos relatórios oficiais, carteirinhas e comunicações da escola
                 </p>
               </div>
-              <div className="pt-2">
-                <button
-                  onClick={() => {
-                    const adminUser = localDb.getUsers().find((u) => u.role === 'admin');
-                    if (adminUser) {
-                      handleSwitchOperator(adminUser);
-                    }
-                  }}
-                  className="px-4 py-2 rounded-lg bg-[#0f766e] hover:bg-[#0d5f59] text-white text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer shadow-xs"
-                >
-                  <Lock className="w-3.5 h-3.5" />
-                  <span>Conectar como Administrador ({localDb.getUsers().find((u) => u.role === 'admin')?.name || 'Maycon Douglas'})</span>
-                </button>
+              <button
+                type="submit"
+                className="bg-[#0f766e] hover:bg-[#0d5f59] text-white text-xs font-medium px-4 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs self-start sm:self-auto shrink-0"
+              >
+                <Check className="w-3.5 h-3.5" />
+                <span>Salvar dados</span>
+              </button>
+            </div>
+
+            <div className="p-5 space-y-5">
+              {/* Row 1: nome + CNPJ + ano */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
+                <div className="space-y-1 lg:col-span-2">
+                  <label className="block font-medium text-neutral-800">Nome da instituição</label>
+                  <input
+                    type="text"
+                    value={schoolForm.name}
+                    onChange={(e) => setSchoolForm({ ...schoolForm, name: e.target.value })}
+                    required
+                    placeholder="Ex: Escola Horizonte"
+                    className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-1.5 text-xs text-neutral-800 focus:outline-none focus:border-[#0f766e]"
+                  />
+                  <span className="text-[11px] text-neutral-400">Usado no cabeçalho dos relatórios A4 e carteirinhas</span>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block font-medium text-neutral-800">CNPJ oficial</label>
+                  <input
+                    type="text"
+                    value={schoolForm.cnpj || ''}
+                    onChange={(e) => setSchoolForm({ ...schoolForm, cnpj: e.target.value })}
+                    placeholder="12.345.678/0001-90"
+                    className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-1.5 text-xs text-neutral-800 font-mono focus:outline-none focus:border-[#0f766e]"
+                  />
+                  <span className="text-[11px] text-neutral-400">Impresso no rodapé dos relatórios A4</span>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block font-medium text-neutral-800">Ano letivo vigente</label>
+                  <input
+                    type="text"
+                    value={schoolForm.school_year || '2026'}
+                    onChange={(e) => setSchoolForm({ ...schoolForm, school_year: e.target.value })}
+                    placeholder="2026"
+                    className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-1.5 text-xs text-neutral-800 font-mono focus:outline-none focus:border-[#0f766e]"
+                  />
+                  <span className="text-[11px] text-neutral-400">Exibido nas carteirinhas e frequência</span>
+                </div>
+              </div>
+
+              {/* Row 2: endereço */}
+              <div className="grid grid-cols-1 text-xs">
+                <div className="space-y-1">
+                  <label className="block font-medium text-neutral-800">Endereço completo da unidade escolar</label>
+                  <input
+                    type="text"
+                    value={schoolForm.address || ''}
+                    onChange={(e) => setSchoolForm({ ...schoolForm, address: e.target.value })}
+                    placeholder="Av. das Acácias, 1500 — Jardim Primavera, São Paulo – SP"
+                    className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-1.5 text-xs text-neutral-800 focus:outline-none focus:border-[#0f766e]"
+                  />
+                  <span className="text-[11px] text-neutral-400">Exibido nos relatórios e comunicados aos responsáveis</span>
+                </div>
+              </div>
+
+              {/* Row 3: diretor + telefone + e-mail */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
+                <div className="space-y-1">
+                  <label className="block font-medium text-neutral-800">Diretor(a) responsável</label>
+                  <input
+                    type="text"
+                    value={(schoolForm as any).director || ''}
+                    onChange={(e) => setSchoolForm({ ...schoolForm, ...(schoolForm as any), director: e.target.value } as any)}
+                    placeholder="Ex: Prof.ª Ana Paula Souza"
+                    className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-1.5 text-xs text-neutral-800 focus:outline-none focus:border-[#0f766e]"
+                  />
+                  <span className="text-[11px] text-neutral-400">Assina os relatórios oficiais</span>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block font-medium text-neutral-800">Telefone institucional</label>
+                  <input
+                    type="tel"
+                    value={(schoolForm as any).phone || ''}
+                    onChange={(e) => setSchoolForm({ ...schoolForm, ...(schoolForm as any), phone: e.target.value } as any)}
+                    placeholder="(11) 3000-0000"
+                    className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-1.5 text-xs text-neutral-800 font-mono focus:outline-none focus:border-[#0f766e]"
+                  />
+                  <span className="text-[11px] text-neutral-400">Contato nos comunicados automáticos</span>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block font-medium text-neutral-800">E-mail institucional</label>
+                  <input
+                    type="email"
+                    value={(schoolForm as any).email || ''}
+                    onChange={(e) => setSchoolForm({ ...schoolForm, ...(schoolForm as any), email: e.target.value } as any)}
+                    placeholder="secretaria@escola.edu.br"
+                    className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-1.5 text-xs text-neutral-800 focus:outline-none focus:border-[#0f766e]"
+                  />
+                  <span className="text-[11px] text-neutral-400">Usado nos relatórios e avisos automáticos</span>
+                </div>
               </div>
             </div>
-          ) : (
-            <>
-              {/* Hierarquia de Usuários & Matriz RBAC */}
-              <div className="bg-white rounded-xl border border-neutral-200 p-5 space-y-4 shadow-2xs">
-                <div>
-                  <h3 className="text-sm font-semibold text-neutral-900 flex items-center gap-2">
-                    <Users className="w-4 h-4 text-[#0f766e]" />
-                    <span>Hierarquia de Usuários e Matriz de Permissões (RBAC)</span>
-                  </h3>
-                  <p className="text-xs text-neutral-500 mt-0.5">
-                    Controle de autorizações estruturado por papel para proteger as rotinas e cadastros da escola
-                  </p>
-                </div>
+          </form>
 
-                <div className="overflow-x-auto border border-neutral-200 rounded-lg">
-                  <table className="w-full text-left text-xs">
-                    <thead className="bg-neutral-50 text-neutral-600 font-semibold border-b border-neutral-200">
-                      <tr>
-                        <th className="py-2.5 px-3">Papel do Sistema</th>
-                        <th className="py-2.5 px-3">Usuário de Exemplo</th>
-                        <th className="py-2.5 px-3">Permissões de Portaria e CRUD</th>
-                        <th className="py-2.5 px-3">Configurações Permitidas</th>
-                        <th className="py-2.5 px-3 text-right">Ação</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-neutral-100 text-neutral-800">
-                      {/* Role 1: Operador */}
-                      <tr className={currentOperator.role === 'operator' ? 'bg-neutral-50' : ''}>
-                        <td className="py-2.5 px-3 font-semibold text-neutral-900">
-                          <span className="px-2 py-0.5 rounded bg-neutral-100 border border-neutral-200 text-neutral-700">
-                            Operador de Portaria
-                          </span>
-                        </td>
-                        <td className="py-2.5 px-3">Marina Azevedo (PORT-01)</td>
-                        <td className="py-2.5 px-3 text-[11px] text-neutral-600">
-                          Leitura de crachás, registro manual justificado de emergência, atalhos de teclado.
-                        </td>
-                        <td className="py-2.5 px-3 text-[11px] text-neutral-500">
-                          Somente teste de áudio e leitor. Sem acesso a regras ou banco.
-                        </td>
-                        <td className="py-2.5 px-3 text-right">
-                          <button
-                            onClick={() =>
-                              handleSwitchOperator(
-                                SYSTEM_OPERATORS.find((u) => u.role === 'operator')!
-                              )
-                            }
-                            className="text-xs text-[#0f766e] hover:underline cursor-pointer font-medium"
-                          >
-                            Simular Operador
-                          </button>
-                        </td>
-                      </tr>
-
-                      {/* Role 2: Coordenador */}
-                      <tr className={currentOperator.role === 'coordinator' ? 'bg-neutral-50' : ''}>
-                        <td className="py-2.5 px-3 font-semibold text-amber-800">
-                          <span className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-700">
-                            Coordenação Pedagógica
-                          </span>
-                        </td>
-                        <td className="py-2.5 px-3">Prof. Marcos Rocha (COORD-02)</td>
-                        <td className="py-2.5 px-3 text-[11px] text-neutral-600">
-                          CRUD completo de Alunos, Turmas e Responsáveis, Relatórios Oficiais A4 e Retificações RF-05.
-                        </td>
-                        <td className="py-2.5 px-3 text-[11px] text-neutral-500">
-                          Tolerância de atrasos, anti-duplicidade e mensagens de retenção.
-                        </td>
-                        <td className="py-2.5 px-3 text-right">
-                          <button
-                            onClick={() =>
-                              handleSwitchOperator(
-                                SYSTEM_OPERATORS.find((u) => u.role === 'coordinator')!
-                              )
-                            }
-                            className="text-xs text-amber-700 hover:underline cursor-pointer font-medium"
-                          >
-                            Simular Coordenação
-                          </button>
-                        </td>
-                      </tr>
-
-                      {/* Role 3: Administrador */}
-                      <tr className={currentOperator.role === 'admin' ? 'bg-neutral-50' : ''}>
-                        <td className="py-2.5 px-3 font-semibold text-purple-900">
-                          <span className="px-2 py-0.5 rounded bg-purple-50 border border-purple-200 text-purple-700">
-                            Administrador TI
-                          </span>
-                        </td>
-                        <td className="py-2.5 px-3">
-                          {localDb.getUsers().find((u) => u.role === 'admin')?.name || 'Maycon Douglas (TI)'} ({localDb.getUsers().find((u) => u.role === 'admin')?.badge_number || 'TI-01'})
-                        </td>
-                        <td className="py-2.5 px-3 text-[11px] text-neutral-600">
-                          Acesso irrestrito a todas as páginas, relatórios, cadastros e auditoria completa.
-                        </td>
-                        <td className="py-2.5 px-3 text-[11px] text-purple-700 font-semibold">
-                          Total: Câmeras CFTV, calibração Laya, SQLite WAL e Backups.
-                        </td>
-                        <td className="py-2.5 px-3 text-right">
-                          <span className="text-xs text-neutral-400 font-medium">Sessão Ativa</span>
-                        </td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
+          {/* Card: Horários dos Turnos */}
+          <form
+            onSubmit={handleSaveSchoolParameters}
+            className="bg-white rounded-xl border border-neutral-200 shadow-2xs"
+          >
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-5 pb-4 border-b border-neutral-100">
+              <div>
+                <h3 className="text-sm font-semibold text-neutral-900 flex items-center gap-2">
+                  <Clock className="w-4 h-4 text-[#0f766e]" />
+                  <span>Horários oficiais dos turnos</span>
+                </h3>
+                <p className="text-xs text-neutral-500 mt-0.5">
+                  Janelas de entrada, tolerância e saída — usadas pelo motor Laya para validar presenças e gerar os relatórios
+                </p>
               </div>
-
-              {/* SQLite Engine Metrics */}
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                <div className="bg-white rounded-xl border border-neutral-200 p-3.5 space-y-1 shadow-2xs">
-                  <span className="text-xs font-medium text-neutral-500">Motor de persistência</span>
-                  <div className="text-lg font-mono tabular-nums font-semibold text-neutral-900">SQLite WAL</div>
-                  <div className="text-[11px] text-neutral-400">journal_mode = WAL</div>
-                </div>
-
-                <div className="bg-white rounded-xl border border-neutral-200 p-3.5 space-y-1 shadow-2xs">
-                  <span className="text-xs font-medium text-neutral-500">Latência de commit</span>
-                  <div className="text-lg font-mono tabular-nums font-semibold text-emerald-700">&lt; 15ms</div>
-                  <div className="text-[11px] text-neutral-400">Atomic append-only</div>
-                </div>
-
-                <div className="bg-white rounded-xl border border-neutral-200 p-3.5 space-y-1 shadow-2xs">
-                  <span className="text-xs font-medium text-neutral-500">Fila outbox pendente</span>
-                  <div className="text-lg font-mono tabular-nums font-semibold text-amber-700">{pendingCount} itens</div>
-                  <div className="text-[11px] text-neutral-400">Aguardando sincronização</div>
-                </div>
-
-                <div className="bg-white rounded-xl border border-neutral-200 p-3.5 space-y-1 shadow-2xs">
-                  <span className="text-xs font-medium text-neutral-500">Confirmados (ACK)</span>
-                  <div className="text-lg font-mono tabular-nums font-semibold text-[#0f766e]">{ackedCount} itens</div>
-                  <div className="text-[11px] text-neutral-400">Idempotência garantida</div>
-                </div>
-              </div>
-
-              {/* CARD 3: Parâmetros Institucionais e Horários de Turno (Modificação Real) */}
-              <form
-                onSubmit={handleSaveSchoolParameters}
-                className="bg-white rounded-xl border border-neutral-200 p-5 space-y-4 shadow-2xs"
+              <button
+                type="submit"
+                className="bg-[#0f766e] hover:bg-[#0d5f59] text-white text-xs font-medium px-4 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs self-start sm:self-auto shrink-0"
               >
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-neutral-100">
-                  <div>
-                    <h3 className="font-semibold text-sm text-neutral-900 flex items-center gap-2">
-                      <Building2 className="w-4 h-4 text-[#0f766e]" />
-                      <span>Parâmetros da Instituição & Horários Oficiais dos Turnos</span>
-                    </h3>
-                    <p className="text-xs text-neutral-500 mt-0.5">
-                      Atualize o cabeçalho institucional dos Relatórios A4, CNPJ, dados cadastrais e as janelas de horários da escola
-                    </p>
-                  </div>
-                  <button
-                    type="submit"
-                    className="bg-[#0f766e] hover:bg-[#0d5f59] text-white text-xs font-medium px-4 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs self-start sm:self-auto"
-                  >
-                    <Check className="w-3.5 h-3.5" />
-                    <span>Salvar Dados Institucionais</span>
-                  </button>
+                <Check className="w-3.5 h-3.5" />
+                <span>Salvar horários</span>
+              </button>
+            </div>
+
+            <div className="p-5 grid grid-cols-1 md:grid-cols-2 gap-5">
+              {/* Turno Matutino */}
+              <div className="p-4 rounded-xl border border-neutral-200 bg-neutral-50/60 space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-neutral-900">Turno Matutino</span>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-50 border border-amber-200 text-amber-700">Manhã</span>
                 </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
-                  {/* Nome da Escola */}
-                  <div className="space-y-1 lg:col-span-2">
-                    <label className="block font-medium text-neutral-800">
-                      Razão Social / Nome da Instituição:
-                    </label>
-                    <input
-                      type="text"
-                      value={schoolForm.name}
-                      onChange={(e) => setSchoolForm({ ...schoolForm, name: e.target.value })}
-                      required
-                      placeholder="Ex: Escola Horizonte"
-                      className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-1.5 text-xs text-neutral-800 focus:outline-none focus:border-[#0f766e]"
-                    />
-                  </div>
-
-                  {/* CNPJ */}
+                <div className="grid grid-cols-3 gap-3 text-xs">
                   <div className="space-y-1">
-                    <label className="block font-medium text-neutral-800">
-                      CNPJ Oficial (Folha A4):
-                    </label>
+                    <label className="block text-[11px] font-medium text-neutral-600">Entrada</label>
                     <input
-                      type="text"
-                      value={schoolForm.cnpj || ''}
-                      onChange={(e) => setSchoolForm({ ...schoolForm, cnpj: e.target.value })}
-                      placeholder="12.345.678/0001-90"
-                      className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-1.5 text-xs text-neutral-800 font-mono focus:outline-none focus:border-[#0f766e]"
+                      type="time"
+                      value={schoolForm.morning_start || '07:00'}
+                      onChange={(e) => setSchoolForm({ ...schoolForm, morning_start: e.target.value })}
+                      className="w-full bg-white border border-neutral-300 rounded-lg px-2 py-1.5 text-xs font-mono focus:outline-none focus:border-[#0f766e]"
                     />
                   </div>
-
-                  {/* Ano Letivo */}
                   <div className="space-y-1">
-                    <label className="block font-medium text-neutral-800">
-                      Ano Letivo Vigente:
-                    </label>
+                    <label className="block text-[11px] font-medium text-neutral-600">Tolerância</label>
                     <input
-                      type="text"
-                      value={schoolForm.school_year || '2026'}
-                      onChange={(e) => setSchoolForm({ ...schoolForm, school_year: e.target.value })}
-                      placeholder="2026"
-                      className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-1.5 text-xs text-neutral-800 font-mono focus:outline-none focus:border-[#0f766e]"
+                      type="time"
+                      value={schoolForm.morning_tolerance || '07:15'}
+                      onChange={(e) => setSchoolForm({ ...schoolForm, morning_tolerance: e.target.value })}
+                      className="w-full bg-white border border-neutral-300 rounded-lg px-2 py-1.5 text-xs font-mono focus:outline-none focus:border-[#0f766e]"
                     />
                   </div>
-
-                  {/* Endereço */}
-                  <div className="space-y-1 lg:col-span-4">
-                    <label className="block font-medium text-neutral-800">
-                      Endereço Completo da Unidade Escolar:
-                    </label>
+                  <div className="space-y-1">
+                    <label className="block text-[11px] font-medium text-neutral-600">Saída</label>
                     <input
-                      type="text"
-                      value={schoolForm.address || ''}
-                      onChange={(e) => setSchoolForm({ ...schoolForm, address: e.target.value })}
-                      placeholder="Av. das Acácias, 1500 - Jardim Primavera, São Paulo - SP"
-                      className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-1.5 text-xs text-neutral-800 focus:outline-none focus:border-[#0f766e]"
+                      type="time"
+                      value={schoolForm.morning_end || '12:20'}
+                      onChange={(e) => setSchoolForm({ ...schoolForm, morning_end: e.target.value })}
+                      className="w-full bg-white border border-neutral-300 rounded-lg px-2 py-1.5 text-xs font-mono focus:outline-none focus:border-[#0f766e]"
                     />
                   </div>
                 </div>
-
-                {/* Grade de Horários dos Turnos */}
-                <div className="pt-3 border-t border-neutral-100 space-y-2">
-                  <span className="text-xs font-semibold text-neutral-800 block">
-                    Horários Oficiais para Validação pelo Motor Laya:
-                  </span>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {/* Turno Matutino */}
-                    <div className="p-3.5 rounded-xl border border-neutral-200 bg-neutral-50/70 space-y-2">
-                      <div className="font-semibold text-xs text-neutral-900 flex items-center justify-between">
-                        <span>Turno Matutino (Manhã)</span>
-                        <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-white border border-neutral-200 text-neutral-600">
-                          Matutino
-                        </span>
-                      </div>
-                      <div className="grid grid-cols-3 gap-2 text-xs">
-                        <div>
-                          <label className="block text-[11px] text-neutral-500">Início:</label>
-                          <input
-                            type="time"
-                            value={schoolForm.morning_start || '07:00'}
-                            onChange={(e) => setSchoolForm({ ...schoolForm, morning_start: e.target.value })}
-                            className="w-full bg-white border border-neutral-300 rounded px-2 py-1 text-xs font-mono"
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-[11px] text-neutral-500">Tolerância:</label>
-                          <input
-                            type="time"
-                            value={schoolForm.morning_tolerance || '07:15'}
-                            onChange={(e) => setSchoolForm({ ...schoolForm, morning_tolerance: e.target.value })}
-                            className="w-full bg-white border border-neutral-300 rounded px-2 py-1 text-xs font-mono"
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-[11px] text-neutral-500">Saída:</label>
-                          <input
-                            type="time"
-                            value={schoolForm.morning_end || '12:20'}
-                            onChange={(e) => setSchoolForm({ ...schoolForm, morning_end: e.target.value })}
-                            className="w-full bg-white border border-neutral-300 rounded px-2 py-1 text-xs font-mono"
-                          />
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Turno Vespertino */}
-                    <div className="p-3.5 rounded-xl border border-neutral-200 bg-neutral-50/70 space-y-2">
-                      <div className="font-semibold text-xs text-neutral-900 flex items-center justify-between">
-                        <span>Turno Vespertino (Tarde)</span>
-                        <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-white border border-neutral-200 text-neutral-600">
-                          Vespertino
-                        </span>
-                      </div>
-                      <div className="grid grid-cols-3 gap-2 text-xs">
-                        <div>
-                          <label className="block text-[11px] text-neutral-500">Início:</label>
-                          <input
-                            type="time"
-                            value={schoolForm.afternoon_start || '13:00'}
-                            onChange={(e) => setSchoolForm({ ...schoolForm, afternoon_start: e.target.value })}
-                            className="w-full bg-white border border-neutral-300 rounded px-2 py-1 text-xs font-mono"
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-[11px] text-neutral-500">Tolerância:</label>
-                          <input
-                            type="time"
-                            value={schoolForm.afternoon_tolerance || '13:15'}
-                            onChange={(e) => setSchoolForm({ ...schoolForm, afternoon_tolerance: e.target.value })}
-                            className="w-full bg-white border border-neutral-300 rounded px-2 py-1 text-xs font-mono"
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-[11px] text-neutral-500">Saída:</label>
-                          <input
-                            type="time"
-                            value={schoolForm.afternoon_end || '18:20'}
-                            onChange={(e) => setSchoolForm({ ...schoolForm, afternoon_end: e.target.value })}
-                            className="w-full bg-white border border-neutral-300 rounded px-2 py-1 text-xs font-mono"
-                          />
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </form>
-
-              {/* CARD 4: Manutenção Preventiva, Backups e Restauração de Fábrica */}
-              <div className="bg-white rounded-xl border border-neutral-200 p-5 space-y-4 shadow-2xs">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                  <div>
-                    <h3 className="font-semibold text-sm text-neutral-900 flex items-center gap-2">
-                      <ShieldCheck className="w-4 h-4 text-[#0f766e]" />
-                      <span>Manutenção Preventiva, Backups e Integridade do Banco</span>
-                    </h3>
-                    <p className="text-xs text-neutral-500 mt-0.5">
-                      Operações estruturais de TI para preservação do arquivo SQLite, dumps e redefinição
-                    </p>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      onClick={handleRunVacuum}
-                      className="bg-white border border-neutral-300 hover:bg-neutral-50 text-neutral-700 text-xs font-medium px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
-                      title="Compactar e recuperar páginas do SQLite"
-                    >
-                      <RotateCcw className="w-3.5 h-3.5 text-[#0f766e]" />
-                      <span>Executar VACUUM</span>
-                    </button>
-                    <button
-                      onClick={handleRunReindex}
-                      className="bg-white border border-neutral-300 hover:bg-neutral-50 text-neutral-700 text-xs font-medium px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
-                      title="Recriar índices de busca"
-                    >
-                      <RefreshCw className="w-3.5 h-3.5 text-[#0f766e]" />
-                      <span>Executar REINDEX</span>
-                    </button>
-                    <button
-                      onClick={handleCheckDatabaseIntegrity}
-                      className="bg-white border border-neutral-300 hover:bg-neutral-50 text-neutral-700 text-xs font-medium px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
-                    >
-                      <ShieldCheck className="w-3.5 h-3.5 text-[#0f766e]" />
-                      <span>Checar integridade</span>
-                    </button>
-                    <button
-                      onClick={handleDownloadSql}
-                      className="bg-white border border-neutral-300 hover:bg-neutral-50 text-neutral-700 text-xs font-medium px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer"
-                    >
-                      <Code className="w-3.5 h-3.5 text-[#0f766e]" />
-                      <span>Exportar DDL SQL</span>
-                    </button>
-                    <button
-                      onClick={handleDownloadBackupJson}
-                      className="bg-[#0f766e] hover:bg-[#0d5f59] text-white text-xs font-medium px-3.5 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
-                    >
-                      <Download className="w-3.5 h-3.5" />
-                      <span>Baixar backup (.JSON)</span>
-                    </button>
-                  </div>
-                </div>
-
-                {maintenanceNotice && (
-                  <div className="p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-mono tabular-nums flex items-center justify-between">
-                    <span>{maintenanceNotice}</span>
-                    <button onClick={() => setMaintenanceNotice(null)} className="text-emerald-700 hover:text-emerald-950 font-bold ml-2">✕</button>
-                  </div>
-                )}
-
-                {integrityStatus && (
-                  <div className="p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-mono tabular-nums">
-                    {integrityStatus}
-                  </div>
-                )}
-
-                {/* Outbox Table */}
-                <div className="pt-3 border-t border-neutral-100 space-y-2.5">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <h4 className="font-medium text-xs text-neutral-900">
-                        Fila de eventos transacionais outbox
-                      </h4>
-                      <p className="text-xs text-neutral-500">
-                        Registros salvos localmente aguardando confirmação do servidor central
-                      </p>
-                    </div>
-                    <button
-                      onClick={handleForceSync}
-                      disabled={!isOnline || isSyncing}
-                      className="text-xs text-[#0f766e] font-medium hover:underline flex items-center gap-1 cursor-pointer"
-                    >
-                      <RefreshCw className="w-3.5 h-3.5" />
-                      <span>Forçar envio</span>
-                    </button>
-                  </div>
-
-                  <div className="border border-neutral-200 rounded-lg overflow-hidden">
-                    <table className="w-full text-left text-xs">
-                      <thead className="bg-neutral-50 text-neutral-500 border-b border-neutral-200 font-medium">
-                        <tr>
-                          <th className="py-2 px-3">Item ID</th>
-                          <th className="py-2 px-3">Agregado</th>
-                          <th className="py-2 px-3">Chave de idempotência</th>
-                          <th className="py-2 px-3">Status</th>
-                          <th className="py-2 px-3">Tentativas</th>
-                          <th className="py-2 px-3 text-right">Inspecionar</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-neutral-100">
-                        {outboxItems.map((item) => (
-                          <tr
-                            key={item.id}
-                            className="hover:bg-neutral-50/80 transition-colors duration-150 h-10"
-                          >
-                            <td className="py-2 px-3 font-mono tabular-nums text-neutral-900">
-                              #{item.id.slice(0, 8)}
-                            </td>
-                            <td className="py-2 px-3 font-mono text-neutral-600">
-                              {item.aggregate_type}
-                            </td>
-                            <td className="py-2 px-3 font-mono tabular-nums text-neutral-500 text-xs truncate max-w-[200px]">
-                              {item.idempotency_key}
-                            </td>
-                            <td className="py-2 px-3">
-                              {item.state === 'acked' ? (
-                                <span className="px-2 py-0.5 rounded text-[11px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center gap-1 w-fit">
-                                  <CheckCircle2 className="w-3 h-3" /> ACK
-                                </span>
-                              ) : (
-                                <span className="px-2 py-0.5 rounded text-[11px] font-medium bg-amber-50 text-amber-700 border border-amber-200 flex items-center gap-1 w-fit">
-                                  <Clock className="w-3 h-3" /> Pendente
-                                </span>
-                              )}
-                            </td>
-                            <td className="py-2 px-3 font-mono tabular-nums text-neutral-600">
-                              {item.attempt_count} / 5
-                            </td>
-                            <td className="py-2 px-3 text-right">
-                              <button
-                                onClick={() => setSelectedItem(item)}
-                                className="p-1 rounded border border-neutral-300 hover:bg-neutral-100 text-neutral-600 cursor-pointer"
-                              >
-                                <Eye className="w-3.5 h-3.5" />
-                              </button>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
+                {/* Visual timeline strip */}
+                <div className="flex items-center gap-1 text-[10px] font-mono text-neutral-500 pt-1">
+                  <span className="bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded">{schoolForm.morning_start || '07:00'}</span>
+                  <div className="flex-1 h-px bg-amber-200 mx-1" />
+                  <span className="bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded">{schoolForm.morning_tolerance || '07:15'}</span>
+                  <div className="flex-1 h-px bg-neutral-200 mx-1" />
+                  <span className="bg-neutral-100 text-neutral-700 px-1.5 py-0.5 rounded">{schoolForm.morning_end || '12:20'}</span>
                 </div>
               </div>
-            </>
-          )}
+
+              {/* Turno Vespertino */}
+              <div className="p-4 rounded-xl border border-neutral-200 bg-neutral-50/60 space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-neutral-900">Turno Vespertino</span>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-sky-50 border border-sky-200 text-sky-700">Tarde</span>
+                </div>
+                <div className="grid grid-cols-3 gap-3 text-xs">
+                  <div className="space-y-1">
+                    <label className="block text-[11px] font-medium text-neutral-600">Entrada</label>
+                    <input
+                      type="time"
+                      value={schoolForm.afternoon_start || '13:00'}
+                      onChange={(e) => setSchoolForm({ ...schoolForm, afternoon_start: e.target.value })}
+                      className="w-full bg-white border border-neutral-300 rounded-lg px-2 py-1.5 text-xs font-mono focus:outline-none focus:border-[#0f766e]"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="block text-[11px] font-medium text-neutral-600">Tolerância</label>
+                    <input
+                      type="time"
+                      value={schoolForm.afternoon_tolerance || '13:15'}
+                      onChange={(e) => setSchoolForm({ ...schoolForm, afternoon_tolerance: e.target.value })}
+                      className="w-full bg-white border border-neutral-300 rounded-lg px-2 py-1.5 text-xs font-mono focus:outline-none focus:border-[#0f766e]"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="block text-[11px] font-medium text-neutral-600">Saída</label>
+                    <input
+                      type="time"
+                      value={schoolForm.afternoon_end || '18:20'}
+                      onChange={(e) => setSchoolForm({ ...schoolForm, afternoon_end: e.target.value })}
+                      className="w-full bg-white border border-neutral-300 rounded-lg px-2 py-1.5 text-xs font-mono focus:outline-none focus:border-[#0f766e]"
+                    />
+                  </div>
+                </div>
+                {/* Visual timeline strip */}
+                <div className="flex items-center gap-1 text-[10px] font-mono text-neutral-500 pt-1">
+                  <span className="bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded">{schoolForm.afternoon_start || '13:00'}</span>
+                  <div className="flex-1 h-px bg-amber-200 mx-1" />
+                  <span className="bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded">{schoolForm.afternoon_tolerance || '13:15'}</span>
+                  <div className="flex-1 h-px bg-neutral-200 mx-1" />
+                  <span className="bg-neutral-100 text-neutral-700 px-1.5 py-0.5 rounded">{schoolForm.afternoon_end || '18:20'}</span>
+                </div>
+              </div>
+            </div>
+          </form>
+
+          {/* Card: Backup dos dados */}
+          <div className="bg-white rounded-xl border border-neutral-200 p-5 shadow-2xs">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div>
+                <h3 className="font-semibold text-sm text-neutral-900 flex items-center gap-2">
+                  <Download className="w-4 h-4 text-[#0f766e]" />
+                  <span>Cópia de segurança dos dados</span>
+                </h3>
+                <p className="text-xs text-neutral-500 mt-0.5">
+                  Exporte todos os registros do sistema em um arquivo JSON para guardar ou migrar para outro dispositivo
+                </p>
+              </div>
+              <button
+                onClick={handleDownloadBackupJson}
+                className="bg-[#0f766e] hover:bg-[#0d5f59] text-white text-xs font-medium px-4 py-2 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs shrink-0"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Baixar backup (.JSON)</span>
+              </button>
+            </div>
+            {maintenanceNotice && (
+              <div className="mt-3 p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center justify-between">
+                <span>{maintenanceNotice}</span>
+                <button onClick={() => setMaintenanceNotice(null)} className="text-emerald-700 hover:text-emerald-950 font-bold ml-2">✕</button>
+              </div>
+            )}
+          </div>
+
         </div>
       )}
 
-      {/* Modal Payload Inspector */}
+            {/* Modal Payload Inspector */}
       {selectedItem && (
         <div className="fixed inset-0 bg-neutral-900/60 backdrop-blur-xs z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-xl border border-neutral-200 max-w-lg w-full p-5 shadow-lg space-y-4">
