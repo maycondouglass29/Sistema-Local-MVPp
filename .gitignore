@@ -13,5 +13,5 @@ coverage/
 *.lnk
 *.db
 *.sqlite*
-data/*.db
+data/*.db*
 data/*.sqlite*

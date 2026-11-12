@@ -1,6 +1,8 @@
 // Hardware & External Camera Management Service
 // Suporta Câmeras USB (WebRTC/UVC), Placas de Captura HDMI e Câmeras IP / CFTV Local
 
+import { canAttemptBackend, isBackendAlive } from './apiClient';
+
 export type CameraSourceType = 'usb_webrtc' | 'ip_stream' | 'disabled';
 export type CameraResolution = '480p' | '720p' | '1080p';
 
@@ -65,9 +67,12 @@ class HardwareConfigService {
   }
 
   private async syncFromBackend() {
+    if (!canAttemptBackend()) return;
     try {
-      const res = await fetch(`${API_BASE}/hardware/config`);
-      if (res.ok) {
+      const alive = await isBackendAlive();
+      if (!alive) return;
+      const res = await fetch(`${API_BASE}/hardware/config`).catch(() => null);
+      if (res && res.ok) {
         const backendConfig = await res.json();
         this.config = { ...this.config, ...backendConfig };
         this.notify();
@@ -114,15 +119,16 @@ class HardwareConfigService {
 
     this.notify();
 
-    // Persist to SQLite backend
-    try {
-      await fetch(`${API_BASE}/hardware/config`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(this.config),
-      });
-    } catch {
-      // Offline fallback: saved locally
+    // Persist to SQLite backend only if backend is active and reachable
+    if (canAttemptBackend()) {
+      isBackendAlive().then((alive) => {
+        if (!alive) return;
+        fetch(`${API_BASE}/hardware/config`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(this.config),
+        }).catch(() => {});
+      }).catch(() => {});
     }
 
     return { ...this.config };
