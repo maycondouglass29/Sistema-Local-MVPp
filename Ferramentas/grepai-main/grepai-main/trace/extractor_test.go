@@ -1,0 +1,1598 @@
+package trace
+
+import (
+	"context"
+	"sort"
+	"testing"
+)
+
+func TestRegexExtractor_SupportedLanguages(t *testing.T) {
+	extractor := NewRegexExtractor()
+	langs := extractor.SupportedLanguages()
+
+	expected := map[string]bool{
+		".go":   true,
+		".js":   true,
+		".ts":   true,
+		".jsx":  true,
+		".tsx":  true,
+		".py":   true,
+		".php":  true,
+		".lua":  true,
+		".c":    true,
+		".h":    true,
+		".zig":  true,
+		".rs":   true,
+		".cpp":  true,
+		".hpp":  true,
+		".cc":   true,
+		".cxx":  true,
+		".hxx":  true,
+		".java": true,
+		".cs":   true,
+		".pas":  true,
+		".dpr":  true,
+		".fs":   true,
+		".fsx":  true,
+		".fsi":  true,
+		".gd":   true,
+		".rb":   true,
+	}
+
+	for _, lang := range langs {
+		if !expected[lang] {
+			t.Errorf("unexpected language extension: %s", lang)
+		}
+		delete(expected, lang)
+	}
+
+	for lang := range expected {
+		t.Errorf("missing language extension: %s", lang)
+	}
+}
+
+func TestRegexExtractor_ExtractSymbols_C(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `#include <stdio.h>
+
+typedef struct {
+    int x;
+    int y;
+} Point;
+
+struct Rectangle {
+    int width;
+    int height;
+};
+
+int calculate_area(int width, int height) {
+    return width * height;
+}
+
+void print_result(int value) {
+    printf("%d\n", value);
+}
+`
+
+	symbols, err := extractor.ExtractSymbols(ctx, "test.c", content)
+	if err != nil {
+		t.Fatalf("ExtractSymbols failed: %v", err)
+	}
+
+	foundFunctions := make(map[string]bool)
+	foundTypes := make(map[string]bool)
+
+	for _, sym := range symbols {
+		switch sym.Kind {
+		case KindFunction:
+			foundFunctions[sym.Name] = true
+		case KindType:
+			foundTypes[sym.Name] = true
+		}
+	}
+
+	expectedFunctions := []string{"calculate_area", "print_result"}
+	for _, name := range expectedFunctions {
+		if !foundFunctions[name] {
+			t.Errorf("missing function: %s", name)
+		}
+	}
+
+	expectedTypes := []string{"Point", "Rectangle"}
+	for _, name := range expectedTypes {
+		if !foundTypes[name] {
+			t.Errorf("missing type: %s", name)
+		}
+	}
+}
+
+func TestRegexExtractor_ExtractSymbols_Zig(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	// Test code based on real Zig standard library patterns
+	content := `const std = @import("std");
+
+pub const Point = struct {
+    x: i32,
+    y: i32,
+
+    pub fn init(x: i32, y: i32) Point {
+        return Point{ .x = x, .y = y };
+    }
+
+    pub inline fn distance(self: Point, other: Point) i32 {
+        return self.x - other.x;
+    }
+};
+
+pub const Color = enum {
+    red,
+    green,
+    blue,
+
+    pub fn isRed(self: Color) bool {
+        return self == .red;
+    }
+};
+
+pub const Alignment = enum(u8) {
+    @"1" = 0,
+    @"2" = 1,
+
+    pub fn toByteUnits(a: Alignment) usize {
+        return @as(usize, 1) << @intFromEnum(a);
+    }
+
+    pub const Mode = enum {
+        decimal,
+        binary,
+    };
+};
+
+fn calculate_area(width: i32, height: i32) i32 {
+    return width * height;
+}
+
+pub inline fn helper() void {}
+
+export fn exported_func() void {}
+
+pub fn main() void {
+    const area = calculate_area(10, 20);
+    std.debug.print("{}\n", .{area});
+}
+`
+
+	symbols, err := extractor.ExtractSymbols(ctx, "test.zig", content)
+	if err != nil {
+		t.Fatalf("ExtractSymbols failed: %v", err)
+	}
+
+	foundFunctions := make(map[string]bool)
+	foundMethods := make(map[string]bool)
+	foundTypes := make(map[string]bool)
+
+	for _, sym := range symbols {
+		switch sym.Kind {
+		case KindFunction:
+			foundFunctions[sym.Name] = true
+		case KindMethod:
+			foundMethods[sym.Name] = true
+		case KindType:
+			foundTypes[sym.Name] = true
+		}
+	}
+
+	// Top-level functions
+	expectedFunctions := []string{"calculate_area", "main", "helper", "exported_func"}
+	for _, name := range expectedFunctions {
+		if !foundFunctions[name] {
+			t.Errorf("missing function: %s", name)
+		}
+	}
+
+	// Methods inside structs/enums
+	expectedMethods := []string{"init", "distance", "isRed", "toByteUnits"}
+	for _, name := range expectedMethods {
+		if !foundMethods[name] {
+			t.Errorf("missing method: %s", name)
+		}
+	}
+
+	// Types (structs, enums)
+	expectedTypes := []string{"Point", "Color", "Alignment", "Mode"}
+	for _, name := range expectedTypes {
+		if !foundTypes[name] {
+			t.Errorf("missing type: %s", name)
+		}
+	}
+}
+
+func TestRegexExtractor_ExtractSymbols_Rust(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `struct Point {
+    x: i32,
+    y: i32,
+}
+
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+trait Drawable {
+    fn draw(&self);
+}
+
+fn calculate_area(width: i32, height: i32) -> i32 {
+    width * height
+}
+
+pub fn main() {
+    let area = calculate_area(10, 20);
+    println!("{}", area);
+}
+`
+
+	symbols, err := extractor.ExtractSymbols(ctx, "test.rs", content)
+	if err != nil {
+		t.Fatalf("ExtractSymbols failed: %v", err)
+	}
+
+	foundFunctions := make(map[string]bool)
+	foundTypes := make(map[string]bool)
+	foundTraits := make(map[string]bool)
+
+	for _, sym := range symbols {
+		switch sym.Kind {
+		case KindFunction:
+			foundFunctions[sym.Name] = true
+		case KindType:
+			foundTypes[sym.Name] = true
+		case KindInterface:
+			foundTraits[sym.Name] = true
+		}
+	}
+
+	expectedFunctions := []string{"calculate_area", "main"}
+	for _, name := range expectedFunctions {
+		if !foundFunctions[name] {
+			t.Errorf("missing function: %s", name)
+		}
+	}
+
+	expectedTypes := []string{"Point", "Color"}
+	for _, name := range expectedTypes {
+		if !foundTypes[name] {
+			t.Errorf("missing type: %s", name)
+		}
+	}
+
+	if !foundTraits["Drawable"] {
+		t.Error("missing trait: Drawable")
+	}
+}
+
+func TestRegexExtractor_ExtractSymbols_Cpp(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `#include <iostream>
+#include <vector>
+
+template<typename T>
+class Container {
+public:
+    void push(T value) {
+        data_.push_back(value);
+    }
+
+    T pop() {
+        T val = data_.back();
+        data_.pop_back();
+        return val;
+    }
+
+    size_t size() const {
+        return data_.size();
+    }
+
+private:
+    std::vector<T> data_;
+};
+
+class Point {
+public:
+    int x;
+    int y;
+
+    int distance(const Point& other) const {
+        return abs(x - other.x) + abs(y - other.y);
+    }
+};
+
+struct Rectangle {
+    int width;
+    int height;
+};
+
+enum class Color {
+    Red,
+    Green,
+    Blue
+};
+
+int calculate_area(int width, int height) {
+    return width * height;
+}
+
+void print_result(int value) {
+    std::cout << value << std::endl;
+}
+`
+
+	symbols, err := extractor.ExtractSymbols(ctx, "test.cpp", content)
+	if err != nil {
+		t.Fatalf("ExtractSymbols failed: %v", err)
+	}
+
+	foundFunctions := make(map[string]bool)
+	foundMethods := make(map[string]bool)
+	foundClasses := make(map[string]bool)
+	foundTypes := make(map[string]bool)
+
+	for _, sym := range symbols {
+		switch sym.Kind {
+		case KindFunction:
+			foundFunctions[sym.Name] = true
+		case KindMethod:
+			foundMethods[sym.Name] = true
+		case KindClass:
+			foundClasses[sym.Name] = true
+		case KindType:
+			foundTypes[sym.Name] = true
+		}
+	}
+
+	expectedFunctions := []string{"calculate_area", "print_result"}
+	for _, name := range expectedFunctions {
+		if !foundFunctions[name] {
+			t.Errorf("missing function: %s", name)
+		}
+	}
+
+	// Methods inside classes
+	expectedMethods := []string{"push", "pop", "size", "distance"}
+	for _, name := range expectedMethods {
+		if !foundMethods[name] {
+			t.Errorf("missing method: %s", name)
+		}
+	}
+
+	expectedClasses := []string{"Container", "Point", "Rectangle"}
+	for _, name := range expectedClasses {
+		if !foundClasses[name] {
+			t.Errorf("missing class: %s", name)
+		}
+	}
+
+	if !foundTypes["Color"] {
+		t.Error("missing enum type: Color")
+	}
+}
+
+func TestRegexExtractor_ExtractSymbols_Java(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `package com.example.app;
+
+import java.util.List;
+import java.util.Map;
+import java.io.IOException;
+
+/**
+ * Main application class demonstrating various Java constructs.
+ */
+public class Application extends BaseApp implements Runnable {
+
+    private String name;
+    private static int counter = 0;
+
+    // Constructor
+    public Application(String name) {
+        this.name = name;
+    }
+
+    // Static method
+    public static Application create(String name) {
+        return new Application(name);
+    }
+
+    // Instance method with generics
+    public List<String> getItems(Map<String, Integer> filter) {
+        return null;
+    }
+
+    // Synchronized method
+    public synchronized void process() {
+        counter++;
+    }
+
+    // Method with throws clause
+    public void load() throws IOException {
+        // implementation
+    }
+
+    // Final method
+    public final void complete() {
+        System.out.println("Complete");
+    }
+
+    // Override from Runnable
+    @Override
+    public void run() {
+        process();
+    }
+
+    // Inner class
+    private static class Helper {
+        public void assist() {
+            // helper method
+        }
+    }
+
+    // Inner enum
+    public enum Status {
+        PENDING,
+        ACTIVE,
+        COMPLETED;
+
+        public boolean isActive() {
+            return this == ACTIVE;
+        }
+    }
+}
+
+// Interface with generics
+public interface Repository<T> {
+
+    T findById(Long id);
+
+    List<T> findAll();
+
+    default void log(String message) {
+        System.out.println(message);
+    }
+}
+
+// Abstract class
+public abstract class BaseService {
+
+    public abstract void execute();
+
+    protected void init() {
+        // initialization
+    }
+}
+
+// Annotation type
+public @interface Deprecated {
+}
+
+// Enum at top level
+public enum Priority {
+    LOW,
+    MEDIUM,
+    HIGH
+}
+
+// Record (Java 14+)
+public record Point(int x, int y) {
+
+    public int distanceFromOrigin() {
+        return (int) Math.sqrt(x * x + y * y);
+    }
+}
+
+// Generic class
+public class Container<T> {
+
+    private T value;
+
+    public T getValue() {
+        return value;
+    }
+
+    public void setValue(T value) {
+        this.value = value;
+    }
+}
+`
+
+	symbols, err := extractor.ExtractSymbols(ctx, "Application.java", content)
+	if err != nil {
+		t.Fatalf("ExtractSymbols failed: %v", err)
+	}
+
+	foundMethods := make(map[string]bool)
+	foundClasses := make(map[string]bool)
+	foundInterfaces := make(map[string]bool)
+	foundTypes := make(map[string]bool)
+
+	for _, sym := range symbols {
+		switch sym.Kind {
+		case KindMethod:
+			foundMethods[sym.Name] = true
+		case KindClass:
+			foundClasses[sym.Name] = true
+		case KindInterface:
+			foundInterfaces[sym.Name] = true
+		case KindType:
+			foundTypes[sym.Name] = true
+		}
+	}
+
+	// Test methods (including constructors)
+	expectedMethods := []string{
+		"Application",        // constructor
+		"create",             // static method
+		"getItems",           // method with generics
+		"process",            // synchronized method
+		"load",               // method with throws
+		"complete",           // final method
+		"run",                // override method
+		"assist",             // inner class method
+		"isActive",           // enum method
+		"findById",           // interface method
+		"findAll",            // interface method
+		"log",                // default method
+		"execute",            // abstract method
+		"init",               // protected method
+		"distanceFromOrigin", // record method
+		"getValue",           // generic class method
+		"setValue",           // generic class method
+	}
+	for _, name := range expectedMethods {
+		if !foundMethods[name] {
+			t.Errorf("missing method: %s", name)
+		}
+	}
+
+	// Test classes (including enums and records)
+	expectedClasses := []string{
+		"Application", // main class
+		"Helper",      // inner class
+		"BaseService", // abstract class
+		"Priority",    // top-level enum
+		"Point",       // record
+		"Container",   // generic class
+	}
+	for _, name := range expectedClasses {
+		if !foundClasses[name] {
+			t.Errorf("missing class: %s", name)
+		}
+	}
+
+	// Test interfaces (including annotations)
+	expectedInterfaces := []string{
+		"Repository", // generic interface
+		"Deprecated", // annotation type
+	}
+	for _, name := range expectedInterfaces {
+		if !foundInterfaces[name] {
+			t.Errorf("missing interface: %s", name)
+		}
+	}
+
+	// Test inner enum as type
+	if !foundTypes["Status"] {
+		t.Error("missing inner enum type: Status")
+	}
+}
+
+func TestRegexExtractor_ExtractSymbols_CSharp(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `using System;
+using System.Collections.Generic;
+
+namespace Sample.App;
+
+public interface IRepository<T>
+{
+    T GetById(Guid id);
+    IEnumerable<T> GetAll();
+}
+
+public record User(Guid Id, string Name)
+{
+    public string DisplayName() => $"{Name}";
+}
+
+public abstract class BaseService
+{
+    protected abstract void Execute();
+}
+
+public class UserService : BaseService
+{
+    private readonly IRepository<User> _repo;
+
+    public UserService(IRepository<User> repo)
+    {
+        _repo = repo;
+    }
+
+    public override void Execute()
+    {
+        var user = new User(Guid.NewGuid(), "Ada");
+        Console.WriteLine(user.DisplayName());
+        _repo.GetById(user.Id);
+    }
+
+    public IEnumerable<User> GetUsers() => _repo.GetAll();
+}
+
+public readonly struct Result<T>
+{
+    public T Value { get; }
+    public Result(T value) => Value = value;
+}
+`
+
+	symbols, err := extractor.ExtractSymbols(ctx, "UserService.cs", content)
+	if err != nil {
+		t.Fatalf("ExtractSymbols failed: %v", err)
+	}
+
+	foundMethods := make(map[string]bool)
+	foundClasses := make(map[string]bool)
+	foundInterfaces := make(map[string]bool)
+
+	for _, sym := range symbols {
+		switch sym.Kind {
+		case KindMethod:
+			foundMethods[sym.Name] = true
+		case KindClass:
+			foundClasses[sym.Name] = true
+		case KindInterface:
+			foundInterfaces[sym.Name] = true
+		}
+	}
+
+	expectedMethods := []string{
+		"GetById",
+		"GetAll",
+		"DisplayName",
+		"UserService",
+		"Execute",
+		"GetUsers",
+		"Result",
+	}
+	for _, name := range expectedMethods {
+		if !foundMethods[name] {
+			t.Errorf("missing method: %s", name)
+		}
+	}
+
+	expectedClasses := []string{"User", "BaseService", "UserService", "Result"}
+	for _, name := range expectedClasses {
+		if !foundClasses[name] {
+			t.Errorf("missing class: %s", name)
+		}
+	}
+
+	if !foundInterfaces["IRepository"] {
+		t.Error("missing interface: IRepository")
+	}
+}
+
+func TestRegexExtractor_ExtractReferences(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `fn helper() i32 {
+    return 42;
+}
+
+pub fn main() void {
+    const result = helper();
+    std.debug.print("{}\n", .{result});
+}
+`
+
+	refs, err := extractor.ExtractReferences(ctx, "test.zig", content)
+	if err != nil {
+		t.Fatalf("ExtractReferences failed: %v", err)
+	}
+
+	foundRefs := make(map[string]bool)
+	for _, ref := range refs {
+		foundRefs[ref.SymbolName] = true
+	}
+
+	if !foundRefs["helper"] {
+		t.Error("missing reference to helper")
+	}
+}
+
+func TestRegexExtractor_ExtractReferences_IgnoresStringAndCommentArtifacts(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `package main
+
+func helper() {}
+
+func run() {
+    fmt.Printf("RPG: enabled (%s) fakeCall()", "ok")
+    // commentCall()
+    helper()
+}`
+
+	refs, err := extractor.ExtractReferences(ctx, "test.go", content)
+	if err != nil {
+		t.Fatalf("ExtractReferences failed: %v", err)
+	}
+
+	foundRefs := make(map[string]bool)
+	for _, ref := range refs {
+		foundRefs[ref.SymbolName] = true
+	}
+
+	if !foundRefs["helper"] {
+		t.Error("missing reference to helper")
+	}
+	if foundRefs["enabled"] {
+		t.Error("unexpected string artifact reference: enabled")
+	}
+	if foundRefs["s"] {
+		t.Error("unexpected format placeholder artifact reference: s")
+	}
+	if foundRefs["fakeCall"] {
+		t.Error("unexpected string artifact reference: fakeCall")
+	}
+	if foundRefs["commentCall"] {
+		t.Error("unexpected comment artifact reference: commentCall")
+	}
+}
+
+func TestRegexExtractor_ExtractReferences_IgnoresAnonFuncDeclarationArtifact(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `package main
+
+func helper() {}
+
+func run() {
+    go func() {
+        helper()
+    }()
+}`
+
+	refs, err := extractor.ExtractReferences(ctx, "test.go", content)
+	if err != nil {
+		t.Fatalf("ExtractReferences failed: %v", err)
+	}
+
+	foundRefs := make(map[string]bool)
+	for _, ref := range refs {
+		foundRefs[ref.SymbolName] = true
+	}
+
+	if !foundRefs["helper"] {
+		t.Error("missing reference to helper")
+	}
+	if foundRefs["func"] {
+		t.Error("unexpected anonymous function declaration artifact: func")
+	}
+}
+
+func TestRegexExtractor_ExtractSymbols_Lua(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `local function helper(x)
+  return x + 1
+end
+
+function process(input)
+  return helper(input)
+end
+
+function M.foo(x)
+  return helper(x)
+end
+
+function M:bar(x)
+  return self:foo(x)
+end
+
+local baz = function(x)
+  return x * 2
+end
+
+M.qux = function(x)
+  return baz(x)
+end
+
+M["zip"] = function(x)
+  return x - 1
+end
+
+M["nested"]["zap"] = function(x)
+  return x + 3
+end
+`
+
+	symbols, err := extractor.ExtractSymbols(ctx, "test.lua", content)
+	if err != nil {
+		t.Fatalf("ExtractSymbols failed: %v", err)
+	}
+
+	foundFunctions := make(map[string]bool)
+	foundMethods := make(map[string]bool)
+	for _, sym := range symbols {
+		switch sym.Kind {
+		case KindFunction:
+			foundFunctions[sym.Name] = true
+		case KindMethod:
+			foundMethods[sym.Name] = true
+		}
+	}
+
+	for _, name := range []string{"helper", "process", "baz"} {
+		if !foundFunctions[name] {
+			t.Errorf("missing function: %s", name)
+		}
+	}
+	for _, name := range []string{"foo", "bar", "qux", "zip", "zap"} {
+		if !foundMethods[name] {
+			t.Errorf("missing method: %s", name)
+		}
+	}
+}
+
+func TestRegexExtractor_ExtractReferences_Lua(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `local function helper(x)
+  return x + 1
+end
+
+local function weirdCall(x)
+  return helper(x)
+end
+
+function process(input)
+  helper(input)
+  M.foo(input)
+  M:bar(input)
+  weirdCall --[[inline comment]] (input)
+  local hello = "world" -- commentCall()
+end
+
+obj["foo"](1)
+obj["bar"]["foo"](2)
+obj["bar"]()["foo"](3)
+asdf["f"] --[[asdf ]] ()
+`
+
+	refs, err := extractor.ExtractReferences(ctx, "test.lua", content)
+	if err != nil {
+		t.Fatalf("ExtractReferences failed: %v", err)
+	}
+
+	callers := make(map[string]map[string]bool)
+	for _, ref := range refs {
+		if callers[ref.CallerName] == nil {
+			callers[ref.CallerName] = make(map[string]bool)
+		}
+		callers[ref.CallerName][ref.SymbolName] = true
+	}
+
+	for _, callee := range []string{"helper", "foo", "bar", "weirdCall"} {
+		if callers["process"] == nil || !callers["process"][callee] {
+			t.Errorf("missing process -> %s reference", callee)
+		}
+	}
+
+	if callers["process"]["commentCall"] {
+		t.Error("unexpected inline-comment artifact: commentCall")
+	}
+	if callers["<top-level>"] == nil || !callers["<top-level>"]["foo"] {
+		t.Error("missing top-level bracket-call reference to foo")
+	}
+	if callers["<top-level>"] == nil || !callers["<top-level>"]["bar"] {
+		t.Error("missing top-level bracket-call reference to bar")
+	}
+	if callers["<top-level>"] == nil || !callers["<top-level>"]["f"] {
+		t.Error("missing top-level comment-separated bracket-call reference to f")
+	}
+}
+
+func TestRegexExtractor_ExtractReferences_Lua_SkipCallResultKeyAccess(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `obj["bar"]()["foo"](1)`
+
+	refs, err := extractor.ExtractReferences(ctx, "test.lua", content)
+	if err != nil {
+		t.Fatalf("ExtractReferences failed: %v", err)
+	}
+
+	found := make(map[string]bool)
+	for _, ref := range refs {
+		found[ref.SymbolName] = true
+	}
+	if !found["bar"] {
+		t.Error("missing reference to bar")
+	}
+	if found["foo"] {
+		t.Error("unexpected reference to foo from call-result key access")
+	}
+}
+
+func TestRegexExtractor_ExtractReferences_Lua_IgnoresLongCommentsAndStrings(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `local function run()
+  -- hiddenCall()
+  --[[ longHiddenCall() ]]
+  --[=[ eqHiddenCall() ]=]
+  local a = [[stringCall()]]
+  local b = [=[anotherStringCall()]=]
+  realCall()
+end`
+
+	refs, err := extractor.ExtractReferences(ctx, "test.lua", content)
+	if err != nil {
+		t.Fatalf("ExtractReferences failed: %v", err)
+	}
+
+	found := make(map[string]bool)
+	for _, ref := range refs {
+		found[ref.SymbolName] = true
+	}
+	if !found["realCall"] {
+		t.Error("missing realCall reference")
+	}
+	for _, unexpected := range []string{"hiddenCall", "longHiddenCall", "eqHiddenCall", "stringCall", "anotherStringCall"} {
+		if found[unexpected] {
+			t.Errorf("unexpected Lua artifact reference: %s", unexpected)
+		}
+	}
+}
+
+func TestRegexExtractor_ExtractReferences_Lua_DedupesAndSkipsDeclarationNoise(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `function M.foo(x)
+  return x
+end
+
+function M:bar(x)
+  return x
+end
+
+function process(input)
+  M.foo(input)
+  M:bar(input)
+end`
+
+	refs, err := extractor.ExtractReferences(ctx, "test.lua", content)
+	if err != nil {
+		t.Fatalf("ExtractReferences failed: %v", err)
+	}
+
+	if len(refs) != 2 {
+		t.Fatalf("expected exactly 2 refs, got %d: %#v", len(refs), refs)
+	}
+
+	seen := make(map[string]bool)
+	for _, ref := range refs {
+		if ref.CallerName != "process" {
+			t.Fatalf("unexpected caller %q for ref %q", ref.CallerName, ref.SymbolName)
+		}
+		seen[ref.SymbolName] = true
+	}
+
+	for _, name := range []string{"foo", "bar"} {
+		if !seen[name] {
+			t.Errorf("missing reference to %s", name)
+		}
+	}
+}
+
+func TestRegexExtractor_ExtractReferences_TypeScriptSkipsDeclarationArtifacts(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := "export function formatUserName(name: string): string {\n" +
+		"  return name.trim().toUpperCase()\n" +
+		"}\n\n" +
+		"export function getGreeting(name: string): string {\n" +
+		"  return formatUserName(name)\n" +
+		"}\n\n" +
+		"export function buildActivityLabel(name: string, count: number): string {\n" +
+		"  return formatUserName(name) + ' has ' + String(count) + ' alerts'\n" +
+		"}\n"
+
+	refs, err := extractor.ExtractReferences(ctx, "test.ts", content)
+	if err != nil {
+		t.Fatalf("ExtractReferences failed: %v", err)
+	}
+
+	var selfCall bool
+	callers := make(map[string]bool)
+	for _, ref := range refs {
+		if ref.SymbolName != "formatUserName" {
+			continue
+		}
+		if ref.CallerName == "formatUserName" {
+			selfCall = true
+		}
+		callers[ref.CallerName] = true
+	}
+
+	if selfCall {
+		t.Fatal("unexpected self-call artifact for function declaration")
+	}
+	if !callers["getGreeting"] {
+		t.Fatal("expected getGreeting -> formatUserName reference")
+	}
+	if !callers["buildActivityLabel"] {
+		t.Fatal("expected buildActivityLabel -> formatUserName reference")
+	}
+}
+
+func TestIsKeyword(t *testing.T) {
+	tests := []struct {
+		name     string
+		lang     string
+		expected bool
+	}{
+		{"if", "c", true},
+		{"malloc", "c", true},
+		{"myFunc", "c", false},
+		{"if", "zig", true},
+		{"comptime", "zig", true},
+		{"myFunc", "zig", false},
+		{"if", "rust", true},
+		{"match", "rust", true},
+		{"myFunc", "rust", false},
+		{"if", "cpp", true},
+		{"static_cast", "cpp", true},
+		{"myFunc", "cpp", false},
+		{"if", "java", true},
+		{"new", "java", true},
+		{"instanceof", "java", true},
+		{"println", "java", true},
+		{"myMethod", "java", false},
+		{"if", "lua", true},
+		{"function", "lua", true},
+		{"myFunc", "lua", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name+"_"+tt.lang, func(t *testing.T) {
+			result := IsKeyword(tt.name, tt.lang)
+			if result != tt.expected {
+				t.Errorf("IsKeyword(%q, %q) = %v, want %v", tt.name, tt.lang, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRegexExtractor_ExtractSymbols_FSharp(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `module MyModule
+
+open System
+
+type Shape =
+  | Circle of float
+  | Rectangle of float * float
+
+type Person = { Name: string; Age: int }
+
+type Alias = int
+
+type ILogger =
+  abstract member Log: string -> unit
+  abstract member Flush: unit -> unit
+
+type Greeter(name: string) =
+  let mutable greeting = "Hello"
+
+  member this.SayHello() =
+    sprintf "%s, %s!" greeting name
+
+  static member Create(name) =
+    Greeter(name)
+
+  override this.ToString() =
+    sprintf "Greeter(%s)" name
+
+let add x y = x + y
+
+let rec factorial n =
+  if n <= 1 then 1
+  else n * factorial (n - 1)
+
+let private helper x = x + 1
+
+let inline square x = x * x
+
+module Nested =
+  let nestedFunc a b = a + b
+`
+
+	symbols, err := extractor.ExtractSymbols(ctx, "test.fs", content)
+	if err != nil {
+		t.Fatalf("ExtractSymbols failed: %v", err)
+	}
+
+	foundFunctions := make(map[string]bool)
+	foundTypes := make(map[string]bool)
+	foundClasses := make(map[string]bool)
+	foundInterfaces := make(map[string]bool)
+	foundMethods := make(map[string]bool)
+
+	for _, sym := range symbols {
+		switch sym.Kind {
+		case KindFunction:
+			foundFunctions[sym.Name] = true
+		case KindType:
+			foundTypes[sym.Name] = true
+		case KindClass:
+			foundClasses[sym.Name] = true
+		case KindInterface:
+			foundInterfaces[sym.Name] = true
+		case KindMethod:
+			foundMethods[sym.Name] = true
+		}
+	}
+
+	expectedFunctions := []string{"add", "factorial", "helper", "square", "nestedFunc"}
+	for _, name := range expectedFunctions {
+		if !foundFunctions[name] {
+			t.Errorf("missing function: %s", name)
+		}
+	}
+
+	expectedTypes := []string{"Shape", "Person", "Alias"}
+	for _, name := range expectedTypes {
+		if !foundTypes[name] {
+			t.Errorf("missing type: %s", name)
+		}
+	}
+
+	// ILogger should NOT appear as KindType — only as KindInterface
+	if foundTypes["ILogger"] {
+		t.Error("ILogger extracted as both KindType and KindInterface (duplicate)")
+	}
+
+	expectedClasses := []string{"Greeter", "Nested"}
+	for _, name := range expectedClasses {
+		if !foundClasses[name] {
+			t.Errorf("missing class: %s", name)
+		}
+	}
+
+	if !foundInterfaces["ILogger"] {
+		t.Error("missing interface: ILogger")
+	}
+
+	expectedMethods := []string{"SayHello", "Create", "ToString", "Log", "Flush"}
+	for _, name := range expectedMethods {
+		if !foundMethods[name] {
+			t.Errorf("missing method: %s", name)
+		}
+	}
+}
+
+func TestRegexExtractor_ExtractReferences_FSharp(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `let processData input =
+  let result = helper(input)
+  let formatted = sprintf("%d", result)
+  Logger.log("done")
+  result
+
+let main () =
+  let data = getData()
+  processData(data)
+`
+
+	refs, err := extractor.ExtractReferences(ctx, "test.fs", content)
+	if err != nil {
+		t.Fatalf("ExtractReferences failed: %v", err)
+	}
+
+	callers := make(map[string]map[string]bool)
+	for _, ref := range refs {
+		if callers[ref.CallerName] == nil {
+			callers[ref.CallerName] = make(map[string]bool)
+		}
+		callers[ref.CallerName][ref.SymbolName] = true
+	}
+
+	expectedRefs := map[string][]string{
+		"processData": {"helper", "log"},
+		"main":        {"getData", "processData"},
+	}
+
+	for caller, callees := range expectedRefs {
+		for _, callee := range callees {
+			if callers[caller] == nil || !callers[caller][callee] {
+				t.Errorf("missing reference: %s -> %s", caller, callee)
+			}
+		}
+	}
+}
+
+func TestRegexExtractor_ExtractReferences_FSharp_IgnoresCommentsAndStrings(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `let realFunction x =
+  // notAFunction(x)
+  (* alsoNotAFunction(x) *)
+  let s = "fakeCall(x)"
+  actualCall(x)
+`
+
+	refs, err := extractor.ExtractReferences(ctx, "test.fs", content)
+	if err != nil {
+		t.Fatalf("ExtractReferences failed: %v", err)
+	}
+
+	foundRefs := make(map[string]bool)
+	for _, ref := range refs {
+		foundRefs[ref.SymbolName] = true
+	}
+
+	if !foundRefs["actualCall"] {
+		t.Error("missing reference to actualCall")
+	}
+	if foundRefs["notAFunction"] {
+		t.Error("unexpected line comment artifact: notAFunction")
+	}
+	if foundRefs["alsoNotAFunction"] {
+		t.Error("unexpected block comment artifact: alsoNotAFunction")
+	}
+	if foundRefs["fakeCall"] {
+		t.Error("unexpected string artifact: fakeCall")
+	}
+
+	// Verify nested block comments are fully masked
+	nestedContent := `let testFunc x =
+  (* outer (* nestedHidden(x) *) stillHidden(x) *)
+  realCall(x)
+`
+	nestedRefs, err := extractor.ExtractReferences(ctx, "nested.fs", nestedContent)
+	if err != nil {
+		t.Fatalf("ExtractReferences (nested comments) failed: %v", err)
+	}
+	nestedFound := make(map[string]bool)
+	for _, ref := range nestedRefs {
+		nestedFound[ref.SymbolName] = true
+	}
+	if !nestedFound["realCall"] {
+		t.Error("missing reference to realCall in nested comment test")
+	}
+	if nestedFound["nestedHidden"] {
+		t.Error("nested block comment artifact: nestedHidden")
+	}
+	if nestedFound["stillHidden"] {
+		t.Error("nested block comment not fully masked: stillHidden leaked")
+	}
+}
+
+func TestRegexExtractor_ExtractReferences_JSTypeScriptPropertyReadWrite(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `function login(store) {
+  const ok = store.uid !== null
+  this.store.uid = "next"
+  return ok
+}`
+
+	refs, err := extractor.ExtractReferences(ctx, "store.ts", content)
+	if err != nil {
+		t.Fatalf("ExtractReferences failed: %v", err)
+	}
+
+	foundRead := false
+	foundWrite := false
+	for _, ref := range refs {
+		if ref.SymbolName != "uid" {
+			continue
+		}
+		if ref.Kind == RefKindRead {
+			foundRead = true
+		}
+		if ref.Kind == RefKindWrite {
+			foundWrite = true
+		}
+	}
+
+	if !foundRead {
+		t.Fatal("expected at least one read reference for uid")
+	}
+	if !foundWrite {
+		t.Fatal("expected at least one write reference for uid")
+	}
+}
+
+func TestRegexExtractor_ExtractReferences_CompositionAPIAliases(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `function setup(store) {
+  const { uid: uidRef } = storeToRefs(store)
+  const roleLocal = store.role
+  const r1 = uidRef.value
+  uidRef.value = "x"
+  return roleLocal
+}`
+
+	refs, err := extractor.ExtractReferences(ctx, "comp.ts", content)
+	if err != nil {
+		t.Fatalf("ExtractReferences failed: %v", err)
+	}
+
+	readUID := false
+	writeUID := false
+	readRole := false
+	for _, ref := range refs {
+		if ref.SymbolName == "uid" && ref.Kind == RefKindRead {
+			readUID = true
+		}
+		if ref.SymbolName == "uid" && ref.Kind == RefKindWrite {
+			writeUID = true
+		}
+		if ref.SymbolName == "role" && ref.Kind == RefKindRead {
+			readRole = true
+		}
+	}
+
+	if !readUID {
+		t.Fatal("expected uid read via uidRef.value")
+	}
+	if !writeUID {
+		t.Fatal("expected uid write via uidRef.value assignment")
+	}
+	if !readRole {
+		t.Fatal("expected role read via simple alias")
+	}
+}
+
+func TestRegexExtractor_ExtractReferences_BracketPropertyAccess(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `function setup(store) {
+  const a = store["uid"]
+  this.store["role"] = "admin"
+  return a
+}`
+
+	refs, err := extractor.ExtractReferences(ctx, "comp.ts", content)
+	if err != nil {
+		t.Fatalf("ExtractReferences failed: %v", err)
+	}
+
+	readUID := false
+	writeRole := false
+	for _, ref := range refs {
+		if ref.SymbolName == "uid" && ref.Kind == RefKindRead {
+			readUID = true
+		}
+		if ref.SymbolName == "role" && ref.Kind == RefKindWrite {
+			writeRole = true
+		}
+	}
+
+	if !readUID {
+		t.Fatal("expected uid read via bracket access")
+	}
+	if !writeRole {
+		t.Fatal("expected role write via bracket access")
+	}
+}
+
+func TestRegexExtractor_ExtractReferences_FiltersBuiltinAndVueInternalNoise(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `function setup(store, obj) {
+  const n = Math.max(1, 2)
+  console.log(n)
+  const keys = Object.keys(obj)
+  this.$refs.input.focus()
+  const uid = store.uid
+  return uid
+}`
+
+	refs, err := extractor.ExtractReferences(ctx, "noise.ts", content)
+	if err != nil {
+		t.Fatalf("ExtractReferences failed: %v", err)
+	}
+
+	hasUID := false
+	hasMax := false
+	hasLog := false
+	hasKeys := false
+	hasRefs := false
+
+	for _, ref := range refs {
+		if ref.Kind == RefKindCall {
+			continue
+		}
+		switch ref.SymbolName {
+		case "uid":
+			if ref.Kind == RefKindRead {
+				hasUID = true
+			}
+		case "max":
+			hasMax = true
+		case "log":
+			hasLog = true
+		case "keys":
+			hasKeys = true
+		case "$refs":
+			hasRefs = true
+		}
+	}
+
+	if !hasUID {
+		t.Fatal("expected store uid read to remain after filtering")
+	}
+	if hasMax || hasLog || hasKeys || hasRefs {
+		t.Fatalf("expected builtins/vue internals filtered, got max=%v log=%v keys=%v $refs=%v", hasMax, hasLog, hasKeys, hasRefs)
+	}
+}
+
+func TestRegexExtractor_ExtractSymbols_GDScript(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `class_name PlayerStats extends Node
+
+signal stats_changed
+
+var total_likes := 0
+
+func _ready():
+	activate_node()
+
+static func create_default() -> PlayerStats:
+	return PlayerStats.new()
+
+@rpc("any_peer", "call_local")
+func take_hit(dmg: int) -> void:
+	total_likes -= dmg
+
+@export static func make_from_config(cfg: Dictionary) -> PlayerStats:
+	return PlayerStats.new()
+
+func get_total_likes(
+		include_bonus: bool,
+		bonus: int
+) -> int:
+	return total_likes
+
+class InnerHelper extends RefCounted:
+	@warning_ignore("unused_parameter")
+	func assist(value):
+		return value + 1
+`
+
+	symbols, err := extractor.ExtractSymbols(ctx, "test.gd", content)
+	if err != nil {
+		t.Fatalf("ExtractSymbols failed: %v", err)
+	}
+
+	seen := make(map[string]map[string]bool) // name -> {"function"/"method"/"class"/"exported"} -> value
+	for _, sym := range symbols {
+		kinds, ok := seen[sym.Name]
+		if !ok {
+			kinds = make(map[string]bool)
+			seen[sym.Name] = kinds
+		}
+		switch sym.Kind {
+		case KindFunction:
+			kinds["function"] = true
+		case KindMethod:
+			kinds["method"] = true
+		case KindClass:
+			kinds["class"] = true
+		}
+		if sym.Exported {
+			kinds["exported"] = true
+		}
+	}
+
+	assertSeen := func(name, kind string, wantExported bool) {
+		t.Helper()
+		entry, ok := seen[name]
+		if !ok || !entry[kind] {
+			t.Errorf("missing %s symbol: %s (seen: %v)", kind, name, seenKeys(seen))
+			return
+		}
+		if entry["exported"] != wantExported {
+			t.Errorf("%s exported = %v, want %v", name, entry["exported"], wantExported)
+		}
+	}
+
+	assertSeen("_ready", "function", false)
+	assertSeen("create_default", "function", true)
+	assertSeen("take_hit", "function", true)         // own-line annotation
+	assertSeen("make_from_config", "function", true) // same-line annotation + static
+	assertSeen("get_total_likes", "function", true)  // multiline parameter list
+	assertSeen("assist", "method", true)             // inner class, annotated
+	assertSeen("PlayerStats", "class", true)         // class_name with extends
+	assertSeen("InnerHelper", "class", true)
+}
+
+func seenKeys(m map[string]map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func TestRegexExtractor_ExtractReferences_GDScript(t *testing.T) {
+	extractor := NewRegexExtractor()
+	ctx := context.Background()
+
+	content := `func _ready():
+	activate_node()
+	update_hud()
+
+func refresh():
+	activate_node()
+`
+
+	_, refs, err := extractor.ExtractAll(ctx, "test.gd", content)
+	if err != nil {
+		t.Fatalf("ExtractAll failed: %v", err)
+	}
+
+	counts := make(map[string]int)
+	callers := make(map[string]bool)
+	for _, ref := range refs {
+		counts[ref.SymbolName]++
+		if ref.SymbolName == "update_hud" {
+			callers[ref.CallerName] = true
+		}
+	}
+	if counts["activate_node"] != 2 {
+		t.Errorf("expected 2 activate_node references, got %d", counts["activate_node"])
+	}
+	if !callers["_ready"] {
+		t.Errorf("expected update_hud called from _ready, got callers %v", callers)
+	}
+}

@@ -1,0 +1,440 @@
+package store
+
+import (
+	"context"
+	"encoding/gob"
+	"fmt"
+	"log"
+	"math"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/yoanbernabeu/grepai/internal/fileutil"
+)
+
+type GOBStore struct {
+	indexPath string
+	lockPath  string
+	chunks    map[string]Chunk    // id -> chunk
+	documents map[string]Document // path -> document
+	// Constructors retain the historical first-Persist behavior independently
+	// from mutations made before Load.
+	constructorPersistPending bool
+	mutationGeneration        uint64
+	mu                        sync.RWMutex
+}
+
+type gobData struct {
+	Chunks    map[string]Chunk
+	Documents map[string]Document
+}
+
+func NewGOBStore(indexPath string) *GOBStore {
+	return &GOBStore{
+		indexPath:                 indexPath,
+		lockPath:                  indexPath + ".lock",
+		chunks:                    make(map[string]Chunk),
+		documents:                 make(map[string]Document),
+		constructorPersistPending: true,
+	}
+}
+
+func (s *GOBStore) SaveChunks(ctx context.Context, chunks []Chunk) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mutationGeneration++
+
+	for _, chunk := range chunks {
+		s.chunks[chunk.ID] = cloneChunk(chunk)
+	}
+
+	return nil
+}
+
+func (s *GOBStore) DeleteByFile(ctx context.Context, filePath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	doc, ok := s.documents[filePath]
+	if !ok {
+		return nil
+	}
+
+	if len(doc.ChunkIDs) == 0 {
+		return nil
+	}
+	for _, chunkID := range doc.ChunkIDs {
+		delete(s.chunks, chunkID)
+	}
+	// Clear the document's chunk IDs under the same lock, so a persist taken
+	// before the new chunks are saved never records a document pointing at
+	// deleted chunks, which the next scan would trust and skip (#356).
+	doc.ChunkIDs = nil
+	s.documents[filePath] = doc
+	s.mutationGeneration++
+
+	return nil
+}
+
+func (s *GOBStore) Search(ctx context.Context, queryVector []float32, limit int, opts SearchOptions) ([]SearchResult, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	results := make([]SearchResult, 0, len(s.chunks))
+
+	for _, chunk := range s.chunks {
+		// Filter by path prefix if provided
+		if opts.PathPrefix != "" && !strings.HasPrefix(chunk.FilePath, opts.PathPrefix) {
+			continue
+		}
+		score := cosineSimilarity(queryVector, chunk.Vector)
+		results = append(results, SearchResult{
+			Chunk: cloneChunk(chunk),
+			Score: score,
+		})
+	}
+
+	// Sort by score descending. The tiebreak in SortResultsByScore is what
+	// keeps the ranking independent of the map iteration order above.
+	SortResultsByScore(results)
+
+	if limit > 0 && len(results) > limit {
+		results = results[:limit]
+	}
+
+	return results, nil
+}
+
+func (s *GOBStore) GetDocument(ctx context.Context, filePath string) (*Document, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	doc, ok := s.documents[filePath]
+	if !ok {
+		return nil, nil
+	}
+
+	cloned := cloneDocument(doc)
+	return &cloned, nil
+}
+
+func (s *GOBStore) SaveDocument(ctx context.Context, doc Document) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.documents[doc.Path] = cloneDocument(doc)
+	s.mutationGeneration++
+	return nil
+}
+
+func (s *GOBStore) DeleteDocument(ctx context.Context, filePath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.documents[filePath]; ok {
+		delete(s.documents, filePath)
+		s.mutationGeneration++
+	}
+	return nil
+}
+
+func (s *GOBStore) ListDocuments(ctx context.Context) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	paths := make([]string, 0, len(s.documents))
+	for path := range s.documents {
+		paths = append(paths, path)
+	}
+
+	return paths, nil
+}
+
+func (s *GOBStore) Load(ctx context.Context) (err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	loaded := false
+	defer func() {
+		if err == nil {
+			s.constructorPersistPending = false
+			if loaded {
+				s.mutationGeneration = 0
+			}
+		}
+	}()
+
+	// Acquire shared (read) file lock for cross-process safety
+	lockFile, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		// If we can't create lock file, proceed without locking (backward compat)
+		loaded, err = s.loadUnlocked()
+		return err
+	}
+	defer lockFile.Close()
+
+	if err := fileutil.FlockShared(lockFile, false); err != nil {
+		// If locking fails, proceed without locking (backward compat)
+		loaded, err = s.loadUnlocked()
+		return err
+	}
+	defer func() {
+		_ = fileutil.Funlock(lockFile)
+	}()
+
+	loaded, err = s.loadUnlocked()
+	return err
+}
+
+// loadUnlocked performs the actual load without any locking.
+func (s *GOBStore) loadUnlocked() (bool, error) {
+	file, err := os.Open(s.indexPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to open index file: %w", err)
+	}
+	defer file.Close()
+
+	var data gobData
+	decoder := gob.NewDecoder(file)
+	if err := decoder.Decode(&data); err != nil {
+		// A truncated/corrupted index (e.g. after an unclean shutdown) must not
+		// wedge grepai in a permanent error loop: the index is a rebuildable
+		// cache. Quarantine the bad file and start from an empty index so the
+		// next scan re-creates it.
+		// Close before renaming: Windows cannot rename a file that is open.
+		_ = file.Close()
+		corruptPath := s.indexPath + ".corrupt"
+		// Plain os.Rename, NOT ReplaceFileAtomically: its remove-then-rename
+		// fallback would delete a .corrupt file freshly quarantined by a
+		// concurrent process (Load holds only a shared lock).
+		renameErr := os.Rename(s.indexPath, corruptPath)
+		if renameErr != nil && !os.IsNotExist(renameErr) {
+			// os.Rename does not overwrite an existing file on Windows; drop a
+			// stale quarantine from a previous recovery and retry once.
+			_ = os.Remove(corruptPath)
+			renameErr = os.Rename(s.indexPath, corruptPath)
+		}
+		switch {
+		case renameErr == nil:
+			log.Printf("Warning: index file %s is corrupted (%v); moved it to %s and starting with an empty index — it will be rebuilt on the next scan", s.indexPath, err, corruptPath)
+		case os.IsNotExist(renameErr):
+			// A concurrent process hit the same corruption and already
+			// quarantined the file; adopt its recovery instead of resurfacing
+			// the decode error.
+			log.Printf("Warning: index file %s is corrupted (%v); already quarantined by a concurrent process — starting with an empty index", s.indexPath, err)
+		default:
+			// Self-heal failed (e.g. read-only directory): keep the fatal
+			// behavior but surface the failed quarantine so it is diagnosable.
+			return false, fmt.Errorf("failed to decode index: %w (quarantine to %s failed: %v)", err, corruptPath, renameErr)
+		}
+		s.chunks = make(map[string]Chunk)
+		s.documents = make(map[string]Document)
+		return false, nil
+	}
+
+	s.chunks = data.Chunks
+	s.documents = data.Documents
+
+	if s.chunks == nil {
+		s.chunks = make(map[string]Chunk)
+	}
+	if s.documents == nil {
+		s.documents = make(map[string]Document)
+	}
+
+	return true, nil
+}
+
+func (s *GOBStore) Persist(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.constructorPersistPending && s.mutationGeneration == 0 {
+		return nil
+	}
+
+	if err := fileutil.EnsureParentDir(s.indexPath); err != nil {
+		return fmt.Errorf("failed to prepare index directory: %w", err)
+	}
+
+	// Acquire exclusive (write) file lock for cross-process safety
+	lockFile, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		// If we can't create lock file, proceed without locking (backward compat)
+		return s.persistUnlocked()
+	}
+	defer lockFile.Close()
+
+	if err := fileutil.FlockExclusive(lockFile, false); err != nil {
+		// If locking fails, proceed without locking (backward compat)
+		return s.persistUnlocked()
+	}
+	defer func() {
+		_ = fileutil.Funlock(lockFile)
+	}()
+
+	return s.persistUnlocked()
+}
+
+// persistUnlocked performs the actual persist without any locking.
+// It writes to a temp file and atomically replaces the index so that an
+// unclean shutdown mid-write can never leave a truncated index behind.
+func (s *GOBStore) persistUnlocked() error {
+	data := gobData{
+		Chunks:    s.chunks,
+		Documents: s.documents,
+	}
+
+	tmpFile, err := os.CreateTemp(filepath.Dir(s.indexPath), filepath.Base(s.indexPath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("failed to create index temp file: %w", err)
+	}
+
+	tmpPath := tmpFile.Name()
+	cleanupTemp := true
+	defer func() {
+		if cleanupTemp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := gob.NewEncoder(tmpFile).Encode(data); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("failed to encode index: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("failed to sync index temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close index temp file: %w", err)
+	}
+	if err := fileutil.ReplaceFileAtomically(tmpPath, s.indexPath); err != nil {
+		return fmt.Errorf("failed to replace index file: %w", err)
+	}
+	cleanupTemp = false
+	s.constructorPersistPending = false
+	s.mutationGeneration = 0
+
+	return nil
+}
+
+func (s *GOBStore) Close() error {
+	return s.Persist(context.Background())
+}
+
+func (s *GOBStore) Stats() (numDocs int, numChunks int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.documents), len(s.chunks)
+}
+
+func (s *GOBStore) GetStats(ctx context.Context) (*IndexStats, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var lastUpdated time.Time
+	for _, chunk := range s.chunks {
+		if chunk.UpdatedAt.After(lastUpdated) {
+			lastUpdated = chunk.UpdatedAt
+		}
+	}
+
+	// Get file size
+	var size int64
+	if info, err := os.Stat(s.indexPath); err == nil {
+		size = info.Size()
+	}
+
+	return &IndexStats{
+		TotalFiles:  len(s.documents),
+		TotalChunks: len(s.chunks),
+		IndexSize:   size,
+		LastUpdated: lastUpdated,
+	}, nil
+}
+
+func (s *GOBStore) ListFilesWithStats(ctx context.Context) ([]FileStats, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	stats := make([]FileStats, 0, len(s.documents))
+	for _, doc := range s.documents {
+		stats = append(stats, FileStats{
+			Path:       doc.Path,
+			ChunkCount: len(doc.ChunkIDs),
+			ModTime:    doc.ModTime,
+		})
+	}
+	return stats, nil
+}
+
+func (s *GOBStore) GetChunksForFile(ctx context.Context, filePath string) ([]Chunk, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	doc, ok := s.documents[filePath]
+	if !ok {
+		return nil, nil
+	}
+
+	chunks := make([]Chunk, 0, len(doc.ChunkIDs))
+	for _, id := range doc.ChunkIDs {
+		if chunk, ok := s.chunks[id]; ok {
+			chunks = append(chunks, cloneChunk(chunk))
+		}
+	}
+	return chunks, nil
+}
+
+func (s *GOBStore) GetAllChunks(ctx context.Context) ([]Chunk, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	chunks := make([]Chunk, 0, len(s.chunks))
+	for _, chunk := range s.chunks {
+		chunks = append(chunks, cloneChunk(chunk))
+	}
+	return chunks, nil
+}
+
+// LookupByContentHash searches in-memory chunks for a matching content hash.
+func (s *GOBStore) LookupByContentHash(ctx context.Context, contentHash, contentPrefix string) ([]float32, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, chunk := range s.chunks {
+		if chunk.ContentHash == contentHash && len(chunk.Vector) > 0 && strings.HasPrefix(chunk.Content, contentPrefix) {
+			vec := make([]float32, len(chunk.Vector))
+			copy(vec, chunk.Vector)
+			return vec, true, nil
+		}
+	}
+
+	return nil, false, nil
+}
+
+// cosineSimilarity calculates the cosine similarity between two vectors
+func cosineSimilarity(a, b []float32) float32 {
+	if len(a) != len(b) {
+		return 0
+	}
+
+	var dotProduct, normA, normB float64
+
+	for i := range a {
+		dotProduct += float64(a[i]) * float64(b[i])
+		normA += float64(a[i]) * float64(a[i])
+		normB += float64(b[i]) * float64(b[i])
+	}
+
+	if normA == 0 || normB == 0 {
+		return 0
+	}
+
+	return float32(dotProduct / (math.Sqrt(normA) * math.Sqrt(normB)))
+}

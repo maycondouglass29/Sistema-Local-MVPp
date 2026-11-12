@@ -1,0 +1,249 @@
+import {
+  fontSize,
+  fontWeight,
+  leading,
+  radius,
+  space,
+} from "@canvas/scale.stylex";
+import { Button } from "@canvas/ui/button";
+import { iconStyles } from "@canvas/ui/icon-styles";
+import { RefreshIcon } from "@canvas/ui/icons";
+import { Spinner } from "@canvas/ui/spinner";
+import { useTooltip } from "@canvas/ui/tooltip";
+import {
+  type ReviewHostStatus,
+  type ReviewRemoteHostActions,
+  reviewHostStatus,
+} from "@dev.fast/review-protocol";
+import * as stylex from "@stylexjs/stylex";
+import { createContext, useContext } from "react";
+
+import {
+  ACTION_WORDS,
+  useHostAction,
+  useRemoteHostState,
+} from "./remote-host-state";
+import { withClass } from "./stylex-props";
+import { tokens } from "./tokens.stylex";
+
+export interface LostConnection {
+  host?: string;
+  hosts?: ReviewRemoteHostActions;
+  detail: string;
+  /** Reopen the review stream after a retry. */
+  reconnect(): void;
+}
+
+export const ConnectionContext = createContext<LostConnection | undefined>(
+  undefined,
+);
+
+/** Shown while the review stream is down; on a remote review it offers the host's next step. */
+export function ConnectionChip() {
+  const connection = useContext(ConnectionContext);
+  const { host, hosts } = connection ?? {};
+  const state = useRemoteHostState(hosts, host, connection !== undefined);
+
+  const status =
+    state && state.state !== "online" ? reviewHostStatus(state) : undefined;
+
+  const action = status ? status.action : host && hosts ? "retry" : undefined;
+
+  const { run, pending, failure } = useHostAction(
+    hosts,
+    host,
+    connection?.reconnect,
+  );
+
+  const tooltip = useTooltip<HTMLElement>(
+    action ? `Click to ${ACTION_WORDS[action].toLowerCase()}` : "Reconnecting…",
+    { detail: failure ?? status?.sentence ?? connection?.detail },
+  );
+
+  if (!connection) return null;
+
+  const label =
+    status?.label ?? (host ? `${host} disconnected` : "Disconnected");
+
+  const spinning = pending || status?.busy;
+
+  if (!action)
+    return (
+      <span
+        {...withClass("connection-chip", styles.chip)}
+        role="status"
+        ref={tooltip}
+      >
+        <span {...stylex.props(styles.text)}>{label}</span>
+        {spinning ? <Spinner /> : null}
+      </span>
+    );
+
+  return (
+    <button
+      type="button"
+      {...withClass("connection-chip", styles.chip, styles.button)}
+      aria-label={`${label}. ${ACTION_WORDS[action]}.`}
+      aria-busy={pending || undefined}
+      ref={tooltip}
+      onClick={() => run(action)}
+    >
+      <span role="status" {...stylex.props(styles.text)}>
+        {label}
+      </span>
+      {action === "retry" ? (
+        <RefreshIcon xstyle={iconStyles.inline} spinning={!!spinning} />
+      ) : (
+        <span {...stylex.props(styles.action)}>{ACTION_WORDS[action]}</span>
+      )}
+    </button>
+  );
+}
+
+/** Shown while a remote review's language server starts. */
+export function LanguageServerChip({ host }: { host: string }) {
+  if (useContext(ConnectionContext)) return null;
+
+  return (
+    <span
+      {...withClass("language-server-chip", styles.chip, styles.neutral)}
+      role="status"
+    >
+      <span {...stylex.props(styles.text)}>
+        Loading language features on {host}
+      </span>
+      <Spinner />
+    </span>
+  );
+}
+
+/** A host's next step as a button; `failure` says why the last one failed. */
+export function useHostActionButton(
+  hosts: ReviewRemoteHostActions | undefined,
+  alias: string | undefined,
+  action: ReviewHostStatus["action"],
+  retried?: () => void,
+) {
+  const { run, pending, failure } = useHostAction(hosts, alias, retried);
+
+  const button =
+    action && hosts ? (
+      <Button aria-busy={pending || undefined} onClick={() => run(action)}>
+        {ACTION_WORDS[action]}
+      </Button>
+    ) : null;
+
+  return { failure, button };
+}
+
+/** A remote review that has not loaded: what its host is doing, and the next step. */
+export function HostWaiting({
+  host,
+  hosts,
+  reconnect,
+  lost,
+}: {
+  host: string;
+  hosts: ReviewRemoteHostActions;
+  reconnect(): void;
+  lost?: string;
+}) {
+  const state = useRemoteHostState(hosts, host, true);
+
+  const status =
+    state && state.state !== "online" ? reviewHostStatus(state) : undefined;
+
+  const { failure, button } = useHostActionButton(
+    hosts,
+    host,
+    status?.action,
+    reconnect,
+  );
+
+  if (!status)
+    return lost === undefined ? null : (
+      <p {...stylex.props(styles.waiting)} role="status">
+        Connection lost. Reconnecting… {lost}
+      </p>
+    );
+
+  return (
+    <section
+      {...withClass("host-waiting", styles.waiting)}
+      role="status"
+      aria-busy={status.busy}
+    >
+      <h2 {...stylex.props(styles.waitingLabel)}>{status.label}</h2>
+      <p {...stylex.props(styles.waitingSentence)}>
+        {failure ?? status.sentence}
+      </p>
+      {button}
+    </section>
+  );
+}
+
+const styles = stylex.create({
+  chip: {
+    display: "inline-flex",
+    flex: "0 1 auto",
+    minWidth: 0,
+    maxWidth: "320px",
+    alignItems: "center",
+    gap: space.s6,
+    height: tokens.chromeControlHeight,
+    marginInline: space.s4,
+    padding: `0 ${space.s10}`,
+    borderWidth: "1px",
+    borderStyle: "solid",
+    borderColor: tokens.warningOutline,
+    borderRadius: radius.pill,
+    backgroundColor: tokens.warningWash,
+    color: tokens.changeModified,
+    font: `${fontWeight.semibold} ${fontSize.small} ${tokens.fontMono}`,
+    whiteSpace: "nowrap",
+  },
+  neutral: {
+    borderColor: tokens.chromeBorder,
+    backgroundColor: tokens.transparent,
+    color: tokens.chromeFgMuted,
+  },
+  // A long alias ends in an ellipsis; the tooltip has it all.
+  text: {
+    minWidth: 0,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  button: {
+    paddingInlineEnd: space.s8,
+    cursor: { default: "pointer", ":disabled": "progress" },
+    filter: { default: null, ":hover:not(:disabled)": "brightness(1.15)" },
+    outline: {
+      default: null,
+      ":focus-visible": `1px solid ${tokens.changeModified}`,
+    },
+    outlineOffset: { default: null, ":focus-visible": "1px" },
+  },
+  waiting: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "flex-start",
+    gap: space.s12,
+    maxWidth: "72ch",
+    margin: `${space.s32} auto`,
+    padding: `0 ${space.s24}`,
+    font: `${fontSize.reading}/${leading.relaxed} ${tokens.chromeFont}`,
+  },
+  waitingLabel: {
+    margin: 0,
+    color: tokens.changeModified,
+    font: `${fontWeight.semibold} ${fontSize.reading} ${tokens.fontMono}`,
+  },
+  waitingSentence: {
+    margin: 0,
+    color: tokens.inkMuted,
+  },
+  action: {
+    textDecorationLine: "underline",
+    textUnderlineOffset: "2px",
+  },
+});

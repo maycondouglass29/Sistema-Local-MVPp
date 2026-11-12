@@ -1,0 +1,20 @@
+---
+interface Props {
+  section?: string;
+  title: string;
+}
+
+const { section, title } = Astro.props;
+---
+
+<nav class="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-ink-muted mb-6" aria-label="Breadcrumb">
+  <a href="/grepai/" class="hover:text-ink transition-colors">Home</a>
+  <span aria-hidden="true">/</span>
+  {section && (
+    <>
+      <span>{section}</span>
+      <span aria-hidden="true">/</span>
+    </>
+  )}
+  <span class="text-ink truncate max-w-[60vw] sm:max-w-xs" aria-current="page" title={title}>{title}</span>
+</nav>

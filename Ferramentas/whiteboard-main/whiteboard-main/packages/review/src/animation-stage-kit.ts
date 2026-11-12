@@ -1,0 +1,553 @@
+// The animation stage's style kit: the CSS every stage loads, and the
+// variables the canvas sets on it. The canvas hands the kit to each stage;
+// the CLI writes it out as whiteboard.css for agents to read.
+
+/** The canvas properties a stage reads as --wb-<name>. */
+export const STAGE_THEME = {
+  ink: "--ink",
+  "ink-muted": "--ink-muted",
+  "ink-faint": "--ink-faint",
+  accent: "--accent",
+  "accent-soft": "--accent-soft",
+  "on-accent": "--on-accent",
+  surface: "--surface",
+  "surface-raised": "--surface-raised",
+  well: "--well",
+  rule: "--rule",
+  "rule-soft": "--rule-soft",
+  added: "--change-added",
+  removed: "--change-removed",
+  modified: "--change-modified",
+  "added-bg": "--diff-added-bg",
+  "removed-bg": "--diff-removed-bg",
+  "modified-bg": "--diff-modified-bg",
+  // Two more outline colours for telling kinds of card apart: the software
+  // map's storage colour, and the merged purple.
+  teal: "--map-storage-border",
+  violet: "--merged",
+  // Each face by its role: the chrome's for labels, mono for what a
+  // terminal would print, the reading face for prose, and the code font.
+  "font-sans": "--chrome-font",
+  "font-mono": "--font-mono",
+  "font-serif": "--font-serif",
+  "font-code": "--font-code",
+} as const;
+
+/** Every --wb-<name> the stage sets, by group, with what it is for. The
+ * canvas's scale steps are checked against these names. */
+export const STAGE_VARIABLES: [note: string, names: string[]][] = [
+  [
+    "Colors, from the reader's light or dark theme",
+    [
+      "ink",
+      "ink-muted",
+      "ink-faint",
+      "accent",
+      "accent-soft",
+      "on-accent",
+      "surface",
+      "surface-raised",
+      "well",
+      "rule",
+      "rule-soft",
+      "added",
+      "removed",
+      "modified",
+      "added-bg",
+      "removed-bg",
+      "modified-bg",
+      "teal",
+      "violet",
+    ],
+  ],
+  [
+    "Faces, by role: sans for labels and controls, mono for ids, paths and values, serif for prose, code for source text. Name no font yourself",
+    ["font-sans", "font-mono", "font-serif", "font-code"],
+  ],
+  [
+    "Spacing: a 2px grid to 20, coarser above",
+    [
+      2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 24, 28, 32, 36, 40, 48, 56, 72, 96,
+      120, 160,
+    ].map((step) => `space-${step}`),
+  ],
+  [
+    "Type sizes: micro is 10px, body 12px",
+    [
+      "micro",
+      "small",
+      "body",
+      "ui",
+      "title",
+      "reading",
+      "heading",
+      "display",
+    ].map((step) => `text-${step}`),
+  ],
+  [
+    "Line heights: unitless steps scale with the font; px steps set a fixed line box",
+    [
+      "none",
+      "tight",
+      "normal",
+      "relaxed",
+      "prose",
+      "px14",
+      "px16",
+      "px18",
+      "px20",
+      "px22",
+      "px24",
+      "px26",
+      "px28",
+      "px32",
+    ].map((step) => `leading-${step}`),
+  ],
+  [
+    "Weights",
+    ["regular", "medium", "semibold", "bold"].map((step) => `weight-${step}`),
+  ],
+  [
+    "Letter spacing: caps and chrome for uppercase labels",
+    ["shortcut", "caps", "chrome", "tight"].map((step) => `tracking-${step}`),
+  ],
+  [
+    "Radii",
+    ["hairline", "small", "control", "surface", "pill", "round"].map(
+      (step) => `radius-${step}`,
+    ),
+  ],
+  [
+    "Motion: durations, then easings. duration (450ms) is the default fade",
+    [
+      "instant",
+      "fast",
+      "medium",
+      "slow",
+      "pulse",
+      "spin",
+      "ease",
+      "enter",
+      "settle",
+    ]
+      .map((step) => `motion-${step}`)
+      .concat("duration"),
+  ],
+];
+
+/** What each kit class is for. */
+const CLASSES: [selector: string, use: string][] = [
+  [
+    ".wb-row, .wb-stack",
+    "A centered row or column of parts, with the scene's spacing.",
+  ],
+  [
+    ".wb-grid",
+    'A grid of equal columns; set style="--wb-columns: 4" (default 3).',
+  ],
+  [
+    ".wb-layers",
+    "Children stacked in one place, for states that replace each other.",
+  ],
+  [
+    ".wb-lane",
+    "A position: relative track with a dashed center line, for a static token snapshot.",
+  ],
+  [
+    ".wb-card",
+    "A box with a title and note: a .wb-card-head holding a .wb-card-dot and the .wb-card-title, then a .wb-card-note. The scene's cards are these.",
+  ],
+  [
+    ".wb-node",
+    "A centered box for a hand-made layout; a <small> inside is its second line.",
+  ],
+  [
+    ".wb-well",
+    "An inset area that groups parts, such as a process or a machine boundary.",
+  ],
+  [".wb-rule", 'A divider (<hr class="wb-rule">).'],
+  [".wb-badge", "A pill for a status or version, e.g. etag e1."],
+  [
+    ".wb-chip",
+    "A chip in a list, such as a queued job or a cached key; .wb-items lays a list of them out.",
+  ],
+  [".wb-table", "A compact table of rows, such as a schema or a result set."],
+  [".wb-title", "A heading inside the stage."],
+  [".wb-caps", "An uppercase micro label, like the step strip's."],
+  [".wb-prose", "A sentence of explanation, in the board's reading face."],
+  [
+    ".wb-mono, .wb-code",
+    "Ids, paths and values in the mono face; .wb-code is inline code on a well.",
+  ],
+  [".wb-muted, .wb-faint", "Text that recedes."],
+  [
+    ".wb-shape, .wb-shape-text",
+    "An SVG shape drawn like a card, and the text inside it.",
+  ],
+  [
+    ".wb-group",
+    "A washed box behind a scene's cards with a .wb-group-title; scene.group draws one.",
+  ],
+  [
+    ".wb-legend",
+    "A row of .wb-legend-entry glyphs and labels under a scene; scene.legend draws one.",
+  ],
+  [
+    "[data-wb-paint]",
+    'When an agent writes the block, its parts paint in: data-wb-paint="3" orders a part (numbers first, then document order), "none" shows it and its subtree at once; data-wb-paint-style="fade|draw|wipe|none" picks the effect.',
+  ],
+];
+
+/** The CSS every stage loads before its own markup. */
+export const STAGE_KIT_CSS = `:root { --wb-duration: 450ms; color-scheme: light dark; }
+*, *::before, *::after { box-sizing: border-box; }
+button { color: inherit; font: inherit; }
+html, body { margin: 0; height: 100%; }
+html[data-wb-auto-size] body { height: auto; display: flow-root; }
+html[data-wb-unpainted] body { visibility: hidden; }
+body {
+  overflow: hidden;
+  background: transparent;
+  color: var(--wb-ink);
+  font: var(--wb-text-ui)/var(--wb-leading-normal) var(--wb-font-sans);
+}
+[data-enter], [data-exit], [data-only] {
+  transition: opacity var(--wb-duration) ease, visibility 0s linear 0s;
+}
+[data-wb-state="before"], [data-wb-state="after"] {
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity var(--wb-duration) ease, visibility 0s linear var(--wb-duration);
+}
+.wb-arrow[data-wb-state="before"] text, .wb-arrow[data-wb-state="after"] text { visibility: hidden; }
+[data-wb-slot] { display: block; max-width: 100%; min-height: 40px; }
+[data-wb-openable] { cursor: pointer; }
+[data-wb-openable]:is(:hover, :focus-visible) { outline: 1.5px solid var(--wb-accent); outline-offset: 2px; }
+
+/* Layout. */
+.wb-row { display: flex; align-items: center; justify-content: space-around; gap: var(--wb-space-48); padding: var(--wb-space-20) var(--wb-space-24); }
+.wb-stack { display: flex; flex-direction: column; align-items: center; gap: var(--wb-space-20); padding: var(--wb-space-20) var(--wb-space-24); }
+.wb-grid { display: grid; grid-template-columns: repeat(var(--wb-columns, 3), minmax(0, 1fr)); gap: var(--wb-space-16); padding: var(--wb-space-20) var(--wb-space-24); align-items: start; }
+.wb-layers { display: grid; justify-items: center; align-items: start; }
+.wb-layers > * { grid-area: 1 / 1; }
+.wb-lane { position: relative; min-height: var(--wb-space-32); }
+.wb-lane::before { content: ""; position: absolute; left: 0; right: 0; top: 50%; border-top: 1px dashed var(--wb-rule-soft); }
+
+/* Text. */
+.wb-title { margin: 0; color: var(--wb-ink); font: var(--wb-weight-semibold) var(--wb-text-title)/var(--wb-leading-tight) var(--wb-font-sans); }
+.wb-caps { color: var(--wb-ink-muted); font: var(--wb-text-micro)/var(--wb-leading-normal) var(--wb-font-mono); letter-spacing: var(--wb-tracking-chrome); text-transform: uppercase; }
+.wb-prose { margin: 0; color: var(--wb-ink); font: var(--wb-text-reading)/var(--wb-leading-prose) var(--wb-font-serif); }
+.wb-mono { font-family: var(--wb-font-mono); }
+.wb-code { padding: 0 var(--wb-space-4); border-radius: var(--wb-radius-small); background: var(--wb-well); color: var(--wb-ink); font-family: var(--wb-font-code); }
+.wb-muted { color: var(--wb-ink-muted); }
+.wb-faint { color: var(--wb-ink-faint); }
+
+/* Surfaces. A card is the scene's box; a node is a card for a hand-made
+   layout, centered and with a minimum width. */
+.wb-card, .wb-node {
+  min-width: 0;
+  padding: var(--wb-space-8) var(--wb-space-12);
+  border: 1px solid var(--wb-rule);
+  border-radius: var(--wb-radius-surface);
+  background: var(--wb-surface);
+  color: var(--wb-ink);
+  font: var(--wb-text-body)/var(--wb-leading-normal) var(--wb-font-mono);
+  transition: opacity var(--wb-duration) ease, border-color var(--wb-duration) ease,
+    background-color var(--wb-duration) ease, box-shadow var(--wb-duration) ease;
+}
+.wb-card { display: flex; flex-direction: column; gap: var(--wb-space-4); }
+.wb-node { min-width: 88px; text-align: center; }
+.wb-node small { display: block; color: var(--wb-ink-faint); font-size: var(--wb-text-micro); }
+.wb-card-head { display: flex; align-items: center; gap: var(--wb-space-6); }
+/* The dot says what state a card is in: it shows only with a tone or a
+   change mark, in that colour, so a plain card carries no unexplained mark. */
+.wb-card-dot { display: none; flex: none; width: 7px; height: 7px; border-radius: var(--wb-radius-round); background: var(--wb-ink-faint); }
+.wb-card:is([data-tone], [data-change]) .wb-card-dot { display: block; }
+.wb-card-title { min-width: 0; overflow-wrap: anywhere; font-weight: var(--wb-weight-semibold); }
+.wb-card-note { color: var(--wb-ink-muted); overflow-wrap: anywhere; font-size: var(--wb-text-micro); min-height: 12px; }
+
+/* A store's text sits in the middle of its drum or cylinder, as a label on
+   a tank does; a pill's too. */
+:where(.wb-card, .wb-node):is([data-form="cylinder"], [data-form="drum"], [data-form="pill"]) { align-items: center; text-align: center; }
+.wb-card:is([data-form="cylinder"], [data-form="drum"], [data-form="pill"]) :is(.wb-card-head, .wb-items) { justify-content: center; }
+/* Shapes: a card's or node's silhouette says what it stands for before
+   its title does. data-form is box (the default), pill, cut (a branch),
+   cylinder (a database), drum (a cache), stack (a queue), window (a
+   client) or bars (a service of this codebase). data-outline is solid,
+   dashed (outside the system) or dotted. data-color is the resting border
+   colour: ink, accent, teal or violet; a tone takes over while set. The
+   scene's cards take these as options. These rules and the change marks
+   weigh one class, as the card rules do: a hand-made layout's own rule for
+   its nodes, say position: absolute, comes later and wins. A tone or a
+   highlight still takes over. */
+:where(.wb-card, .wb-node)[data-form] { position: relative; }
+:where(.wb-card, .wb-node)[data-form]::before, :where(.wb-card, .wb-node)[data-form]::after { pointer-events: none; }
+:where(.wb-card, .wb-node)[data-form="pill"] { padding-inline: var(--wb-space-16); border-radius: var(--wb-radius-pill); }
+:where(.wb-card, .wb-node)[data-form="cut"] { border-radius: var(--wb-space-12); corner-shape: bevel; }
+:where(.wb-card, .wb-node)[data-form="cylinder"] { padding-top: var(--wb-space-28); padding-bottom: var(--wb-space-12); border-radius: 50% / var(--wb-space-10); }
+:where(.wb-card, .wb-node)[data-form="cylinder"]::before {
+  content: ""; position: absolute; inset: -1px -1px auto; height: var(--wb-space-20);
+  border: 1px solid; border-color: inherit; border-radius: 50%; background: inherit;
+}
+:where(.wb-card, .wb-node)[data-form="drum"] { padding-left: var(--wb-space-28); padding-right: var(--wb-space-16); border-radius: var(--wb-space-12) / 50%; }
+:where(.wb-card, .wb-node)[data-form="drum"]::before {
+  content: ""; position: absolute; inset: -1px auto -1px -1px; width: var(--wb-space-24);
+  border: 1px solid; border-color: inherit; border-radius: 50%; background: inherit;
+}
+:where(.wb-card, .wb-node)[data-form="stack"] {
+  margin-right: var(--wb-space-8); margin-bottom: var(--wb-space-8);
+  box-shadow: 4px 4px 0 -1px var(--wb-surface), 4px 4px 0 0 var(--wb-rule), 8px 8px 0 -1px var(--wb-surface), 8px 8px 0 0 var(--wb-rule);
+}
+:where(.wb-card, .wb-node)[data-form="window"] { padding-top: var(--wb-space-16); }
+:where(.wb-card, .wb-node)[data-form="window"]::before { content: ""; position: absolute; top: var(--wb-space-8); right: 0; left: 0; border-top: 1px solid; border-color: inherit; }
+:where(.wb-card, .wb-node)[data-form="bars"] { padding-inline: var(--wb-space-18); }
+:where(.wb-card, .wb-node)[data-form="bars"]::before, :where(.wb-card, .wb-node)[data-form="bars"]::after { content: ""; position: absolute; top: 0; bottom: 0; border-left: 1px solid; border-color: inherit; }
+:where(.wb-card, .wb-node)[data-form="bars"]::before { left: var(--wb-space-6); }
+:where(.wb-card, .wb-node)[data-form="bars"]::after { right: var(--wb-space-6); }
+/* What the change under review did to a part: its dot and a stripe down its
+   left edge in the change colour, at rest; a removed part's title is struck.
+   A frame's tone still colours the whole card over it. */
+:where(.wb-card, .wb-node)[data-change] { border-left-width: 3px; }
+:where(.wb-card, .wb-node)[data-change="added"] { border-left-color: var(--wb-added); }
+:where(.wb-card, .wb-node)[data-change="modified"] { border-left-color: var(--wb-modified); }
+:where(.wb-card, .wb-node)[data-change="removed"] { border-left-color: var(--wb-removed); }
+.wb-card[data-change="added"] .wb-card-dot { background: var(--wb-added); }
+.wb-card[data-change="modified"] .wb-card-dot { background: var(--wb-modified); }
+.wb-card[data-change="removed"] .wb-card-dot { background: var(--wb-removed); }
+.wb-card[data-change="removed"] .wb-card-title { color: var(--wb-ink-muted); text-decoration: line-through; }
+:where(.wb-card, .wb-node)[data-outline="dashed"] { border-style: dashed; }
+:where(.wb-card, .wb-node)[data-outline="dotted"] { border-style: dotted; }
+:where(.wb-card, .wb-node)[data-color="ink"] { border-color: var(--wb-ink); }
+:where(.wb-card, .wb-node)[data-color="accent"] { border-color: var(--wb-accent); }
+:where(.wb-card, .wb-node)[data-color="teal"] { border-color: var(--wb-teal); }
+:where(.wb-card, .wb-node)[data-color="violet"] { border-color: var(--wb-violet); }
+.wb-card[data-color="ink"] .wb-card-dot { background: var(--wb-ink); }
+.wb-card[data-color="accent"] .wb-card-dot { background: var(--wb-accent); }
+.wb-card[data-color="teal"] .wb-card-dot { background: var(--wb-teal); }
+.wb-card[data-color="violet"] .wb-card-dot { background: var(--wb-violet); }
+.wb-shape[data-color="ink"] { stroke: var(--wb-ink); }
+.wb-shape[data-color="accent"] { stroke: var(--wb-accent); }
+.wb-shape[data-color="teal"] { stroke: var(--wb-teal); }
+.wb-shape[data-color="violet"] { stroke: var(--wb-violet); }
+.wb-well { padding: var(--wb-space-12); border: 1px solid var(--wb-rule-soft); border-radius: var(--wb-radius-surface); background: var(--wb-well); }
+.wb-well :is(.wb-item, .wb-chip, .wb-badge, .wb-code) { background: var(--wb-surface); }
+.wb-rule { margin: var(--wb-space-12) 0; border: 0; border-top: 1px solid var(--wb-rule); }
+
+/* Chips: a badge is a pill for a status, an item a chip in a list. */
+.wb-items { display: flex; flex-wrap: wrap; gap: var(--wb-space-4); margin-top: var(--wb-space-2); }
+.wb-item, .wb-chip {
+  display: inline-block;
+  padding: var(--wb-space-2) var(--wb-space-6);
+  border: 1px solid var(--wb-rule);
+  border-radius: var(--wb-radius-control);
+  background: var(--wb-well);
+  color: var(--wb-ink-muted);
+  font: var(--wb-text-micro)/var(--wb-leading-normal) var(--wb-font-mono);
+  transition: opacity var(--wb-duration) ease, border-color var(--wb-duration) ease, background-color var(--wb-duration) ease;
+}
+.wb-badge {
+  display: inline-block;
+  padding: var(--wb-space-2) var(--wb-space-8);
+  border: 1px solid var(--wb-rule);
+  border-radius: var(--wb-radius-pill);
+  background: var(--wb-well);
+  color: var(--wb-ink-muted);
+  font: var(--wb-text-micro)/var(--wb-leading-normal) var(--wb-font-mono);
+  letter-spacing: var(--wb-tracking-chrome);
+}
+
+/* Data. */
+.wb-table { width: 100%; table-layout: fixed; margin-top: var(--wb-space-2); border-collapse: collapse; font: var(--wb-text-micro)/var(--wb-leading-normal) var(--wb-font-mono); }
+.wb-table th, .wb-table td { padding: var(--wb-space-2) var(--wb-space-6); text-align: left; border-bottom: 1px solid var(--wb-rule); white-space: normal; overflow-wrap: anywhere; }
+.wb-table th { color: var(--wb-ink-muted); font-weight: var(--wb-weight-semibold); }
+.wb-table td { color: var(--wb-ink-muted); }
+
+/* SVG: a shape drawn like a card, and text set inside it. */
+.wb-shape { fill: var(--wb-surface); stroke: var(--wb-rule); stroke-width: 1; vector-effect: non-scaling-stroke; transition: fill var(--wb-duration) ease, stroke var(--wb-duration) ease; }
+.wb-shape-text { fill: var(--wb-ink); font: var(--wb-text-body) var(--wb-font-mono); }
+
+/* Tones: what a change adds, removes or alters; accent draws the eye and
+   muted recedes. Every kit part takes data-tone. */
+:is(.wb-card, .wb-node)[data-tone="accent"] { border-color: var(--wb-accent); }
+:is(.wb-card, .wb-node, .wb-item, .wb-chip)[data-tone="added"] { border-color: var(--wb-added); background: var(--wb-added-bg); }
+:is(.wb-card, .wb-node, .wb-item, .wb-chip)[data-tone="removed"] { border-color: var(--wb-removed); background: var(--wb-removed-bg); }
+:is(.wb-card, .wb-node, .wb-item, .wb-chip)[data-tone="modified"] { border-color: var(--wb-modified); background: var(--wb-modified-bg); }
+:is(.wb-card, .wb-node)[data-tone="muted"] { border-style: dashed; color: var(--wb-ink-muted); }
+:is(.wb-item, .wb-chip)[data-tone="added"] { color: var(--wb-ink); }
+:is(.wb-item, .wb-chip)[data-tone="muted"] { border-style: dashed; }
+.wb-card[data-tone="accent"] .wb-card-dot { background: var(--wb-accent); }
+.wb-card[data-tone="added"] .wb-card-dot { background: var(--wb-added); }
+.wb-card[data-tone="removed"] .wb-card-dot { background: var(--wb-removed); }
+.wb-card[data-tone="modified"] .wb-card-dot { background: var(--wb-modified); }
+.wb-badge[data-tone="accent"] { border-color: var(--wb-accent); color: var(--wb-accent); }
+.wb-badge[data-tone="added"] { border-color: var(--wb-added); color: var(--wb-added); }
+.wb-badge[data-tone="removed"] { border-color: var(--wb-removed); color: var(--wb-removed); }
+.wb-badge[data-tone="modified"] { border-color: var(--wb-modified); color: var(--wb-modified); }
+.wb-table tr[data-tone="added"] td { color: var(--wb-ink); background: var(--wb-added-bg); }
+.wb-table tr[data-tone="removed"] td { background: var(--wb-removed-bg); }
+.wb-table tr[data-tone="modified"] td { background: var(--wb-modified-bg); }
+.wb-shape[data-tone="accent"] { stroke: var(--wb-accent); }
+.wb-shape[data-tone="added"] { stroke: var(--wb-added); fill: var(--wb-added-bg); }
+.wb-shape[data-tone="removed"] { stroke: var(--wb-removed); fill: var(--wb-removed-bg); }
+.wb-shape[data-tone="modified"] { stroke: var(--wb-modified); fill: var(--wb-modified-bg); }
+.wb-shape[data-tone="muted"] { stroke-dasharray: 4 3; }
+:is(.wb-card, .wb-node)[data-wb-highlit] { border-color: var(--wb-accent); box-shadow: 0 0 0 3px var(--wb-accent-soft); }
+:is(.wb-card, .wb-node)[data-form="stack"][data-wb-highlit] {
+  box-shadow: 0 0 0 3px var(--wb-accent-soft), 4px 4px 0 -1px var(--wb-surface), 4px 4px 0 0 var(--wb-rule), 8px 8px 0 -1px var(--wb-surface), 8px 8px 0 0 var(--wb-rule);
+}
+.wb-shape[data-wb-highlit] { stroke: var(--wb-accent); stroke-width: 2; }
+
+/* Connectors and tokens. */
+/* Above the cards, which sit above their groups: an edge's head meets a
+   card's border, and a chip stays readable as it passes one. */
+.wb-arrows, .wb-tokens { position: fixed; inset: 0; z-index: 2; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.wb-line {
+  fill: none;
+  stroke: var(--wb-ink-faint);
+  stroke-width: 1.5;
+  marker-end: url(#wb-head);
+  transition: stroke var(--wb-duration) ease, stroke-width var(--wb-duration) ease,
+    stroke-dashoffset var(--wb-duration) ease;
+}
+.wb-arrow:not([data-dashed]) .wb-line { stroke-dasharray: var(--wb-length) var(--wb-length); }
+.wb-arrow[data-dashed] .wb-line { stroke-dasharray: 5 4; }
+.wb-arrow[data-wb-endpoint-detached] { display: none !important; }
+.wb-arrow[data-wb-state="before"]:not([data-dashed]) .wb-line { stroke-dashoffset: var(--wb-length); }
+.wb-arrow[data-tone="accent"] .wb-line, .wb-arrow[data-wb-highlit] .wb-line { stroke: var(--wb-accent); marker-end: url(#wb-head-accent); }
+.wb-arrow[data-wb-highlit] .wb-line { stroke-width: 2.5; }
+.wb-arrow[data-tone="added"] .wb-line { stroke: var(--wb-added); marker-end: url(#wb-head-added); }
+.wb-arrow[data-tone="removed"] .wb-line { stroke: var(--wb-removed); marker-end: url(#wb-head-removed); }
+.wb-arrow[data-tone="modified"] .wb-line { stroke: var(--wb-modified); marker-end: url(#wb-head-modified); }
+.wb-arrow[data-wb-headless] .wb-line { marker-end: none; }
+/* An edge carrying one of the frame's messages takes the marker, label too. */
+.wb-arrow[data-wb-sent] .wb-line { stroke: var(--wb-accent); marker-end: url(#wb-head-accent); }
+.wb-arrow[data-wb-sent] .wb-label { fill: var(--wb-accent); }
+.wb-arrow[data-wb-sent="added"] .wb-line { stroke: var(--wb-added); marker-end: url(#wb-head-added); }
+.wb-arrow[data-wb-sent="added"] .wb-label { fill: var(--wb-added); }
+.wb-arrow[data-wb-sent="removed"] .wb-line { stroke: var(--wb-removed); marker-end: url(#wb-head-removed); }
+.wb-arrow[data-wb-sent="removed"] .wb-label { fill: var(--wb-removed); }
+.wb-arrow[data-wb-sent="modified"] .wb-line { stroke: var(--wb-modified); marker-end: url(#wb-head-modified); }
+.wb-arrow[data-wb-sent="modified"] .wb-label { fill: var(--wb-modified); }
+.wb-arrow[data-wb-sent="muted"] .wb-line { stroke: var(--wb-ink-faint); marker-end: url(#wb-head); }
+.wb-arrow[data-wb-sent="muted"] .wb-label { fill: var(--wb-ink-muted); }
+.wb-label {
+  fill: var(--wb-ink-muted);
+  font: var(--wb-text-micro) var(--wb-font-mono);
+  text-anchor: middle;
+  paint-order: stroke;
+  stroke: var(--wb-surface);
+  stroke-width: 4px;
+  stroke-linejoin: round;
+}
+.wb-token {
+  position: absolute;
+  left: 0;
+  top: 0;
+  translate: -50% -50%;
+  min-width: 12px;
+  height: 12px;
+  border-radius: var(--wb-radius-control);
+  background: var(--wb-accent);
+  box-shadow: 0 0 0 3px var(--wb-accent-soft);
+  opacity: 0;
+}
+.wb-token[data-visible] { opacity: 1; }
+[data-wb-travel-unrouted] { visibility: hidden !important; }
+.wb-token[data-labelled] { height: auto; padding: var(--wb-space-2) var(--wb-space-8); color: var(--wb-token-accent-ink); font: var(--wb-text-micro)/var(--wb-leading-tight) var(--wb-font-mono); white-space: nowrap; }
+.wb-token[data-tone="added"] { background: var(--wb-added); }
+.wb-token[data-labelled][data-tone="added"] { color: var(--wb-token-added-ink); }
+.wb-token[data-tone="removed"] { background: var(--wb-removed); }
+.wb-token[data-labelled][data-tone="removed"] { color: var(--wb-token-removed-ink); }
+.wb-token[data-tone="modified"] { background: var(--wb-modified); }
+.wb-token[data-labelled][data-tone="modified"] { color: var(--wb-token-modified-ink); }
+.wb-token[data-tone="muted"] { background: var(--wb-ink-faint); }
+.wb-token[data-labelled][data-tone="muted"] { color: var(--wb-token-muted-ink); }
+
+/* The scene. */
+.wb-scene { display: grid; gap: var(--wb-space-28) var(--wb-space-48); padding: var(--wb-space-24); align-items: center; justify-items: stretch; min-width: 0; }
+/* A card is as wide as what it says, within bounds, and sits mid-column, so
+   a wide column does not stretch it into a slab. A table keeps its column;
+   a scene's own CSS may set any width. The scene sets its own min-width from
+   the columns its cards make, and the block scrolls it sideways when
+   narrower. */
+.wb-scene > .wb-card:not([data-kind="table"]) { justify-self: center; width: fit-content; min-width: 140px; max-width: 300px; }
+.wb-scene > [data-wb-state="before"], .wb-scene > [data-wb-state="after"],
+.wb-items > [data-wb-state="before"], .wb-items > [data-wb-state="after"],
+.wb-table tr[data-wb-state="before"], .wb-table tr[data-wb-state="after"] { display: none; }
+.wb-scene-top { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--wb-space-8); margin-bottom: var(--wb-space-4); }
+/* A group is a washed box behind the cards of its cells, bleeding into the
+   gaps around them, titled in its top-left. Cards paint over it. */
+.wb-scene > .wb-card { position: relative; z-index: 1; }
+/* Groups bleed into the gaps around their cells, so a grouped scene opens
+   its rows and columns to keep the boxes apart and give edges between
+   layers room to be read. The top bleed holds the title clear of the cards
+   below it, ring and all. */
+.wb-scene:has(> .wb-group) { row-gap: var(--wb-space-72); column-gap: var(--wb-space-72); padding: var(--wb-space-32) var(--wb-space-24); }
+.wb-group {
+  position: relative; z-index: 0; align-self: stretch; justify-self: stretch;
+  margin: calc(-1 * var(--wb-space-28)) calc(-1 * var(--wb-space-16)) calc(-1 * var(--wb-space-10));
+  border: 1px solid var(--wb-rule-soft); border-radius: var(--wb-radius-surface); background: var(--wb-well);
+  transition: opacity var(--wb-duration) ease;
+}
+.wb-group-title { position: absolute; top: var(--wb-space-4); left: var(--wb-space-12); color: var(--wb-ink-muted); font: var(--wb-text-micro)/var(--wb-leading-normal) var(--wb-font-mono); letter-spacing: var(--wb-tracking-chrome); text-transform: uppercase; white-space: nowrap; }
+.wb-group[data-color="accent"] { border-color: color-mix(in srgb, var(--wb-accent) 30%, transparent); background: color-mix(in srgb, var(--wb-accent) 7%, transparent); }
+.wb-group[data-color="accent"] .wb-group-title { color: var(--wb-accent); }
+.wb-group[data-color="teal"] { border-color: color-mix(in srgb, var(--wb-teal) 36%, transparent); background: color-mix(in srgb, var(--wb-teal) 8%, transparent); }
+.wb-group[data-color="teal"] .wb-group-title { color: var(--wb-teal); }
+.wb-group[data-color="violet"] { border-color: color-mix(in srgb, var(--wb-violet) 36%, transparent); background: color-mix(in srgb, var(--wb-violet) 8%, transparent); }
+.wb-group[data-color="violet"] .wb-group-title { color: var(--wb-violet); }
+.wb-group[data-color="ink"] { border-color: var(--wb-rule); }
+.wb-group[data-color="ink"] .wb-group-title { color: var(--wb-ink); }
+/* The legend: a card-like glyph per entry, drawn with the card rules and
+   scaled to 0.4 inside a box of the scaled size, and what it stands for.
+   A transform, not zoom: Electron's Chromium reports a zoomed element's
+   rect in unzoomed units, which made the stage measure itself 2.5x tall. */
+.wb-legend { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--wb-space-6) var(--wb-space-16); padding: 0 var(--wb-space-24) var(--wb-space-12); color: var(--wb-ink-muted); font: var(--wb-text-micro)/var(--wb-leading-normal) var(--wb-font-mono); letter-spacing: var(--wb-tracking-chrome); text-transform: uppercase; }
+.wb-legend-entry { display: inline-flex; align-items: center; gap: var(--wb-space-6); white-space: nowrap; }
+.wb-legend-box { position: relative; flex: none; width: 20px; height: 13px; }
+.wb-card.wb-legend-glyph { position: absolute; top: 0; left: 0; display: block; width: 50px; min-width: 0; height: 32px; padding: 0; transform: scale(0.4); transform-origin: 0 0; }
+.wb-card.wb-legend-glyph[data-form="cylinder"] { height: 44px; }
+/* Lines that scale to a pixel: the glyph's borders, its lid and rule marks,
+   and its change stripe are drawn 2.5x heavier before the 0.4 scale. */
+.wb-card.wb-legend-glyph, .wb-card.wb-legend-glyph::before, .wb-card.wb-legend-glyph::after { border-width: 2.5px; }
+.wb-card.wb-legend-glyph[data-change] { border-left-width: 7px; }
+:root[data-wb-instant] *, :root[data-wb-instant] *::before, :root[data-wb-instant] *::after {
+  transition: none !important;
+  animation-duration: 0s !important;
+  animation-delay: 0s !important;
+}`;
+
+/** whiteboard.css: the kit with a guide to its classes and variables, for an
+ * agent to read before writing an animation. */
+export function stageStyleReference(): string {
+  const variables = STAGE_VARIABLES.map(
+    ([note, names]) =>
+      ` * ${note}:\n *   ${names.map((name) => `--wb-${name}`).join(", ")}`,
+  ).join("\n *\n");
+
+  const classes = CLASSES.map(
+    ([selector, use]) => ` *   ${selector.padEnd(26)} ${use}`,
+  ).join("\n");
+
+  return `/* Whiteboard animations: the CSS every animation loads.
+ *
+ * Read-only reference. Whiteboard rewrites this file; editing it changes
+ * nothing. Build an animation from these classes and variables. Add a <style> in
+ * animation.html only for what they do not cover, written with the variables:
+ * no literal colors, sizes or font names. data-tone="accent|added|removed|
+ * modified|muted" colors any card, node, chip, badge, shape or table row;
+ * data-highlight="frameKey ..." rings a card, node or shape in those frames
+ * (in a clip, those markers).
+ *
+ * Classes:
+${classes}
+ *
+ * Variables, set on :root. Colors and faces follow the reader's theme, so
+ * this file gives no values for them; use the variable.
+ *
+${variables}
+ */
+
+${STAGE_KIT_CSS}
+`;
+}

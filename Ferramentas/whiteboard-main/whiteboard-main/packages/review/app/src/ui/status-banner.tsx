@@ -1,0 +1,39 @@
+import { fontSize, space } from "@canvas/scale.stylex";
+import type { StyleArg } from "@canvas/stylex-props";
+import { tokens } from "@canvas/tokens.stylex";
+import * as stylex from "@stylexjs/stylex";
+import type { ReactElement, ReactNode } from "react";
+
+export function StatusBanner({
+  children,
+  action,
+  xstyle,
+}: {
+  children: ReactNode;
+  action?: ReactNode;
+  xstyle?: StyleArg;
+}): ReactElement {
+  return (
+    <div {...stylex.props(styles.banner, xstyle)} role="status">
+      <span>{children}</span>
+      {action}
+    </div>
+  );
+}
+
+const styles = stylex.create({
+  banner: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: space.s12,
+    padding: `${space.s6} ${space.s12}`,
+    borderBottomWidth: "1px",
+    borderBottomStyle: "solid",
+    borderBottomColor: tokens.ruleSoft,
+    backgroundColor: `color-mix(in srgb, ${tokens.accent} 12%, ${tokens.surface})`,
+    color: tokens.ink,
+    fontFamily: tokens.chromeFont,
+    fontSize: fontSize.body,
+  },
+});

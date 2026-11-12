@@ -1,0 +1,47 @@
+{
+  "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
+  "appId": "com.escola.portaria.localfirst",
+  "productName": "Portaria Escolar Local-First",
+  "copyright": "Copyright © 2026 Escola Horizonte",
+  "directories": {
+    "output": "dist_electron",
+    "buildResources": "build"
+  },
+  "files": [
+    "dist/**/*",
+    "electron/**/*.js",
+    "backend/**/*.js",
+    "backend/**/*.sql",
+    "package.json"
+  ],
+  "extraResources": [
+    {
+      "from": "backend/src/db/schema.sql",
+      "to": "backend/src/db/schema.sql"
+    }
+  ],
+  "win": {
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64"]
+      },
+      {
+        "target": "portable",
+        "arch": ["x64"]
+      }
+    ],
+    "requestedExecutionLevel": "asInvoker"
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "Portaria Escolar"
+  },
+  "portable": {
+    "artifactName": "PortariaEscolar-Portable-${version}.exe"
+  }
+}
+

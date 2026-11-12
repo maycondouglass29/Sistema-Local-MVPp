@@ -1,0 +1,36 @@
+[
+  {
+    "type": "flow_diagram",
+    "title": "Queue an order",
+    "nodes": [
+      {
+        "key": "request",
+        "label": "Queue order",
+        "attachments": [
+          {
+            "label": "Handler",
+            "sources": ["head/order.ts#L1"]
+          },
+          {
+            "label": "Validation",
+            "sources": ["base/order.ts#L1"]
+          }
+        ]
+      },
+      {
+        "key": "saved",
+        "label": "Saved",
+        "kind": "terminal",
+        "attachments": []
+      }
+    ],
+    "edges": [
+      {
+        "from": "request",
+        "to": "saved",
+        "label": "persist"
+      }
+    ],
+    "id": "flow-1"
+  }
+]

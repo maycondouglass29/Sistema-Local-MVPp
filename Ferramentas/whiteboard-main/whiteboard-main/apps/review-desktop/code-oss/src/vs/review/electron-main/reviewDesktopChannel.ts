@@ -1,0 +1,166 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) dev.fast. All rights reserved.
+ *  Licensed under the MIT License. See LICENSE in the repository root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import { Event } from "../../base/common/event.js";
+import { isAbsolute } from "../../base/common/path.js";
+import { IServerChannel } from "../../base/parts/ipc/common/ipc.js";
+import type { IDialogMainService } from "../../platform/dialogs/electron-main/dialogMainService.js";
+import type { IWindowsMainService } from "../../platform/windows/electron-main/windows.js";
+import type { ReviewDesktopConnection } from "../common/reviewDesktopBootstrap.js";
+import { externalEditorUrl, type ReviewExternalEditorTarget } from "../common/reviewExternalEditor.js";
+import { REVIEW_SSH_ANSWER_CALL, REVIEW_SSH_PROMPT_EVENT } from "../common/reviewSshPrompt.js";
+import {
+  reviewSshPromptRelay,
+  type ReviewSshPromptRelay,
+} from "./remote/reviewSshPromptRelay.js";
+import type { ReviewDesktopHost } from "./reviewDesktopHost.js";
+import { applicationPickerOptions, launchApplication, launchEditorWorkspace, launchExternalEditorUrl, type EditorWorkspaceFile } from "./reviewExternalEditorLauncher.js";
+
+/** How the channel reaches outside Whiteboard; tests replace it. */
+export interface ReviewExternalLauncher {
+  openUrl(url: string): Promise<void>;
+  openInApplication(application: string, filePath: string): Promise<void>;
+  /** False where the editor's command line is not found. */
+  openEditorWorkspace(editor: string, folder: string, file: EditorWorkspaceFile): Promise<boolean>;
+}
+
+const externalLauncher: ReviewExternalLauncher = {
+  openUrl: (url) => launchExternalEditorUrl(url),
+  openInApplication: (application, filePath) => launchApplication(application, filePath),
+  openEditorWorkspace: (editor, folder, file) => launchEditorWorkspace(editor, folder, file),
+};
+
+export { REVIEW_DESKTOP_CHANNEL } from "../common/reviewDesktopBootstrap.js";
+
+/**
+ * Hands the renderer the endpoint the main process validated. Bootstrap details
+ * deliberately do not travel through the window configuration or the process
+ * environment: the main process is the only owner of the server credentials.
+ */
+export class ReviewDesktopChannel implements IServerChannel {
+  constructor(
+    private readonly host: ReviewDesktopHost,
+    private readonly windows: IWindowsMainService,
+    private readonly moveToApplications: () => boolean,
+    private readonly dialogs: Pick<IDialogMainService, "showOpenDialog">,
+    private readonly sshPrompts: ReviewSshPromptRelay = reviewSshPromptRelay,
+    private readonly launcher: ReviewExternalLauncher = externalLauncher,
+  ) {}
+
+  listen<T>(_context: string, event: string): Event<T> {
+    if (event === REVIEW_SSH_PROMPT_EVENT) return this.sshPrompts.onPrompt as Event<T>;
+    return Event.None as Event<T>;
+  }
+
+  async call<T>(_context: string, command: string, arg?: unknown): Promise<T> {
+    if (command === "getConnection") {
+      const connection: ReviewDesktopConnection = await this.host.whenConnected();
+      return connection as T;
+    }
+    if (command === "stageRustAnalyzer") {
+      this.host.stageRustAnalyzer();
+      return undefined as T;
+    }
+    if (command === "moveToApplications") {
+      return this.moveToApplications() as T;
+    }
+    if (command === "closeSourceWindows") {
+      this.closeSourceWindows(Array.isArray(arg) ? arg.map(String) : []);
+      return undefined as T;
+    }
+    if (command === "openInExternalEditor") {
+      // Only a known editor's file URL leaves here: the renderer names the
+      // file, never the URL or the program that opens it.
+      const target = (arg ?? {}) as ReviewExternalEditorTarget;
+      const url = externalEditorUrl(target);
+      if (!url) throw new Error("Not a file Whiteboard can open in an external editor.");
+      const folder = typeof target.folder === "string" && isAbsolute(target.folder) ? target.folder : undefined;
+      // The command line takes the folder and file together, into one window.
+      if (folder && await this.launcher.openEditorWorkspace(target.editor, folder, { path: target.filePath, line: target.line, column: target.column })) return undefined as T;
+      // Without it, the folder's URL first, so the editor puts the file in
+      // the window that has its checkout open. Zed would open the folder in
+      // a window of its own, so it gets only the file.
+      const folderUrl = folder && target.editor !== "zed" && externalEditorUrl({ editor: target.editor, filePath: folder });
+      if (folderUrl) await this.launcher.openUrl(folderUrl);
+      await this.launcher.openUrl(url);
+      return undefined as T;
+    }
+    if (command === "openInApplication") {
+      const { application, filePath } = (arg ?? {}) as { application?: unknown; filePath?: unknown };
+      if (typeof application !== "string" || typeof filePath !== "string" || !isAbsolute(application) || !isAbsolute(filePath))
+        throw new Error("Not a file and application Whiteboard can open.");
+      await this.launcher.openInApplication(application, filePath);
+      return undefined as T;
+    }
+    if (command === "chooseApplication") {
+      const parent = this.windows.getFocusedWindow()?.win ?? undefined;
+      const result = await this.dialogs.showOpenDialog(applicationPickerOptions(process.platform), parent);
+      return (result.canceled ? null : result.filePaths[0] ?? null) as T;
+    }
+    if (command === "listSshAliases") {
+      return (await this.host.listSshAliases()) as T;
+    }
+    if (command === "getRemoteLanguageEndpoint") {
+      if (typeof arg !== "string") return undefined as T;
+      return (await this.host.getRemoteLanguageEndpoint(arg)) as T;
+    }
+    if (command === "getRemoteHostState") {
+      const [serverId, last] = Array.isArray(arg) ? arg : [arg];
+      if (typeof serverId !== "string") return undefined as T;
+      return (await this.host.getRemoteHostState(serverId, typeof last === "string" ? last : undefined)) as T;
+    }
+    if (command === "retryRemoteHost") {
+      if (typeof arg === "string") await this.host.retryRemoteHost(arg);
+      return undefined as T;
+    }
+    if (command === "detectRemoteAgents") {
+      const [alias, refresh] = Array.isArray(arg) ? arg : [arg];
+      if (typeof alias !== "string") throw new Error("Unknown agents request.");
+      return ((await this.host.detectRemoteAgents(alias, refresh === true)) ?? null) as T;
+    }
+    if (command === "connectRemoteAgents") {
+      const { alias, agents } = (arg ?? {}) as { alias?: unknown; agents?: unknown };
+      if (typeof alias !== "string" || !Array.isArray(agents) || agents.length > 16) throw new Error("Unknown agents request.");
+      return (await this.host.connectRemoteAgents(alias, agents)) as T;
+    }
+    if (command === "installRemoteHost") {
+      if (typeof arg === "string") await this.host.installRemoteHost(arg);
+      return undefined as T;
+    }
+    if (command === "uninstallRemoteHost") {
+      if (typeof arg !== "string") throw new Error("uninstallRemoteHost needs an alias.");
+      return (await this.host.uninstallRemoteHost(arg)) as T;
+    }
+    if (command === REVIEW_SSH_ANSWER_CALL) {
+      const { id, answer } = (arg ?? {}) as { id?: unknown; answer?: unknown };
+      if (typeof id === "number")
+        this.sshPrompts.answer(id, typeof answer === "string" ? answer : undefined);
+      return undefined as T;
+    }
+    throw new Error(`Unknown Review Desktop channel call: ${command}`);
+  }
+
+  /**
+   * A source window opens a workspace file the host writes inside the
+   * review's managed checkouts, which dismissal and deletion remove. Closing
+   * here, not by window id from a renderer, cannot fall back to closing the
+   * caller when the window is already gone.
+   */
+  private closeSourceWindows(reviewIds: string[]) {
+    // The host names the directory with safeStorageSegment(reviewId).
+    const roots = reviewIds.map(
+      (id) => `/dev-fast/reviews/${id.replace(/[^A-Za-z0-9_.-]+/g, "__")}/`,
+    );
+    for (const window of this.windows.getWindows()) {
+      const workspace = window.openedWorkspace;
+      if (
+        workspace &&
+        "configPath" in workspace &&
+        roots.some((root) => workspace.configPath.path.includes(root))
+      )
+        window.close();
+    }
+  }
+}

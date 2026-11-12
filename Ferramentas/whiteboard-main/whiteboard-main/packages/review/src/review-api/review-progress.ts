@@ -1,0 +1,403 @@
+import {
+  type DiffLens,
+  type FileLineRange,
+  type Lens,
+  type LensSource,
+  type Pins,
+  ReviewInputError,
+  SelectionUnavailableError,
+  type SelectionUnavailableReason,
+  UNCATEGORIZED_LENS_ID,
+  anchorPins,
+  boardRepositoryId,
+  comparisonKey,
+  fileLineRangeSchema,
+  lensSelections,
+  patchRows,
+  resolveDiffSelection,
+  selectionKey,
+  selectionReferences,
+} from "@dev.fast/whiteboard-document";
+import { type CoverageFile, emptyCoverage } from "@review/viewed-coverage.js";
+import { z } from "zod";
+
+import type { ComparisonCoverage } from "./comparison-coverage.js";
+import {
+  changedPath,
+  resolveFileLens,
+  uncategorizedSources,
+} from "./file-lenses.js";
+import type { LocalReviewData } from "./local-data.js";
+import type { ReviewStore, Snapshot } from "./store.js";
+
+/** Older clients still send `mode`. */
+export const legacyModeSchema = z.unknown().optional();
+
+export const progressUpdateSchema = z.strictObject({
+  mode: legacyModeSchema,
+  version: z.number().int().nonnegative(),
+  files: z
+    .array(
+      z.strictObject({
+        path: z.string(),
+        fingerprint: z.string().min(1),
+        sources: z.array(fileLineRangeSchema),
+      }),
+    )
+    .max(10000),
+  viewed: z.boolean(),
+});
+
+export interface ReviewProgress {
+  complete?: boolean;
+  unavailableSelections?: Record<string, SelectionUnavailableReason>;
+  files: CoverageFile[];
+  /** Changed files of the comparisons that references with their own pins
+   * named, by `comparisonKey` and then path. They are not the document's
+   * comparison, so they are not in `files`; a node attached to one still
+   * counts its changed lines, under its own pins only. A comparison that
+   * changed nothing at a cited path has an entry with no file for it. */
+  referenceFiles?: Record<string, Record<string, CoverageFile>>;
+  resolvedSelections: Record<string, FileLineRange[]>;
+  /** The review's file lenses, then the automatic "Uncategorized changes". */
+  lenses: (DiffLens & { unavailable?: string; pending?: boolean })[];
+  /** Untracked files a live worktree review leaves out of its comparison. */
+  untrackedFiles?: number;
+}
+
+/** Coverage survives new pins only when both complete file contents are unchanged. */
+export async function reviewProgress(
+  store: ReviewStore,
+  data: LocalReviewData,
+  snapshot: Snapshot,
+  signal: AbortSignal = new AbortController().signal,
+  partial?: ComparisonCoverage,
+): Promise<ReviewProgress> {
+  const marks = store.viewedCoverage(snapshot.reviewId);
+
+  const pins = snapshot.pins
+    ? (await data.resolveSource(snapshot)).pins
+    : undefined;
+
+  // A document without pins of its own has no changed files; its references
+  // each resolve against the comparison their own pins name.
+  const comparison: ComparisonCoverage = pins
+    ? (partial ?? (await data.coverage(snapshot.reviewId, pins)))
+    : {
+        counted: true,
+        files: [],
+        fileSources: new Map(),
+        alignments: new Map(),
+      };
+
+  const counting = !comparison.counted;
+
+  signal.throwIfAborted();
+
+  const documentKey = JSON.stringify(pins);
+  const comparisons = new Map<string, Promise<ComparisonCoverage>>();
+
+  /** The comparison a reference's own pins name, shared across references. */
+  const ownComparison = (
+    own: Pins,
+  ): Promise<ComparisonCoverage> | undefined => {
+    const key = JSON.stringify(own);
+    let loading = comparisons.get(key);
+
+    if (loading) return loading;
+
+    if (partial) {
+      const state = data.coverageSnapshot(snapshot.reviewId, own);
+
+      if (state.pending)
+        return state.comparison.counted
+          ? Promise.resolve(state.comparison)
+          : undefined;
+    }
+
+    loading = data.coverage(snapshot.reviewId, own);
+    comparisons.set(key, loading);
+
+    return loading;
+  };
+
+  const withViewed = (file: CoverageFile): CoverageFile => ({
+    ...file,
+    viewed:
+      marks.get(file.path)?.fingerprint === file.fingerprint
+        ? marks.get(file.path)!.coverage
+        : emptyCoverage(),
+  });
+
+  const files = comparison.files.map(withViewed);
+  const referenceFiles: Record<string, Record<string, CoverageFile>> = {};
+
+  const fileSources = new Map(comparison.fileSources);
+  const alignments = new Map(comparison.alignments);
+  const resolvedSelections: Record<string, FileLineRange[]> = {};
+
+  const unavailableSelections: Record<string, SelectionUnavailableReason> = {};
+  const pendingSources = new Set<string>();
+
+  const resolve = async (source: LensSource): Promise<FileLineRange[]> => {
+    const key = selectionKey(source);
+
+    if (resolvedSelections[key]) return resolvedSelections[key];
+    const sourcePins = anchorPins(source, pins);
+    const own = JSON.stringify(sourcePins) !== documentKey;
+    let ownFiles = files;
+    let ownAlignments = alignments;
+
+    if (own) {
+      const loading = ownComparison(sourcePins);
+
+      if (!loading) {
+        pendingSources.add(key);
+
+        return [];
+      }
+
+      const loaded = await loading;
+      ownFiles = loaded.files;
+      ownAlignments = loaded.alignments;
+    }
+
+    const file = ownFiles.find(
+      (file) => source.file === file.path || source.file === file.previousPath,
+    );
+
+    if (own) {
+      const group = (referenceFiles[comparisonKey(sourcePins)] ??= {});
+
+      if (file) group[file.path] ??= withViewed(file);
+    }
+
+    let rows = file && ownAlignments.get(file.path);
+
+    // Context-only files are absent from the changed-file stream. Read both pins
+    // and require equality rather than inventing correspondence for missing
+    // diffs; a file on one side only, such as an untracked one, is that side.
+    if (!file && counting && !own) {
+      pendingSources.add(key);
+
+      return [];
+    }
+
+    if (!file) {
+      const [base, head] = await Promise.all(
+        (["base", "head"] as const).map((side) =>
+          data.file(sourcePins, side, source.file).then(
+            (value) => value.text,
+            (error) => {
+              if (error instanceof ReviewInputError && error.status === 404)
+                return null;
+              throw error;
+            },
+          ),
+        ),
+      );
+
+      if (base === null && head === null)
+        throw new SelectionUnavailableError(
+          "missing_file",
+          "File is unavailable at these pins.",
+        );
+
+      if (base !== null && head !== null && base !== head)
+        throw new SelectionUnavailableError(
+          "no_alignment",
+          "Changed context file has no alignment.",
+        );
+      rows = patchRows(
+        "",
+        base?.split("\n").length ?? 0,
+        head?.split("\n").length ?? 0,
+      );
+    }
+
+    if (!rows)
+      throw new SelectionUnavailableError(
+        "no_alignment",
+        "File has no text alignment.",
+      );
+
+    const result = resolveDiffSelection(
+      source,
+      rows,
+      file ?? { path: source.file },
+    );
+
+    resolvedSelections[key] = result;
+
+    return result;
+  };
+
+  const resolveAvailable = async (source: LensSource) => {
+    try {
+      return await resolve(source);
+    } catch (error) {
+      unavailableSelections[selectionKey(source)] =
+        error instanceof SelectionUnavailableError ? error.reason : "other";
+
+      return [];
+    }
+  };
+
+  const lenses: ReviewProgress["lenses"] = await Promise.all(
+    (snapshot.lenses ?? []).map(async (authored) => {
+      const lens = { id: authored.id, title: authored.title };
+
+      try {
+        // Explicit ranges use the same pin validation as diagram evidence.
+        await Promise.all(
+          lensSelections([authored]).map(({ source }) =>
+            resolveAvailable(source),
+          ),
+        );
+
+        const resolved = resolveFileLens(
+          authored,
+          files,
+          fileSources,
+          (source) => resolvedSelections[selectionKey(source)] ?? [],
+        );
+
+        return {
+          ...lens,
+          ...resolved,
+          pending: counting,
+          unavailable:
+            counting || resolved.fileCount
+              ? undefined
+              : "No files match these targets",
+        };
+      } catch {
+        return {
+          ...lens,
+          sources: [],
+          unavailable: "Source links need updating at these pins",
+        };
+      }
+    }),
+  );
+
+  // Peeks share alignment resolution without claiming lens coverage.
+  await Promise.all(
+    selectionReferences(snapshot.document, {
+      tolerant: true,
+      repositoryId: boardRepositoryId(snapshot),
+    }).map(async ({ source }) => {
+      try {
+        await resolveAvailable(source);
+      } catch {
+        /* An unavailable peek does not hide other content. */
+      }
+    }),
+  );
+
+  const uncategorized = counting
+    ? []
+    : uncategorizedSources(
+        files,
+        lenses
+          .filter((lens) => !lens.unavailable)
+          .flatMap((lens) => lens.sources),
+      );
+
+  lenses.push({
+    id: UNCATEGORIZED_LENS_ID,
+    title: "Uncategorized changes",
+    sources: uncategorized,
+    wholeFiles: false,
+    fileCount: new Set(uncategorized.map(changedPath(files))).size,
+    pending: counting,
+    unavailable:
+      counting || uncategorized.length
+        ? undefined
+        : "All changed lines are covered by lenses",
+  });
+
+  const progress: ReviewProgress = {
+    complete: !counting && !pendingSources.size,
+    files,
+    referenceFiles,
+    lenses,
+    resolvedSelections,
+    unavailableSelections,
+  };
+
+  const untrackedFiles = pins ? await data.untrackedFiles(pins) : undefined;
+
+  if (untrackedFiles) progress.untrackedFiles = untrackedFiles;
+
+  return progress;
+}
+
+/** The most files an uncategorized report names; the rest are counted. */
+const REPORT_FILES = 50;
+
+export interface UncategorizedReport {
+  /** Changed lines, counting each side, that no lens selects. */
+  lines: number;
+  files: {
+    path: string;
+    lines: number;
+    ranges: Pick<FileLineRange, "side" | "fromLine" | "toLine">[];
+  }[];
+  /** Files past the first REPORT_FILES, left out of `files`. */
+  moreFiles?: number;
+}
+
+/** What a lens author still has to place: the changed lines no lens selects,
+ * grouped by file. */
+export function uncategorizedReport(
+  progress: ReviewProgress,
+): UncategorizedReport {
+  const sources =
+    progress.lenses.find((lens) => lens.id === UNCATEGORIZED_LENS_ID)
+      ?.sources ?? [];
+
+  const byPath = new Map<string, UncategorizedReport["files"][number]>();
+  const pathOf = changedPath(progress.files);
+
+  for (const source of sources) {
+    const path = pathOf(source);
+
+    const entry = byPath.get(path) ?? { path, lines: 0, ranges: [] };
+    entry.lines += source.toLine - source.fromLine + 1;
+    entry.ranges.push({
+      side: source.side,
+      fromLine: source.fromLine,
+      toLine: source.toLine,
+    });
+    byPath.set(path, entry);
+  }
+
+  const files = [...byPath.values()];
+
+  const report: UncategorizedReport = {
+    lines: files.reduce((total, file) => total + file.lines, 0),
+    files: files.slice(0, REPORT_FILES),
+  };
+
+  if (files.length > REPORT_FILES)
+    report.moreFiles = files.length - REPORT_FILES;
+
+  return report;
+}
+
+/** Each lens as authored, with what it resolves to, for a lens author. */
+export function lensReport(lenses: readonly Lens[], progress: ReviewProgress) {
+  return {
+    lenses: lenses.map((lens) => {
+      const resolved = progress.lenses.find((item) => item.id === lens.id);
+
+      return {
+        ...lens,
+        fileCount: resolved?.fileCount ?? 0,
+        ...(resolved?.unavailable && { unavailable: resolved.unavailable }),
+      };
+    }),
+    uncategorized: uncategorizedReport(progress),
+  };
+}

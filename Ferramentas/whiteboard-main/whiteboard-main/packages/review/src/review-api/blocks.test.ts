@@ -1,0 +1,279 @@
+import { readFile, readdir } from "node:fs/promises";
+import path from "node:path";
+
+import type { JsonValue } from "@dev.fast/json";
+import {
+  type BlockType,
+  type Definitions,
+  ReviewInputError,
+  blocks,
+  checkReferences,
+  documentSchema,
+} from "@dev.fast/whiteboard-document";
+import { describe, expect, it } from "vitest";
+
+const fixturesDir = path.resolve(import.meta.dirname, "../fixtures/blocks");
+
+const goldensDir = path.resolve(
+  import.meta.dirname,
+  "../../app/src/fixtures/saved-reviews",
+);
+
+async function fixture<T extends BlockType>(type: T) {
+  const raw = JSON.parse(
+    await readFile(path.join(fixturesDir, `${type}.json`), "utf8"),
+  );
+
+  const definition: Definitions[T] = blocks[type];
+
+  return documentSchema
+    .parse(raw)
+    .map((block) => definition.schema.parse(block));
+}
+
+describe("block definitions", () => {
+  it.each(Object.keys(blocks) as BlockType[])(
+    "%s fixtures parse and pass their check",
+    async (type) => {
+      for (const block of await fixture(type)) {
+        expect(block.type).toBe(type);
+        expect(() => checkReferences([block])).not.toThrow();
+      }
+    },
+  );
+
+  it("accepts the three real reviews", async () => {
+    const goldens = (await readdir(goldensDir)).filter((f) =>
+      f.endsWith(".json"),
+    );
+
+    for (const name of goldens) {
+      const document = documentSchema.parse(
+        JSON.parse(await readFile(path.join(goldensDir, name), "utf8")),
+      );
+
+      expect(() => checkReferences(document)).not.toThrow();
+    }
+  });
+
+  describe("check rules", () => {
+    it("sequence: a step must name declared actors", async () => {
+      const [sequence] = await fixture("sequence");
+
+      const broken = {
+        ...sequence!,
+        steps: [{ ...sequence!.steps[0]!, to: "ghost" }],
+      };
+
+      expect(() => checkReferences([broken])).toThrow(
+        new ReviewInputError("Unknown component name: ghost"),
+      );
+    });
+    it("call_stack_diff: frame keys are unique per side", async () => {
+      const [diff] = await fixture("call_stack_diff");
+
+      const broken = {
+        ...diff!,
+        head: [diff!.head[0]!, { ...diff!.head[0]!, id: "frame-3" }],
+      };
+
+      expect(() => checkReferences([broken])).toThrow(
+        new ReviewInputError("Frame keys must be unique within head."),
+      );
+    });
+    it("call_stack_diff: columns can compare paths in the same pinned snapshot", async () => {
+      const [diff] = await fixture("call_stack_diff");
+
+      const comparison = {
+        ...diff!,
+        base: [
+          {
+            ...diff!.base[0]!,
+            source: diff!.base[0]!.source.replace(/^base\//, "head/"),
+          },
+        ],
+      };
+
+      expect(() => checkReferences([comparison])).not.toThrow();
+    });
+    it("animation: frame keys are unique", async () => {
+      const [animation] = await fixture("animation");
+
+      const broken = {
+        ...animation!,
+        frames: [animation!.frames[0]!, animation!.frames[0]!],
+      };
+
+      expect(() => checkReferences([broken])).toThrow(
+        new ReviewInputError(
+          "Animation frame keys must be unique within the animation.",
+        ),
+      );
+    });
+    it("animation: scenarios name declared frames", async () => {
+      const [animation] = await fixture("animation");
+
+      const scenarios = (missing: string) => ({
+        ...animation!,
+        scenarios: [
+          { key: "short", label: "Short", frames: ["before"] },
+          { key: "long", label: "Long", frames: ["before", missing] },
+        ],
+      });
+
+      expect(() => checkReferences([scenarios("change")])).not.toThrow();
+      expect(() => checkReferences([scenarios("chnage")])).toThrow(
+        /names frame "chnage"/,
+      );
+    });
+    it("animation: frame labels are all or none", async () => {
+      const [animation] = await fixture("animation");
+
+      const bare = animation!.frames.map(
+        ({ label: _label, ...frame }) => frame,
+      );
+
+      const partial = {
+        ...animation!,
+        frames: [{ ...bare[0]!, label: "FIRST" }, ...bare.slice(1)],
+      };
+
+      expect(() => checkReferences([partial])).toThrow(
+        /Give every animation frame a label/,
+      );
+
+      const all = {
+        ...animation!,
+        frames: bare.map((frame, index) => ({
+          ...frame,
+          label: `STEP ${index + 1}`,
+        })),
+      };
+
+      expect(() => checkReferences([all])).not.toThrow();
+    });
+    it("animation: a frame holds its own data, within a size limit", async () => {
+      const [animation] = await fixture("animation");
+
+      const withData = (data: JsonValue) => ({
+        ...animation!,
+        frames: [
+          { ...animation!.frames[0]!, data },
+          ...animation!.frames.slice(1),
+        ],
+      });
+
+      const state = { nodes: [{ name: "S1", log: ["x←1"], commit: 1 }] };
+
+      expect(
+        blocks.animation.schema.parse(withData(state)).frames[0]!.data,
+      ).toEqual(state);
+      expect(() =>
+        blocks.animation.schema.parse(withData({ log: "x".repeat(20_001) })),
+      ).toThrow(/under 20 KB/);
+    });
+    it("animation: code names a source anchor", async () => {
+      const [animation] = await fixture("animation");
+
+      expect(() =>
+        blocks.animation.schema.parse({
+          ...animation!,
+          code: { status: "order.ts:1" },
+        }),
+      ).toThrow(/source anchor/);
+    });
+    it.each([
+      ["actor", { actor: "nobody" }, "Unknown component name: nobody"],
+      ["store", { store: "missing" }, "Unknown component name: missing"],
+      [
+        "collection",
+        { collection: "missing" },
+        "Unknown component name: missing",
+      ],
+      ["field", { field: "missing" }, "Unknown component name: missing"],
+      [
+        "dotted field",
+        { field: "status.nested" },
+        "Unknown component name: status.nested",
+      ],
+    ])(
+      "database_lens: an operation must resolve its %s",
+      async (_, patch, message) => {
+        const [lens] = await fixture("database_lens");
+        const useCase = lens!.useCases[0]!;
+
+        const broken = {
+          ...lens!,
+          useCases: [
+            {
+              ...useCase,
+              operations: [{ ...useCase.operations[0]!, ...patch }],
+            },
+          ],
+        };
+
+        expect(() => checkReferences([broken])).toThrow(
+          new ReviewInputError(message),
+        );
+      },
+    );
+    it("database_lens: a foreign key must resolve", async () => {
+      const [lens] = await fixture("database_lens");
+      const orders = lens!.stores.orders!;
+
+      const broken = {
+        ...lens!,
+        stores: {
+          orders: {
+            ...orders,
+            collections: {
+              orders: {
+                ...orders.collections.orders!,
+                fields: {
+                  ...orders.collections.orders!.fields,
+                  status: {
+                    label: "status",
+                    dataType: "text",
+                    references: {
+                      store: "orders",
+                      collection: "orders",
+                      field: "missing",
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      };
+
+      expect(() => checkReferences([broken])).toThrow(
+        new ReviewInputError("Unknown component name: missing"),
+      );
+    });
+  });
+
+  describe("lens minimum rules (the class the mount uniquely caught)", () => {
+    it("rejects a lens with no stores", async () => {
+      const [lens] = await fixture("database_lens");
+      expect(() =>
+        blocks.database_lens.schema.parse({ ...lens!, stores: {} }),
+      ).toThrow(/at least one store/);
+    });
+    it("rejects a lens with no use cases", async () => {
+      const [lens] = await fixture("database_lens");
+      expect(() =>
+        blocks.database_lens.schema.parse({ ...lens!, useCases: [] }),
+      ).toThrow(/at least one use case/);
+    });
+    it("rejects a use case with no operations", async () => {
+      const [lens] = await fixture("database_lens");
+      expect(() =>
+        blocks.database_lens.schema.parse({
+          ...lens!,
+          useCases: [{ ...lens!.useCases[0]!, operations: [] }],
+        }),
+      ).toThrow(/at least one operation/);
+    });
+  });
+});

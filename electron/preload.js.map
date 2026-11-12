@@ -1,0 +1,7 @@
+{
+  "version": 3,
+  "sources": ["preload.ts"],
+  "sourcesContent": ["import { contextBridge, ipcRenderer } from 'electron';\n\ncontextBridge.exposeInMainWorld('electronAPI', {\n  getVersion: () => ipcRenderer.invoke('app:get-version'),\n  isPackaged: () => ipcRenderer.invoke('app:is-packaged'),\n  minimize: () => ipcRenderer.invoke('window:minimize'),\n  maximize: () => ipcRenderer.invoke('window:maximize'),\n  close: () => ipcRenderer.invoke('window:close'),\n  print: () => window.print(),\n});\n\n"],
+  "mappings": ";AAAA,sBAA2C;AAE3C,8BAAc,kBAAkB,eAAe;AAAA,EAC7C,YAAY,MAAM,4BAAY,OAAO,iBAAiB;AAAA,EACtD,YAAY,MAAM,4BAAY,OAAO,iBAAiB;AAAA,EACtD,UAAU,MAAM,4BAAY,OAAO,iBAAiB;AAAA,EACpD,UAAU,MAAM,4BAAY,OAAO,iBAAiB;AAAA,EACpD,OAAO,MAAM,4BAAY,OAAO,cAAc;AAAA,EAC9C,OAAO,MAAM,OAAO,MAAM;AAC5B,CAAC;",
+  "names": []
+}

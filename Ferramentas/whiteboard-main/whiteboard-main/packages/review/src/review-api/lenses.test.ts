@@ -1,0 +1,435 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
+import {
+  STRUCTURAL_DIFF_WIRE_VERSION,
+  type StructuralSource,
+} from "@dev.fast/review-protocol";
+import { rangeAnchor } from "@dev.fast/whiteboard-document";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+
+import { type AuthoringTool, callAuthoringTool } from "./agent-client.js";
+import { ReviewApiClient } from "./client.js";
+import { documentText } from "./document-text.js";
+import { createReviewApi } from "./http.js";
+import { LocalReviewData } from "./local-data.js";
+import { type ReviewProviders, ReviewStore } from "./store.js";
+
+const pins = { repositoryId: "repo", base: "base-commit", head: "head-commit" };
+
+let directory: string, database: string, store: ReviewStore;
+
+let providers: ReviewProviders;
+
+beforeEach(() => {
+  directory = mkdtempSync(path.join(tmpdir(), "review-lenses-"));
+  database = path.join(directory, "reviews.db");
+  vi.stubEnv("DEV_REVIEW_HOME", directory);
+  providers = {
+    validatePins: vi.fn<ReviewProviders["validatePins"]>(async () => {}),
+    validateSource: vi.fn<ReviewProviders["validateSource"]>(async () => {}),
+    validateResource: vi.fn<ReviewProviders["validateResource"]>(
+      async () => {},
+    ),
+  };
+  store = new ReviewStore(database, providers);
+});
+
+afterEach(async () => {
+  vi.useRealTimers();
+  await store.close();
+  vi.unstubAllEnvs();
+  rmSync(directory, { recursive: true, force: true });
+});
+
+const run = <Operation>(operation: Operation) => store.execute({ operation });
+
+const create = () =>
+  run({
+    type: "create",
+    title: "Lenses",
+    target: { kind: "commits", ...pins },
+  });
+
+const lens = <Edit>(reviewId: string, edit: Edit, activityId?: string) =>
+  run({ type: "lens_edit", reviewId, edit, activityId });
+
+const markdown = (reviewId: string, text: string) =>
+  run({
+    type: "edit",
+    reviewId,
+    edit: { type: "insert", content: { type: "markdown", markdown: text } },
+  });
+
+const files = (...patterns: string[]) => [{ kind: "files", patterns }];
+
+it("inserts, updates and removes one lens at a time beside the document", async () => {
+  const { reviewId } = await create();
+  await markdown(reviewId, "Why this change");
+
+  const api = await lens(reviewId, {
+    type: "insert",
+    title: "API",
+    targets: files("src/api/**"),
+  });
+
+  expect(api).toMatchObject({ targetId: "lens-2", type: "lens" });
+  expect(store.read(reviewId).lastEdit).toEqual({
+    type: "insert",
+    targetId: "lens-2",
+    blockId: "lens-2",
+    kind: "lens",
+  });
+
+  const tests = await lens(reviewId, {
+    type: "insert",
+    title: "Tests",
+    targets: files("**/*.test.ts"),
+  });
+
+  const docs = await lens(reviewId, {
+    type: "insert",
+    title: "Docs",
+    targets: files("docs/**"),
+    afterId: api.targetId,
+  });
+
+  expect(store.read(reviewId).lenses?.map((item) => item.title)).toEqual([
+    "API",
+    "Docs",
+    "Tests",
+  ]);
+
+  await lens(reviewId, {
+    type: "update",
+    targetId: docs.targetId,
+    title: "Documentation",
+  });
+  expect(store.read(reviewId).lenses?.[1]).toEqual({
+    id: docs.targetId,
+    title: "Documentation",
+    targets: files("docs/**"),
+  });
+  expect(store.read(reviewId).lastEdit).toMatchObject({
+    type: "update",
+    targetId: docs.targetId,
+    kind: "lens",
+    fields: ["title"],
+  });
+
+  await lens(reviewId, { type: "remove", targetId: tests.targetId });
+  const current = store.read(reviewId);
+  expect(current.lenses?.map((item) => item.id)).toEqual([
+    api.targetId,
+    docs.targetId,
+  ]);
+  expect(current.lastEdit).toMatchObject({
+    type: "remove",
+    targetId: tests.targetId,
+  });
+  // The document never holds a lens; its outline lists them for their ids.
+  expect(current.document).toHaveLength(1);
+  expect(documentText(current)).toContain(`[${docs.targetId}] Documentation`);
+
+  await expect(
+    lens(reviewId, { type: "update", targetId: "lens-99", title: "Nope" }),
+  ).rejects.toThrow(/does not exist/);
+  await expect(
+    lens(reviewId, { type: "update", targetId: api.targetId }),
+  ).rejects.toThrow(/title or targets/);
+});
+
+it("keeps lenses in history and restores them", async () => {
+  const { reviewId } = await create();
+
+  const first = await lens(reviewId, {
+    type: "insert",
+    title: "API",
+    targets: files("src/**"),
+  });
+
+  await lens(reviewId, { type: "remove", targetId: first.targetId });
+  expect(store.read(reviewId).lenses).toBeUndefined();
+  expect(store.read(reviewId, first.version).lenses).toHaveLength(1);
+
+  await run({ type: "restore", reviewId, version: first.version });
+  expect(store.read(reviewId).lenses).toEqual([
+    { id: first.targetId, title: "API", targets: files("src/**") },
+  ]);
+});
+
+it("validates a lens's pinned ranges like any other source link", async () => {
+  const { reviewId } = await create();
+  const range = { side: "head" as const, file: "a.ts", fromLine: 2, toLine: 4 };
+
+  await lens(reviewId, {
+    type: "insert",
+    title: "Range",
+    targets: [{ kind: "ranges", sources: [rangeAnchor(range)] }],
+  });
+  expect(providers.validateSource).toHaveBeenCalledWith(pins, range, {
+    peek: false,
+  });
+});
+
+it("lets two agents write the document and lenses at once, each credited and renewed on its own page", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  const { reviewId } = await create();
+
+  store.activity.update(reviewId, { action: "begin" });
+
+  const lensWriter = store.activity.update(reviewId, {
+    action: "begin",
+    focus: { description: "Grouping the API files", targetId: "lens-1" },
+  }).activityId!;
+
+  vi.advanceTimersByTime(120_000);
+  await Promise.all([
+    markdown(reviewId, "Overview"),
+    lens(
+      reviewId,
+      { type: "insert", title: "API", targets: files("src/**") },
+      lensWriter,
+    ),
+  ]);
+  expect(store.read(reviewId).document).toHaveLength(1);
+  expect(store.read(reviewId).lenses).toHaveLength(1);
+  expect(store.read(reviewId).lastEdit).toMatchObject({
+    kind: "lens",
+    activityId: lensWriter,
+  });
+
+  // The lens write kept its writer; the document writer named no one and lapsed.
+  vi.advanceTimersByTime(90_000);
+  expect(store.activity.read(reviewId).activities).toEqual([
+    {
+      activityId: lensWriter,
+      slot: 1,
+      surface: "lenses",
+      focus: { description: "Grouping the API files", targetId: "lens-1" },
+    },
+  ]);
+});
+
+it("reads lenses saved as document blocks as the snapshot's lenses", async () => {
+  const { reviewId, version } = await create();
+
+  const legacy = [
+    { type: "markdown", id: "markdown-1", markdown: "Intro" },
+    {
+      type: "file_lens",
+      id: "files-2",
+      title: "Tests",
+      patterns: ["**/*.test.ts"],
+    },
+    {
+      type: "section",
+      id: "section-3",
+      title: "Details",
+      children: [
+        {
+          type: "file_lens",
+          id: "files-4",
+          title: "API",
+          targets: [{ kind: "files", patterns: ["src/api/**"] }],
+        },
+        { type: "markdown", id: "markdown-5", markdown: "More" },
+      ],
+    },
+  ];
+
+  const db = new DatabaseSync(database);
+  db.prepare(
+    "UPDATE versions SET snapshot=json_set(snapshot,'$.document',json(?)) WHERE review_id=? AND version=?",
+  ).run(JSON.stringify(legacy), reviewId, version);
+  db.prepare("UPDATE reviews SET next_id=5 WHERE id=?").run(reviewId);
+  db.close();
+
+  const read = store.read(reviewId);
+  expect(read.lenses).toEqual([
+    { id: "files-2", title: "Tests", targets: files("**/*.test.ts") },
+    { id: "files-4", title: "API", targets: files("src/api/**") },
+  ]);
+  expect(JSON.stringify(read.document)).not.toContain("file_lens");
+  expect(read.document.map((block) => block.id)).toEqual([
+    "markdown-1",
+    "section-3",
+  ]);
+
+  // The next write saves them beside the document, ids and all.
+  await lens(reviewId, {
+    type: "update",
+    targetId: "files-4",
+    targets: files("src/api/**", "src/server/**"),
+  });
+  const raw = new DatabaseSync(database);
+
+  const saved = JSON.parse(
+    String(
+      raw
+        .prepare(
+          "SELECT snapshot FROM versions WHERE review_id=? ORDER BY version DESC LIMIT 1",
+        )
+        .get(reviewId)!.snapshot,
+    ),
+  );
+
+  raw.close();
+  expect(JSON.stringify(saved.document)).not.toContain("file_lens");
+  expect(saved.lenses.map((item: { id: string }) => item.id)).toEqual([
+    "files-2",
+    "files-4",
+  ]);
+});
+
+it("reports the changed lines no lens selects after each lens write", async () => {
+  const { reviewId } = await create();
+  const data = new LocalReviewData(store);
+  vi.spyOn(data, "resolveSource").mockImplementation(async (snapshot) => ({
+    snapshot,
+    pins: snapshot.pins!,
+  }));
+
+  const changed = (path: string, text: string) => ({
+    file: {
+      lhs: { path, oid: "base", mode: "100644" },
+      rhs: { path, oid: "head", mode: "100644" },
+    },
+    text,
+  });
+
+  const api = changed("src/api.ts", "one\ntwo"),
+    readme = changed("docs/readme.md", "intro");
+
+  vi.spyOn(data, "changes").mockImplementation((async (
+    _pins: typeof pins,
+    file?: string,
+  ) =>
+    file
+      ? file === "src/api.ts"
+        ? "@@ -1,2 +1,2 @@\n-one\n-two\n+one\n+two\n"
+        : "@@ -1 +1 @@\n-intro\n+intro\n"
+      : [
+          {
+            path: "src/api.ts",
+            status: "modified",
+            additions: 2,
+            deletions: 2,
+          },
+          {
+            path: "docs/readme.md",
+            status: "modified",
+            additions: 1,
+            deletions: 1,
+          },
+        ]) as typeof data.changes);
+  vi.spyOn(data, "structuralChanges").mockImplementation(async function* () {
+    yield {
+      type: "start",
+      version: STRUCTURAL_DIFF_WIRE_VERSION,
+      lhs: { type: "revision", rev: "base" },
+      rhs: { type: "revision", rev: "head" },
+      files: [api, readme].map(({ file }) => ({ file, status: "modified" })),
+    };
+
+    for (const { file, text } of [api, readme])
+      yield {
+        type: "file",
+        file,
+        diff: {
+          type: "text",
+          lhs: structuralSource(text),
+          rhs: structuralSource(text),
+          structural_changes: {
+            base: [[0, text.split("\n").length]],
+            head: [[0, text.split("\n").length]],
+          },
+          stats: {
+            textual: { added: 1, removed: 1 },
+            visible: { added: 0, removed: 0 },
+          },
+        },
+      };
+    yield { type: "complete", succeeded: 2, failed: 0 };
+  });
+  vi.spyOn(data, "file").mockImplementation(async (_pins, side, file) => ({
+    file,
+    side,
+    commit: _pins[side],
+    text: file === "src/api.ts" ? api.text : readme.text,
+  }));
+
+  const app = createReviewApi(store, data);
+
+  const client = new ReviewApiClient(
+    { serverUrl: "http://review", token: "token" },
+    async (url, init) =>
+      app.request(String(url).replace("http://review/reviews-api", ""), init),
+  );
+
+  const tools = await client.read<AuthoringTool[]>("/authoring");
+
+  const call = (name: string, input: Parameters<typeof callAuthoringTool>[2]) =>
+    callAuthoringTool(client, tools.find((tool) => tool.name === name)!, {
+      reviewId,
+      ...input,
+    });
+
+  try {
+    expect(
+      await call("review_lens_edit", {
+        edit: { type: "insert", title: "API", targets: files("src/**") },
+      }),
+    ).toMatchObject({
+      targetId: "lens-1",
+      type: "lens",
+      uncategorized: {
+        lines: 2,
+        files: [
+          {
+            path: "docs/readme.md",
+            lines: 2,
+            ranges: [
+              { side: "base", fromLine: 1, toLine: 1 },
+              { side: "head", fromLine: 1, toLine: 1 },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(
+      await call("review_lens_edit", {
+        edit: { type: "insert", title: "Docs", targets: files("docs/**") },
+      }),
+    ).toMatchObject({ uncategorized: { lines: 0, files: [] } });
+
+    expect(await call("review_lens_get", {})).toMatchObject({
+      lenses: [
+        { id: "lens-1", title: "API", fileCount: 1 },
+        { id: "lens-2", title: "Docs", fileCount: 1 },
+      ],
+      uncategorized: { lines: 0 },
+    });
+  } finally {
+    await data.close();
+  }
+});
+
+function structuralSource(text: string): StructuralSource {
+  const lines = text.split("\n");
+
+  return {
+    text,
+    root: {
+      kind: "leaf",
+      id: 1,
+      fold_state_id: 1,
+      alignment_id: 1,
+      start: { line: 0, column: 0 },
+      end: { line: lines.length - 1, column: lines.at(-1)!.length },
+    },
+  };
+}

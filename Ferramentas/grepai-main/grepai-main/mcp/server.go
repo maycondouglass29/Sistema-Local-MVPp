@@ -1,0 +1,2638 @@
+// Package mcp provides an MCP (Model Context Protocol) server for grepai.
+// This allows AI agents to use grepai as a native tool.
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"time"
+
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
+	"github.com/yoanbernabeu/grepai/config"
+	"github.com/yoanbernabeu/grepai/embedder"
+	"github.com/yoanbernabeu/grepai/internal/toon"
+	"github.com/yoanbernabeu/grepai/rpg"
+	"github.com/yoanbernabeu/grepai/search"
+	"github.com/yoanbernabeu/grepai/stats"
+	"github.com/yoanbernabeu/grepai/store"
+	"github.com/yoanbernabeu/grepai/trace"
+)
+
+// Server wraps the MCP server with grepai functionality.
+type Server struct {
+	mcpServer     *server.MCPServer
+	projectRoot   string
+	workspaceName string // non-empty when started via --workspace or auto-detect
+	recorder      *stats.Recorder
+}
+
+// SearchResult is a lightweight struct for MCP output.
+type SearchResult struct {
+	FilePath    string  `json:"file_path"`
+	StartLine   int     `json:"start_line"`
+	EndLine     int     `json:"end_line"`
+	Score       float32 `json:"score"`
+	Content     string  `json:"content"`
+	FeaturePath string  `json:"feature_path,omitempty"`
+	SymbolName  string  `json:"symbol_name,omitempty"`
+}
+
+// SearchResultCompact is a minimal struct for compact output (no content field).
+type SearchResultCompact struct {
+	FilePath    string  `json:"file_path"`
+	StartLine   int     `json:"start_line"`
+	EndLine     int     `json:"end_line"`
+	Score       float32 `json:"score"`
+	FeaturePath string  `json:"feature_path,omitempty"`
+	SymbolName  string  `json:"symbol_name,omitempty"`
+}
+
+// CallSiteCompact is a minimal struct for compact output (no context field).
+type CallSiteCompact struct {
+	File string `json:"file"`
+	Line int    `json:"line"`
+}
+
+// CallerInfoCompact is a compact version of trace.CallerInfo for compact output.
+type CallerInfoCompact struct {
+	Symbol   trace.Symbol    `json:"symbol"`
+	CallSite CallSiteCompact `json:"call_site"`
+}
+
+// CalleeInfoCompact is a compact version of trace.CalleeInfo for compact output.
+type CalleeInfoCompact struct {
+	Symbol   trace.Symbol    `json:"symbol"`
+	CallSite CallSiteCompact `json:"call_site"`
+}
+
+type RefUsageCompact struct {
+	Symbol   trace.Symbol    `json:"symbol"`
+	Access   string          `json:"access"`
+	AccessAt CallSiteCompact `json:"access_at"`
+}
+
+type RefUsage struct {
+	Symbol   trace.Symbol   `json:"symbol"`
+	Access   string         `json:"access"`
+	AccessAt trace.CallSite `json:"access_at"`
+}
+
+// CallEdgeCompact is a compact version of trace.CallEdge for compact output.
+type CallEdgeCompact struct {
+	CallerName string `json:"caller_name"`
+	CalleeName string `json:"callee_name"`
+	File       string `json:"file"`
+	Line       int    `json:"line"`
+}
+
+// IndexStatus represents the current state of the index.
+type IndexStatus struct {
+	TotalFiles   int    `json:"total_files"`
+	TotalChunks  int    `json:"total_chunks"`
+	IndexSize    string `json:"index_size"`
+	LastUpdated  string `json:"last_updated"`
+	Provider     string `json:"provider"`
+	Model        string `json:"model"`
+	SymbolsReady bool   `json:"symbols_ready"`
+	RPGEnabled   bool   `json:"rpg_enabled"`
+	RPGNodes     int    `json:"rpg_nodes,omitempty"`
+	RPGEdges     int    `json:"rpg_edges,omitempty"`
+}
+
+// encodeOutput encodes data in the specified format (json or toon).
+func encodeOutput(data any, format string) (string, error) {
+	switch format {
+	case "toon":
+		return toon.Encode(data)
+	default: // "json"
+		jsonBytes, err := json.MarshalIndent(data, "", "  ")
+		if err != nil {
+			return "", err
+		}
+		return string(jsonBytes), nil
+	}
+}
+
+// NewServer creates a new MCP server for grepai.
+func NewServer(projectRoot string) (*Server, error) {
+	s := &Server{
+		projectRoot: projectRoot,
+		recorder:    stats.NewRecorder(projectRoot),
+	}
+
+	// Create MCP server
+	s.mcpServer = server.NewMCPServer(
+		"grepai",
+		"1.0.0",
+		server.WithToolCapabilities(true),
+	)
+
+	// Register tools
+	s.registerTools()
+
+	return s, nil
+}
+
+// NewServerWithWorkspace creates a new MCP server with workspace context.
+// projectRoot may be empty when in workspace-only mode (no local .grepai/).
+func NewServerWithWorkspace(projectRoot, workspaceName string) (*Server, error) {
+	s := &Server{
+		projectRoot:   projectRoot,
+		workspaceName: workspaceName,
+		recorder:      stats.NewRecorder(projectRoot),
+	}
+
+	s.mcpServer = server.NewMCPServer(
+		"grepai",
+		"1.0.0",
+		server.WithToolCapabilities(true),
+	)
+
+	s.registerTools()
+
+	return s, nil
+}
+
+// rootToolOption is the shared "root" parameter description for tools that can
+// operate on an explicit project instead of the one the server was started in.
+// It enables per-launch project detection: MCP clients pass the directory they
+// are working in without restarting mcp-serve.
+func rootToolOption() mcp.ToolOption {
+	return mcp.WithString("root",
+		mcp.Description("Absolute project root path. When provided, the server will load configuration/index from this path (overrides server startup project). Optional."),
+	)
+}
+
+// registerTools registers all grepai tools with the MCP server.
+func (s *Server) registerTools() {
+	// grepai_search tool
+	searchTool := mcp.NewTool("grepai_search",
+		mcp.WithDescription("Semantic code search. Search your codebase using natural language queries. Returns the most relevant code chunks with file paths, line numbers, and similarity scores.\n\nExamples:\n- whole workspace: workspace='acme', path='backend/src/' (path starts with the project name)\n- single project: workspace='acme', projects='backend', path='src/' (path relative to that project)"),
+		mcp.WithString("query",
+			mcp.Required(),
+			mcp.Description("Natural language search query (e.g., 'user authentication flow', 'error handling middleware')"),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Maximum number of results to return (default: 10)"),
+		),
+		mcp.WithBoolean("compact",
+			mcp.Description("Return minimal output without content (default: false)"),
+		),
+		mcp.WithString("format",
+			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+		mcp.WithString("path",
+			mcp.Description("Path prefix to filter results. Without workspace: relative to the project root, e.g. 'src/'. With workspace and exactly one project in projects: relative to that project root, e.g. 'src/'. With workspace and no single project: must start with the project name, e.g. 'api/src'."),
+		),
+		mcp.WithString("workspace",
+			mcp.Description("Workspace name for cross-project search (optional)"),
+		),
+		mcp.WithString("projects",
+			mcp.Description("Comma-separated list of project names to search within workspace (requires workspace)"),
+		),
+		rootToolOption(),
+	)
+	s.mcpServer.AddTool(searchTool, s.handleSearch)
+
+	// grepai_trace_callers tool
+	traceCallersTool := mcp.NewTool("grepai_trace_callers",
+		mcp.WithDescription("Find all functions that call the specified symbol. Useful for understanding code dependencies before modifying a function."),
+		mcp.WithString("symbol",
+			mcp.Required(),
+			mcp.Description("Name of the function/method to find callers for"),
+		),
+		mcp.WithBoolean("compact",
+			mcp.Description("Return minimal output without context (default: false)"),
+		),
+		mcp.WithString("format",
+			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+		mcp.WithString("workspace",
+			mcp.Description("Workspace name for cross-project trace (optional)"),
+		),
+		mcp.WithString("project",
+			mcp.Description("Project name within workspace (requires workspace)"),
+		),
+		rootToolOption(),
+	)
+	s.mcpServer.AddTool(traceCallersTool, s.handleTraceCallers)
+
+	// grepai_trace_callees tool
+	traceCalleesTool := mcp.NewTool("grepai_trace_callees",
+		mcp.WithDescription("Find all functions called by the specified symbol. Useful for understanding what a function depends on."),
+		mcp.WithString("symbol",
+			mcp.Required(),
+			mcp.Description("Name of the function/method to find callees for"),
+		),
+		mcp.WithBoolean("compact",
+			mcp.Description("Return minimal output without context (default: false)"),
+		),
+		mcp.WithString("format",
+			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+		mcp.WithString("workspace",
+			mcp.Description("Workspace name for cross-project trace (optional)"),
+		),
+		mcp.WithString("project",
+			mcp.Description("Project name within workspace (requires workspace)"),
+		),
+		rootToolOption(),
+	)
+	s.mcpServer.AddTool(traceCalleesTool, s.handleTraceCallees)
+
+	// grepai_trace_graph tool
+	traceGraphTool := mcp.NewTool("grepai_trace_graph",
+		mcp.WithDescription("Build a complete call graph around a symbol showing both callers and callees up to a specified depth."),
+		mcp.WithString("symbol",
+			mcp.Required(),
+			mcp.Description("Name of the function/method to build graph for"),
+		),
+		mcp.WithNumber("depth",
+			mcp.Description("Maximum depth for graph traversal (default: 2)"),
+		),
+		mcp.WithString("format",
+			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+		mcp.WithString("workspace",
+			mcp.Description("Workspace name for cross-project trace (optional)"),
+		),
+		mcp.WithString("project",
+			mcp.Description("Project name within workspace (requires workspace)"),
+		),
+		rootToolOption(),
+	)
+	s.mcpServer.AddTool(traceGraphTool, s.handleTraceGraph)
+
+	refsReadersTool := mcp.NewTool("grepai_refs_readers",
+		mcp.WithDescription("Find readers of a property/state symbol (non-call data usage such as store.uid reads)."),
+		mcp.WithString("symbol",
+			mcp.Required(),
+			mcp.Description("Property/state symbol name to find readers for"),
+		),
+		mcp.WithBoolean("compact",
+			mcp.Description("Return minimal output without context (default: false)"),
+		),
+		mcp.WithString("format",
+			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+		mcp.WithString("workspace",
+			mcp.Description("Workspace name for cross-project refs (optional)"),
+		),
+		mcp.WithString("project",
+			mcp.Description("Project name within workspace (requires workspace)"),
+		),
+		rootToolOption(),
+	)
+	s.mcpServer.AddTool(refsReadersTool, s.handleRefsReaders)
+
+	refsWritersTool := mcp.NewTool("grepai_refs_writers",
+		mcp.WithDescription("Find writers of a property/state symbol (non-call data usage such as this.uid = ...)."),
+		mcp.WithString("symbol",
+			mcp.Required(),
+			mcp.Description("Property/state symbol name to find writers for"),
+		),
+		mcp.WithBoolean("compact",
+			mcp.Description("Return minimal output without context (default: false)"),
+		),
+		mcp.WithString("format",
+			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+		mcp.WithString("workspace",
+			mcp.Description("Workspace name for cross-project refs (optional)"),
+		),
+		mcp.WithString("project",
+			mcp.Description("Project name within workspace (requires workspace)"),
+		),
+		rootToolOption(),
+	)
+	s.mcpServer.AddTool(refsWritersTool, s.handleRefsWriters)
+
+	refsGraphTool := mcp.NewTool("grepai_refs_graph",
+		mcp.WithDescription("Build a property/state usage graph for a symbol by combining readers and writers."),
+		mcp.WithString("symbol",
+			mcp.Required(),
+			mcp.Description("Property/state symbol name to build graph for"),
+		),
+		mcp.WithBoolean("compact",
+			mcp.Description("Return minimal output without context (default: false)"),
+		),
+		mcp.WithString("format",
+			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+		mcp.WithString("workspace",
+			mcp.Description("Workspace name for cross-project refs (optional)"),
+		),
+		mcp.WithString("project",
+			mcp.Description("Project name within workspace (requires workspace)"),
+		),
+		rootToolOption(),
+	)
+	s.mcpServer.AddTool(refsGraphTool, s.handleRefsGraph)
+
+	// grepai_index_status tool
+	indexStatusTool := mcp.NewTool("grepai_index_status",
+		mcp.WithDescription("Check the health and status of the grepai index. Returns statistics about indexed files, chunks, and configuration."),
+		mcp.WithBoolean("verbose", mcp.Description("Include additional debug details when available (optional).")),
+		mcp.WithString("format",
+			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+		mcp.WithString("workspace",
+			mcp.Description("Workspace name to check status for (optional)"),
+		),
+		rootToolOption(),
+	)
+	s.mcpServer.AddTool(indexStatusTool, s.handleIndexStatus)
+
+	// grepai_list_workspaces tool
+	listWorkspacesTool := mcp.NewTool("grepai_list_workspaces",
+		mcp.WithDescription("List all available workspace names. Use this to discover valid values for tools that accept the workspace parameter."),
+		mcp.WithString("format",
+			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+	)
+	s.mcpServer.AddTool(listWorkspacesTool, s.handleListWorkspaces)
+
+	// grepai_list_projects tool
+	listProjectsTool := mcp.NewTool("grepai_list_projects",
+		mcp.WithDescription("List all projects within a workspace. Use this to discover project names and file paths relative to their project roots, which informs how to use the --path parameter in grepai_search."),
+		mcp.WithString("workspace",
+			mcp.Description("Name of the workspace to list projects for (optional when mcp-serve was started with --workspace)"),
+		),
+		mcp.WithString("format",
+			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+	)
+	s.mcpServer.AddTool(listProjectsTool, s.handleListProjects)
+
+	// grepai_rpg_search tool
+	rpgSearchTool := mcp.NewTool("grepai_rpg_search",
+		mcp.WithDescription("Search RPG nodes using Jaccard-based semantic matching with scope and kind filtering."),
+		mcp.WithString("query",
+			mcp.Required(),
+			mcp.Description("Natural language or feature query to search for"),
+		),
+		mcp.WithString("scope",
+			mcp.Description("Area/category path to narrow search (e.g., 'cli', 'rpg/query')"),
+		),
+		mcp.WithString("kinds",
+			mcp.Description("Comma-separated node kinds to filter: area, category, subcategory, file, symbol, chunk (default: symbol)"),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Maximum number of results to return (default: 10)"),
+		),
+		mcp.WithString("format",
+			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+		mcp.WithString("workspace",
+			mcp.Description("Workspace name: read the RPG graph of a workspace project (defaults to the server's --workspace)"),
+		),
+		mcp.WithString("project",
+			mcp.Description("Project name within the workspace (required when the workspace has several projects)"),
+		),
+	)
+	s.mcpServer.AddTool(rpgSearchTool, s.handleRPGSearch)
+
+	// grepai_rpg_fetch tool
+	rpgFetchTool := mcp.NewTool("grepai_rpg_fetch",
+		mcp.WithDescription("Fetch detailed information about a specific RPG node including hierarchy, edges, and context."),
+		mcp.WithString("node_id",
+			mcp.Required(),
+			mcp.Description("Node ID to fetch (e.g., 'sym:main.go:HandleRequest')"),
+		),
+		mcp.WithString("format",
+			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+		mcp.WithString("workspace",
+			mcp.Description("Workspace name: read the RPG graph of a workspace project (defaults to the server's --workspace)"),
+		),
+		mcp.WithString("project",
+			mcp.Description("Project name within the workspace (required when the workspace has several projects)"),
+		),
+	)
+	s.mcpServer.AddTool(rpgFetchTool, s.handleRPGFetch)
+
+	// grepai_rpg_explore tool
+	rpgExploreTool := mcp.NewTool("grepai_rpg_explore",
+		mcp.WithDescription("Explore the RPG graph using BFS traversal from a starting node with configurable depth and edge type filtering."),
+		mcp.WithString("start_node_id",
+			mcp.Required(),
+			mcp.Description("Starting node ID for graph traversal"),
+		),
+		mcp.WithString("direction",
+			mcp.Description("Traversal direction: 'forward', 'reverse', or 'both' (default: 'both')"),
+		),
+		mcp.WithNumber("depth",
+			mcp.Description("Maximum BFS depth (default: 2)"),
+		),
+		mcp.WithString("edge_types",
+			mcp.Description("Comma-separated edge types to follow: feature_parent, contains, invokes, imports, maps_to_chunk, semantic_sim"),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Maximum nodes to return (default: 100)"),
+		),
+		mcp.WithString("format",
+			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+		mcp.WithString("workspace",
+			mcp.Description("Workspace name: read the RPG graph of a workspace project (defaults to the server's --workspace)"),
+		),
+		mcp.WithString("project",
+			mcp.Description("Project name within the workspace (required when the workspace has several projects)"),
+		),
+	)
+	s.mcpServer.AddTool(rpgExploreTool, s.handleRPGExplore)
+
+	// grepai_stats tool
+	statsTool := mcp.NewTool("grepai_stats",
+		mcp.WithDescription("Show token savings summary achieved by using grepai instead of grep-based workflows. Returns aggregated metrics from local stats."),
+		mcp.WithBoolean("history",
+			mcp.Description("Include per-day history breakdown (default: false)"),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Max days in history (default: 30, only used when history=true)"),
+		),
+	)
+	s.mcpServer.AddTool(statsTool, s.handleStats)
+}
+
+// handleSearch handles the grepai_search tool call.
+func (s *Server) handleSearch(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	query, err := request.RequireString("query")
+	if err != nil {
+		return mcp.NewToolResultError("query parameter is required"), nil
+	}
+
+	limit := request.GetInt("limit", 10)
+	if limit <= 0 {
+		limit = 10
+	}
+
+	compact := request.GetBool("compact", false)
+	format := request.GetString("format", "json")
+	path := request.GetString("path", "")
+	projects := request.GetString("projects", "")
+
+	// Validate format
+	if format != "json" && format != "toon" {
+		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	// Resolve workspace/root context (root enables per-launch project override)
+	workspace, root, err := s.resolveProjectContext(request, request.GetString("workspace", ""))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Workspace mode
+	if workspace != "" {
+		return s.handleWorkspaceSearch(ctx, query, limit, compact, format, path, workspace, projects)
+	}
+
+	// Single-project mode (with possible root override)
+	projectPathToUse := effectiveProjectRoot(s.projectRoot, root)
+
+	// Load configuration for single-project mode
+	cfg, err := config.Load(projectPathToUse)
+	if err != nil {
+		if projectPathToUse == "" {
+			wsCfg, wsErr := config.LoadWorkspaceConfig()
+			if wsErr == nil && wsCfg != nil && len(wsCfg.Workspaces) > 0 {
+				return mcp.NewToolResultError(
+					fmt.Sprintf("failed to load configuration: no workspace was provided so grepai_search fell back to local project config; provide the workspace parameter (or start mcp-serve with --workspace). Details: %v", err),
+				), nil
+			}
+		}
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load configuration: %v", err)), nil
+	}
+	if err := config.CheckIndexMeta(config.GetIndexMetaPath(projectPathToUse), cfg.Embedder); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Initialize embedder
+	emb, err := s.createEmbedder(cfg)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to initialize embedder: %v", err)), nil
+	}
+	defer emb.Close()
+
+	// Initialize store (respect root override)
+	var st store.VectorStore
+	if root != "" {
+		st, err = s.createStoreForRoot(ctx, cfg, root)
+	} else {
+		st, err = s.createStore(ctx, cfg)
+	}
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to initialize store: %v", err)), nil
+	}
+	defer st.Close()
+
+	// Create searcher and search
+	searcher := search.NewSearcher(st, emb, cfg.Search)
+	normalizedPath, err := search.NormalizeProjectPathPrefix(path, projectPathToUse)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("invalid path parameter: %v", err)), nil
+	}
+	results, err := searcher.Search(ctx, query, limit, normalizedPath)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
+	}
+
+	// RPG enrichment
+	type rpgInfo struct {
+		featurePath string
+		symbolName  string
+	}
+	rpgData := make(map[int]rpgInfo)
+	rpgSt, qe, rpgErr := s.tryLoadRPGForRoot(ctx, projectPathToUse)
+	if rpgErr != nil {
+		log.Printf("Warning: RPG enrichment unavailable: %v", rpgErr)
+	}
+	if rpgSt != nil && qe != nil {
+		defer rpgSt.Close()
+		graph := rpgSt.GetGraph()
+		for i, r := range results {
+			nodes := graph.GetNodesByFile(r.Chunk.FilePath)
+			for _, n := range nodes {
+				if n.Kind == rpg.KindSymbol && n.StartLine <= r.Chunk.EndLine && r.Chunk.StartLine <= n.EndLine {
+					fetchRes, err := qe.FetchNode(ctx, rpg.FetchNodeRequest{NodeID: n.ID})
+					if err == nil && fetchRes != nil {
+						rpgData[i] = rpgInfo{featurePath: fetchRes.FeaturePath, symbolName: n.SymbolName}
+					}
+					break
+				}
+			}
+		}
+	}
+
+	var data any
+	if compact {
+		searchResultsCompact := make([]SearchResultCompact, len(results))
+		for i, r := range results {
+			searchResultsCompact[i] = SearchResultCompact{
+				FilePath:  r.Chunk.FilePath,
+				StartLine: r.Chunk.StartLine,
+				EndLine:   r.Chunk.EndLine,
+				Score:     r.Score,
+			}
+			if info, ok := rpgData[i]; ok {
+				searchResultsCompact[i].FeaturePath = info.featurePath
+				searchResultsCompact[i].SymbolName = info.symbolName
+			}
+		}
+		data = searchResultsCompact
+	} else {
+		searchResults := make([]SearchResult, len(results))
+		for i, r := range results {
+			searchResults[i] = SearchResult{
+				FilePath:  r.Chunk.FilePath,
+				StartLine: r.Chunk.StartLine,
+				EndLine:   r.Chunk.EndLine,
+				Score:     r.Score,
+				Content:   r.Chunk.Content,
+			}
+			if info, ok := rpgData[i]; ok {
+				searchResults[i].FeaturePath = info.featurePath
+				searchResults[i].SymbolName = info.symbolName
+			}
+		}
+		data = searchResults
+	}
+
+	output, err := encodeOutput(data, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode results: %v", err)), nil
+	}
+
+	s.recordMCPStats(stats.Search, mcpOutputMode(compact, format), len(results), output)
+	return mcp.NewToolResultText(output), nil
+}
+
+// handleWorkspaceSearch handles workspace-level search via MCP.
+func (s *Server) handleWorkspaceSearch(ctx context.Context, query string, limit int, compact bool, format, pathPrefix, workspaceName, projectsStr string) (*mcp.CallToolResult, error) {
+	// Load workspace config
+	wsCfg, err := config.LoadWorkspaceConfig()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load workspace config: %v", err)), nil
+	}
+	if wsCfg == nil {
+		return mcp.NewToolResultError("no workspaces configured"), nil
+	}
+
+	ws, err := wsCfg.GetWorkspace(workspaceName)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("workspace not found: %v", err)), nil
+	}
+
+	projectNames := parseProjectNames(projectsStr)
+	normalizedPath, resolvedProjects, err := search.NormalizeWorkspacePathPrefix(pathPrefix, ws, projectNames)
+	if err != nil {
+		selected := projectNames
+		if len(selected) == 0 {
+			selected = listWorkspaceProjectNames(ws.Projects)
+		}
+		return mcp.NewToolResultError(buildWorkspacePathValidationError(pathPrefix, selected, workspaceProjectRoots(selectWorkspaceProjects(ws, selected)), workspacePathExamples(selectWorkspaceProjects(ws, selected)), err.Error())), nil
+	}
+	if validationErr := validateWorkspacePathForProjects(normalizedPath, ws, resolvedProjects); validationErr != "" {
+		return mcp.NewToolResultError(validationErr), nil
+	}
+	if err := config.CheckWorkspaceIndexMeta(ws, resolvedProjects); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Validate backend
+	if err := config.ValidateWorkspaceBackend(ws); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Initialize embedder
+	emb, err := s.createWorkspaceEmbedder(ws)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to initialize embedder: %v", err)), nil
+	}
+	defer emb.Close()
+
+	// Initialize store
+	st, err := s.createWorkspaceStore(ctx, ws)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to initialize store: %v", err)), nil
+	}
+	defer st.Close()
+
+	// Create searcher with default config
+	searchCfg := config.SearchConfig{
+		Hybrid: config.HybridConfig{Enabled: false, K: 60},
+		Boost:  config.DefaultConfig().Search.Boost,
+	}
+	searcher := search.NewSearcher(st, emb, searchCfg)
+
+	// Construct full path prefix for database query. Database stores paths as:
+	// workspaceName/projectName/relativePath. With a single project, the path is
+	// relative to that project; otherwise it starts with the project name
+	// (same semantics as the CLI).
+	fullPathPrefix := ws.Name + "/"
+	singleProject := ""
+	if len(resolvedProjects) == 1 {
+		singleProject = resolvedProjects[0]
+		fullPathPrefix += singleProject + "/"
+	}
+
+	// Add path prefix if provided
+	if normalizedPath != "" {
+		fullPathPrefix += normalizedPath
+	}
+
+	// Search
+	var results []store.SearchResult
+	results, err = searcher.Search(ctx, query, limit, fullPathPrefix)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
+	}
+
+	// Filter by projects if specified
+	// File paths are stored as: workspaceName/projectName/relativePath
+	if len(resolvedProjects) > 0 {
+		filteredResults := make([]store.SearchResult, 0)
+		for _, r := range results {
+			for _, projectName := range resolvedProjects {
+				// Match workspace/project/ prefix
+				expectedPrefix := ws.Name + "/" + projectName + "/"
+				if strings.HasPrefix(r.Chunk.FilePath, expectedPrefix) {
+					filteredResults = append(filteredResults, r)
+					break
+				}
+			}
+		}
+		results = filteredResults
+	}
+
+	if normalizedPath != "" && len(results) == 0 {
+		selected := resolvedProjects
+		if len(selected) == 0 {
+			selected = listWorkspaceProjectNames(ws.Projects)
+		}
+		projects := selectWorkspaceProjects(ws, selected)
+
+		hasIndexedMatch, matchErr := workspacePathHasIndexedFiles(ctx, st, ws.Name, selected, normalizedPath)
+		if matchErr != nil {
+			log.Printf("Warning: failed to inspect indexed workspace paths for validation: %v", matchErr)
+		} else if !hasIndexedMatch {
+			return mcp.NewToolResultError(
+				buildWorkspacePathValidationError(
+					pathPrefix,
+					selected,
+					workspaceProjectRoots(projects),
+					workspacePathExamples(projects),
+					"no indexed files matched this path prefix in selected projects",
+				),
+			), nil
+		}
+	}
+
+	var data any
+	if compact {
+		searchResultsCompact := make([]SearchResultCompact, len(results))
+		for i, r := range results {
+			searchResultsCompact[i] = SearchResultCompact{
+				FilePath:  r.Chunk.FilePath,
+				StartLine: r.Chunk.StartLine,
+				EndLine:   r.Chunk.EndLine,
+				Score:     r.Score,
+			}
+		}
+		data = searchResultsCompact
+	} else {
+		searchResults := make([]SearchResult, len(results))
+		for i, r := range results {
+			searchResults[i] = SearchResult{
+				FilePath:  r.Chunk.FilePath,
+				StartLine: r.Chunk.StartLine,
+				EndLine:   r.Chunk.EndLine,
+				Score:     r.Score,
+				Content:   r.Chunk.Content,
+			}
+		}
+		data = searchResults
+	}
+
+	output, err := encodeOutput(data, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode results: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(output), nil
+}
+
+func parseProjectNames(projectsStr string) []string {
+	if projectsStr == "" {
+		return nil
+	}
+	raw := strings.Split(projectsStr, ",")
+	projects := make([]string, 0, len(raw))
+	for _, p := range raw {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			projects = append(projects, p)
+		}
+	}
+	return projects
+}
+
+// validateWorkspacePathForProjects checks a workspace search path against the
+// path semantics shared with the CLI: with exactly one project selected, the
+// path is relative to that project root; otherwise it must start with a
+// project name ("api/src"), because stored paths are <workspace>/<project>/<path>.
+func validateWorkspacePathForProjects(normalizedPath string, ws *config.Workspace, selectedProjects []string) string {
+	if normalizedPath == "" || ws == nil {
+		return ""
+	}
+
+	if len(selectedProjects) == 1 {
+		projects := selectWorkspaceProjects(ws, selectedProjects)
+		roots := workspaceProjectRoots(projects)
+		// The index may have been built on another machine (or the project
+		// moved): only validate against roots that exist on this host.
+		localRoots := make([]string, 0, len(roots))
+		for _, root := range roots {
+			if st, err := os.Stat(root); err == nil && st.IsDir() {
+				localRoots = append(localRoots, root)
+			}
+		}
+		if len(localRoots) == 0 || pathPrefixMatchesProjectRoots(normalizedPath, localRoots) {
+			return ""
+		}
+		return buildWorkspacePathValidationError(
+			normalizedPath,
+			selectedProjects,
+			localRoots,
+			workspacePathExamples(projects),
+			"path must be relative to the selected project root",
+		)
+	}
+
+	candidates := selectedProjects
+	if len(candidates) == 0 {
+		candidates = listWorkspaceProjectNames(ws.Projects)
+	}
+	firstSegment := strings.Trim(normalizedPath, "/")
+	if idx := strings.Index(firstSegment, "/"); idx >= 0 {
+		firstSegment = firstSegment[:idx]
+	}
+	for _, name := range candidates {
+		if name == firstSegment {
+			return ""
+		}
+	}
+
+	examples := make([]string, 0, len(candidates))
+	for _, name := range candidates {
+		examples = append(examples, name+"/")
+	}
+	return buildWorkspacePathValidationError(
+		normalizedPath,
+		candidates,
+		nil,
+		examples,
+		"without exactly one project, path must start with a project name (for example \"api/src\"), or set projects to a single project and pass a path relative to it",
+	)
+}
+
+func pathPrefixMatchesProjectRoots(pathPrefix string, projectRoots []string) bool {
+	trimmed := strings.Trim(strings.TrimSpace(pathPrefix), "/")
+	if trimmed == "" || trimmed == "." {
+		return true
+	}
+
+	firstSegment := trimmed
+	if idx := strings.Index(trimmed, "/"); idx >= 0 {
+		firstSegment = trimmed[:idx]
+	}
+	firstSegment = filepath.FromSlash(firstSegment)
+	if firstSegment == "." || firstSegment == "" {
+		return true
+	}
+
+	for _, root := range projectRoots {
+		if root == "" {
+			continue
+		}
+		candidate := filepath.Join(root, firstSegment)
+		if _, err := os.Stat(candidate); err == nil {
+			return true
+		}
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), firstSegment) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func selectWorkspaceProjects(ws *config.Workspace, selectedProjects []string) []config.ProjectEntry {
+	if ws == nil {
+		return nil
+	}
+	if len(selectedProjects) == 0 {
+		return ws.Projects
+	}
+
+	selectedSet := make(map[string]struct{}, len(selectedProjects))
+	for _, p := range selectedProjects {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			selectedSet[p] = struct{}{}
+		}
+	}
+
+	selectedEntries := make([]config.ProjectEntry, 0, len(selectedSet))
+	for _, p := range ws.Projects {
+		if _, ok := selectedSet[p.Name]; ok {
+			selectedEntries = append(selectedEntries, p)
+		}
+	}
+	return selectedEntries
+}
+
+func workspaceProjectRoots(projects []config.ProjectEntry) []string {
+	roots := make([]string, 0, len(projects))
+	for _, p := range projects {
+		if p.Path != "" {
+			roots = append(roots, p.Path)
+		}
+	}
+	sort.Strings(roots)
+	return roots
+}
+
+func listWorkspaceProjectNames(projects []config.ProjectEntry) []string {
+	names := make([]string, 0, len(projects))
+	for _, p := range projects {
+		if p.Name != "" {
+			names = append(names, p.Name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func workspacePathExamples(projects []config.ProjectEntry) []string {
+	examples := make([]string, 0, 6)
+	seen := make(map[string]struct{})
+
+	add := func(example string) {
+		example = strings.Trim(strings.TrimSpace(filepath.ToSlash(example)), "/")
+		if example == "" {
+			return
+		}
+		if _, ok := seen[example]; ok {
+			return
+		}
+		seen[example] = struct{}{}
+		examples = append(examples, example)
+	}
+
+	for _, p := range projects {
+		if len(examples) >= 6 || p.Path == "" {
+			break
+		}
+
+		srcCandidate := filepath.Join(p.Path, "src")
+		if st, err := os.Stat(srcCandidate); err == nil && st.IsDir() {
+			add("src")
+		}
+
+		entries, err := os.ReadDir(p.Path)
+		if err != nil {
+			continue
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+		for _, e := range entries {
+			name := e.Name()
+			if strings.HasPrefix(name, ".") {
+				continue
+			}
+			add(name)
+			if e.IsDir() {
+				nestedSrc := filepath.Join(p.Path, name, "src")
+				if st, err := os.Stat(nestedSrc); err == nil && st.IsDir() {
+					add(filepath.Join(name, "src"))
+				}
+			}
+			if len(examples) >= 6 {
+				break
+			}
+		}
+	}
+
+	if len(examples) == 0 {
+		examples = append(examples, "src")
+	}
+	return examples
+}
+
+func buildWorkspacePathValidationError(path string, selectedProjects, selectedProjectRoots, exampleValidPaths []string, details string) string {
+	sort.Strings(selectedProjects)
+	sort.Strings(selectedProjectRoots)
+	sort.Strings(exampleValidPaths)
+
+	hint := map[string]any{
+		"reason":                 "path_not_within_selected_project",
+		"path":                   path,
+		"selected_projects":      selectedProjects,
+		"selected_project_roots": selectedProjectRoots,
+		"example_valid_paths":    exampleValidPaths,
+	}
+	if details != "" {
+		hint["details"] = details
+	}
+
+	encoded, err := json.Marshal(hint)
+	if err != nil {
+		return fmt.Sprintf("invalid path parameter: %s", details)
+	}
+	return string(encoded)
+}
+
+func workspacePathHasIndexedFiles(ctx context.Context, st store.VectorStore, workspaceName string, selectedProjects []string, normalizedPath string) (bool, error) {
+	if st == nil {
+		return false, fmt.Errorf("vector store is nil")
+	}
+
+	docPaths, err := st.ListDocuments(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	selectedSet := make(map[string]struct{}, len(selectedProjects))
+	for _, p := range selectedProjects {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			selectedSet[p] = struct{}{}
+		}
+	}
+
+	normalizedPath = strings.Trim(strings.TrimSpace(filepath.ToSlash(normalizedPath)), "/")
+	for _, docPath := range docPaths {
+		parts := strings.SplitN(filepath.ToSlash(docPath), "/", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		if parts[0] != workspaceName {
+			continue
+		}
+		if len(selectedSet) > 0 {
+			if _, ok := selectedSet[parts[1]]; !ok {
+				continue
+			}
+		}
+
+		rel := strings.Trim(parts[2], "/")
+		if normalizedPath == "" || strings.HasPrefix(rel, normalizedPath) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// createWorkspaceEmbedder creates an embedder based on workspace configuration.
+func (s *Server) createWorkspaceEmbedder(ws *config.Workspace) (embedder.Embedder, error) {
+	return embedder.NewFromWorkspaceConfig(ws)
+}
+
+// createWorkspaceStore creates a vector store based on workspace configuration.
+func (s *Server) createWorkspaceStore(ctx context.Context, ws *config.Workspace) (store.VectorStore, error) {
+	projectID := "workspace:" + ws.Name
+
+	switch ws.Store.Backend {
+	case "postgres":
+		return store.NewPostgresStore(ctx, ws.Store.Postgres.DSN, projectID, ws.Embedder.GetDimensions(), ws.Embedder.CacheNamespace())
+	case "qdrant":
+		collectionName := ws.Store.Qdrant.Collection
+		if collectionName == "" {
+			collectionName = "workspace_" + ws.Name
+		}
+		return store.NewQdrantStore(ctx, ws.Store.Qdrant.Endpoint, ws.Store.Qdrant.Port, ws.Store.Qdrant.UseTLS, collectionName, ws.Store.Qdrant.APIKey, ws.Embedder.GetDimensions())
+	default:
+		return nil, fmt.Errorf("unsupported backend for workspace: %s", ws.Store.Backend)
+	}
+}
+
+// resolveWorkspace returns the effective workspace name, auto-injecting from server config.
+func (s *Server) resolveWorkspace(workspace string) string {
+	if workspace == "" && s.workspaceName != "" {
+		return s.workspaceName
+	}
+	return workspace
+}
+
+// enrichTraceSymbols enriches trace symbols with RPG feature paths.
+// It loads the RPG store once and enriches all provided symbols in one pass.
+func (s *Server) enrichTraceSymbols(ctx context.Context, projectRoot string, symbols ...*trace.Symbol) {
+	if projectRoot == "" {
+		return
+	}
+	cfg, err := config.Load(projectRoot)
+	if err != nil || !cfg.RPG.Enabled {
+		return
+	}
+	rpgStore := rpg.NewGOBRPGStore(config.GetRPGIndexPath(projectRoot))
+	if err := rpgStore.Load(ctx); err != nil {
+		log.Printf("Warning: RPG enrichment unavailable for trace: %v", err)
+		return
+	}
+	defer rpgStore.Close()
+
+	graph := rpgStore.GetGraph()
+	qe := rpg.NewQueryEngine(graph)
+
+	for _, sym := range symbols {
+		if sym == nil || sym.File == "" {
+			continue
+		}
+		nodes := graph.GetNodesByFile(sym.File)
+		for _, n := range nodes {
+			if n.Kind == rpg.KindSymbol && n.SymbolName == sym.Name {
+				fetchResult, fetchErr := qe.FetchNode(ctx, rpg.FetchNodeRequest{NodeID: n.ID})
+				if fetchErr == nil && fetchResult != nil {
+					sym.FeaturePath = fetchResult.FeaturePath
+				}
+				break
+			}
+		}
+	}
+}
+
+// handleTraceCallers handles the grepai_trace_callers tool call.
+func (s *Server) handleTraceCallers(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	symbolName, err := request.RequireString("symbol")
+	if err != nil {
+		return mcp.NewToolResultError("symbol parameter is required"), nil
+	}
+
+	compact := request.GetBool("compact", false)
+	format := request.GetString("format", "json")
+	project := request.GetString("project", "")
+
+	// Validate format
+	if format != "json" && format != "toon" {
+		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	workspace, root, err := s.resolveProjectContext(request, request.GetString("workspace", ""))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Workspace mode
+	if workspace != "" {
+		stores, loadErr := trace.LoadWorkspaceSymbolStores(ctx, workspace, project)
+		if loadErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to load workspace symbol stores: %v", loadErr)), nil
+		}
+		defer trace.CloseSymbolStores(stores)
+
+		return s.handleTraceCallersFromStores(ctx, s.projectRoot, symbolName, compact, format, stores)
+	}
+
+	// Single-project mode (allow explicit root override)
+	projectRootToUse := effectiveProjectRoot(s.projectRoot, root)
+	if projectRootToUse == "" {
+		return mcp.NewToolResultError("trace requires a project context; use --workspace parameter, start mcp-serve from a project directory, or pass root"), nil
+	}
+
+	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRootToUse))
+	if err := symbolStore.Load(ctx); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load symbol index: %v. Run 'grepai watch' first", err)), nil
+	}
+	defer symbolStore.Close()
+
+	stats, err := symbolStore.GetStats(ctx)
+	if err != nil || stats.TotalSymbols == 0 {
+		return mcp.NewToolResultError("symbol index is empty. Run 'grepai watch' first to build the index"), nil
+	}
+
+	return s.handleTraceCallersFromStores(ctx, projectRootToUse, symbolName, compact, format, []trace.SymbolStore{symbolStore})
+}
+
+// handleTraceCallersFromStores handles callers lookup across one or more symbol stores.
+func (s *Server) handleTraceCallersFromStores(ctx context.Context, projectRoot string, symbolName string, compact bool, format string, stores []trace.SymbolStore) (*mcp.CallToolResult, error) {
+	// Aggregate results across stores
+	var firstSymbol *trace.Symbol
+	type storeRef struct {
+		store trace.SymbolStore
+		ref   trace.Reference
+	}
+	var allRefs []storeRef
+
+	for _, ss := range stores {
+		symbols, err := ss.LookupSymbol(ctx, symbolName)
+		if err != nil {
+			log.Printf("Warning: failed to lookup symbol %q: %v", symbolName, err)
+		}
+		refs, err := ss.LookupCallers(ctx, symbolName)
+		if err != nil {
+			log.Printf("Warning: failed to lookup callers of %q: %v", symbolName, err)
+		}
+		if len(symbols) > 0 && firstSymbol == nil {
+			// Same choice as the CLI among same-name definitions (#372).
+			sym := *trace.PickTargetSymbol(symbols, refs)
+			firstSymbol = &sym
+		}
+		for _, ref := range refs {
+			allRefs = append(allRefs, storeRef{store: ss, ref: ref})
+		}
+	}
+
+	if firstSymbol == nil {
+		result := trace.TraceResult{Query: symbolName, Mode: "fast"}
+		output, err := encodeOutput(result, format)
+		if err != nil {
+			log.Printf("Warning: failed to encode empty trace result: %v", err)
+		}
+		return mcp.NewToolResultText(output), nil
+	}
+
+	var allCallers []trace.CallerInfo
+	for _, r := range allRefs {
+		allCallers = append(allCallers, trace.CallerInfo{
+			// Resolve the caller in its own store, like the CLI (#372).
+			Symbol: trace.ResolveCallerSymbol(ctx, r.store, r.ref),
+			CallSite: trace.CallSite{
+				File:    r.ref.File,
+				Line:    r.ref.Line,
+				Context: r.ref.Context,
+			},
+		})
+	}
+
+	var data any
+	if compact {
+		resultCompact := struct {
+			Query   string              `json:"query"`
+			Mode    string              `json:"mode"`
+			Symbol  *trace.Symbol       `json:"symbol,omitempty"`
+			Callers []CallerInfoCompact `json:"callers,omitempty"`
+		}{
+			Query:   symbolName,
+			Mode:    "fast",
+			Symbol:  firstSymbol,
+			Callers: make([]CallerInfoCompact, 0, len(allCallers)),
+		}
+
+		for _, caller := range allCallers {
+			resultCompact.Callers = append(resultCompact.Callers, CallerInfoCompact{
+				Symbol: caller.Symbol,
+				CallSite: CallSiteCompact{
+					File: caller.CallSite.File,
+					Line: caller.CallSite.Line,
+				},
+			})
+		}
+
+		// Enrich with RPG
+		symPtrs := []*trace.Symbol{resultCompact.Symbol}
+		for i := range resultCompact.Callers {
+			symPtrs = append(symPtrs, &resultCompact.Callers[i].Symbol)
+		}
+		s.enrichTraceSymbols(ctx, projectRoot, symPtrs...)
+
+		data = resultCompact
+	} else {
+		result := trace.TraceResult{
+			Query:   symbolName,
+			Mode:    "fast",
+			Symbol:  firstSymbol,
+			Callers: allCallers,
+		}
+
+		// Enrich with RPG
+		symPtrs := []*trace.Symbol{result.Symbol}
+		for i := range result.Callers {
+			symPtrs = append(symPtrs, &result.Callers[i].Symbol)
+		}
+		s.enrichTraceSymbols(ctx, projectRoot, symPtrs...)
+
+		data = result
+	}
+
+	output, err := encodeOutput(data, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode results: %v", err)), nil
+	}
+
+	resultCount := 0
+	if tr, ok := data.(trace.TraceResult); ok {
+		resultCount = len(tr.Callers)
+	}
+	s.recordMCPStats(stats.TraceCallers, mcpOutputMode(compact, format), resultCount, output)
+	return mcp.NewToolResultText(output), nil
+}
+
+// handleTraceCallees handles the grepai_trace_callees tool call.
+func (s *Server) handleTraceCallees(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	symbolName, err := request.RequireString("symbol")
+	if err != nil {
+		return mcp.NewToolResultError("symbol parameter is required"), nil
+	}
+
+	compact := request.GetBool("compact", false)
+	format := request.GetString("format", "json")
+	project := request.GetString("project", "")
+
+	// Validate format
+	if format != "json" && format != "toon" {
+		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	workspace, root, err := s.resolveProjectContext(request, request.GetString("workspace", ""))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Workspace mode
+	if workspace != "" {
+		stores, loadErr := trace.LoadWorkspaceSymbolStores(ctx, workspace, project)
+		if loadErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to load workspace symbol stores: %v", loadErr)), nil
+		}
+		defer trace.CloseSymbolStores(stores)
+
+		return s.handleTraceCalleesFromStores(ctx, s.projectRoot, symbolName, compact, format, stores)
+	}
+
+	// Single-project mode (allow explicit root override)
+	projectRootToUse := effectiveProjectRoot(s.projectRoot, root)
+	if projectRootToUse == "" {
+		return mcp.NewToolResultError("trace requires a project context; use --workspace parameter, start mcp-serve from a project directory, or pass root"), nil
+	}
+
+	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRootToUse))
+	if err := symbolStore.Load(ctx); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load symbol index: %v. Run 'grepai watch' first", err)), nil
+	}
+	defer symbolStore.Close()
+
+	stats, err := symbolStore.GetStats(ctx)
+	if err != nil || stats.TotalSymbols == 0 {
+		return mcp.NewToolResultError("symbol index is empty. Run 'grepai watch' first to build the index"), nil
+	}
+
+	return s.handleTraceCalleesFromStores(ctx, projectRootToUse, symbolName, compact, format, []trace.SymbolStore{symbolStore})
+}
+
+// handleTraceCalleesFromStores handles callees lookup across one or more symbol stores.
+func (s *Server) handleTraceCalleesFromStores(ctx context.Context, projectRoot string, symbolName string, compact bool, format string, stores []trace.SymbolStore) (*mcp.CallToolResult, error) {
+	var firstSymbol *trace.Symbol
+	var allRefs []trace.Reference
+
+	for _, ss := range stores {
+		symbols, err := ss.LookupSymbol(ctx, symbolName)
+		if err != nil {
+			log.Printf("Warning: failed to lookup symbol %q: %v", symbolName, err)
+		}
+		if len(symbols) > 0 {
+			if firstSymbol == nil {
+				sym := symbols[0]
+				firstSymbol = &sym
+			}
+			refs, err := ss.LookupCallees(ctx, symbolName, symbols[0].File)
+			if err != nil {
+				log.Printf("Warning: failed to lookup callees of %q: %v", symbolName, err)
+			}
+			allRefs = append(allRefs, refs...)
+		}
+	}
+
+	if firstSymbol == nil {
+		result := trace.TraceResult{Query: symbolName, Mode: "fast"}
+		output, err := encodeOutput(result, format)
+		if err != nil {
+			log.Printf("Warning: failed to encode empty trace result: %v", err)
+		}
+		return mcp.NewToolResultText(output), nil
+	}
+
+	var data any
+	if compact {
+		resultCompact := struct {
+			Query   string              `json:"query"`
+			Mode    string              `json:"mode"`
+			Symbol  *trace.Symbol       `json:"symbol,omitempty"`
+			Callees []CalleeInfoCompact `json:"callees,omitempty"`
+		}{
+			Query:   symbolName,
+			Mode:    "fast",
+			Symbol:  firstSymbol,
+			Callees: make([]CalleeInfoCompact, 0, len(allRefs)),
+		}
+
+		for _, ref := range allRefs {
+			var calleeSym trace.Symbol
+			for _, ss := range stores {
+				calleeSyms, err := ss.LookupSymbol(ctx, ref.SymbolName)
+				if err != nil {
+					log.Printf("Warning: failed to lookup callee symbol %q: %v", ref.SymbolName, err)
+				}
+				if len(calleeSyms) > 0 {
+					calleeSym = calleeSyms[0]
+					break
+				}
+			}
+			if calleeSym.Name == "" {
+				calleeSym = trace.Symbol{Name: ref.SymbolName}
+			}
+			resultCompact.Callees = append(resultCompact.Callees, CalleeInfoCompact{
+				Symbol: calleeSym,
+				CallSite: CallSiteCompact{
+					File: ref.File,
+					Line: ref.Line,
+				},
+			})
+		}
+
+		// Enrich with RPG
+		symPtrs := []*trace.Symbol{resultCompact.Symbol}
+		for i := range resultCompact.Callees {
+			symPtrs = append(symPtrs, &resultCompact.Callees[i].Symbol)
+		}
+		s.enrichTraceSymbols(ctx, projectRoot, symPtrs...)
+
+		data = resultCompact
+	} else {
+		result := trace.TraceResult{
+			Query:  symbolName,
+			Mode:   "fast",
+			Symbol: firstSymbol,
+		}
+		for _, ref := range allRefs {
+			var calleeSym trace.Symbol
+			for _, ss := range stores {
+				calleeSyms, err := ss.LookupSymbol(ctx, ref.SymbolName)
+				if err != nil {
+					log.Printf("Warning: failed to lookup callee symbol %q: %v", ref.SymbolName, err)
+				}
+				if len(calleeSyms) > 0 {
+					calleeSym = calleeSyms[0]
+					break
+				}
+			}
+			if calleeSym.Name == "" {
+				calleeSym = trace.Symbol{Name: ref.SymbolName}
+			}
+			result.Callees = append(result.Callees, trace.CalleeInfo{
+				Symbol: calleeSym,
+				CallSite: trace.CallSite{
+					File:    ref.File,
+					Line:    ref.Line,
+					Context: ref.Context,
+				},
+			})
+		}
+
+		// Enrich with RPG
+		symPtrs := []*trace.Symbol{result.Symbol}
+		for i := range result.Callees {
+			symPtrs = append(symPtrs, &result.Callees[i].Symbol)
+		}
+		s.enrichTraceSymbols(ctx, projectRoot, symPtrs...)
+
+		data = result
+	}
+
+	output, err := encodeOutput(data, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode results: %v", err)), nil
+	}
+
+	resultCount := 0
+	if tr, ok := data.(trace.TraceResult); ok {
+		resultCount = len(tr.Callees)
+	}
+	s.recordMCPStats(stats.TraceCallees, mcpOutputMode(compact, format), resultCount, output)
+	return mcp.NewToolResultText(output), nil
+}
+
+// handleTraceGraph handles the grepai_trace_graph tool call.
+func (s *Server) handleTraceGraph(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	symbolName, err := request.RequireString("symbol")
+	if err != nil {
+		return mcp.NewToolResultError("symbol parameter is required"), nil
+	}
+
+	depth := request.GetInt("depth", 2)
+	if depth <= 0 {
+		depth = 2
+	}
+
+	format := request.GetString("format", "json")
+	project := request.GetString("project", "")
+
+	// Validate format
+	if format != "json" && format != "toon" {
+		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	workspace, root, err := s.resolveProjectContext(request, request.GetString("workspace", ""))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Workspace mode: merge call graphs across projects
+	if workspace != "" {
+		stores, loadErr := trace.LoadWorkspaceSymbolStores(ctx, workspace, project)
+		if loadErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to load workspace symbol stores: %v", loadErr)), nil
+		}
+		defer trace.CloseSymbolStores(stores)
+
+		merged := &trace.CallGraph{
+			Root:  symbolName,
+			Nodes: make(map[string]trace.Symbol),
+			Edges: []trace.CallEdge{},
+			Depth: depth,
+		}
+		edgeSeen := make(map[string]bool)
+
+		for _, ss := range stores {
+			graph, graphErr := ss.GetCallGraph(ctx, symbolName, depth)
+			if graphErr != nil {
+				continue
+			}
+			for name, sym := range graph.Nodes {
+				if _, exists := merged.Nodes[name]; !exists {
+					merged.Nodes[name] = sym
+				}
+			}
+			for _, edge := range graph.Edges {
+				key := edge.Caller + "->" + edge.Callee
+				if !edgeSeen[key] {
+					merged.Edges = append(merged.Edges, edge)
+					edgeSeen[key] = true
+				}
+			}
+		}
+
+		result := trace.TraceResult{
+			Query: symbolName,
+			Mode:  "fast",
+			Graph: merged,
+		}
+
+		output, encErr := encodeOutput(result, format)
+		if encErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to encode results: %v", encErr)), nil
+		}
+		return mcp.NewToolResultText(output), nil
+	}
+
+	// Single-project mode (allow explicit root override)
+	projectRootToUse := effectiveProjectRoot(s.projectRoot, root)
+	if projectRootToUse == "" {
+		return mcp.NewToolResultError("trace requires a project context; use --workspace parameter, start mcp-serve from a project directory, or pass root"), nil
+	}
+
+	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRootToUse))
+	if err := symbolStore.Load(ctx); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load symbol index: %v. Run 'grepai watch' first", err)), nil
+	}
+	defer symbolStore.Close()
+
+	symStats, err := symbolStore.GetStats(ctx)
+	if err != nil || symStats.TotalSymbols == 0 {
+		return mcp.NewToolResultError("symbol index is empty. Run 'grepai watch' first to build the index"), nil
+	}
+
+	graph, err := symbolStore.GetCallGraph(ctx, symbolName, depth)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to build call graph: %v", err)), nil
+	}
+
+	result := trace.TraceResult{
+		Query: symbolName,
+		Mode:  "fast",
+		Graph: graph,
+	}
+
+	// Enrich graph nodes with RPG
+	if result.Graph != nil {
+		// Collect symbols as pointers for enrichment, paired with their map keys
+		type symEntry struct {
+			name string
+			sym  trace.Symbol
+		}
+		entries := make([]symEntry, 0, len(result.Graph.Nodes))
+		symPtrs := make([]*trace.Symbol, 0, len(result.Graph.Nodes))
+		for name, sym := range result.Graph.Nodes {
+			entries = append(entries, symEntry{name: name, sym: sym})
+			symPtrs = append(symPtrs, &entries[len(entries)-1].sym)
+		}
+		s.enrichTraceSymbols(ctx, projectRootToUse, symPtrs...)
+		for _, e := range entries {
+			result.Graph.Nodes[e.name] = e.sym
+		}
+	}
+
+	output, err := encodeOutput(result, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode results: %v", err)), nil
+	}
+
+	nodeCount := 0
+	if result.Graph != nil {
+		nodeCount = len(result.Graph.Nodes)
+	}
+	s.recordMCPStats(stats.TraceGraph, mcpOutputMode(false, format), nodeCount, output)
+	return mcp.NewToolResultText(output), nil
+}
+
+func (s *Server) handleRefsReaders(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return s.handleRefsByKind(ctx, request, trace.RefKindRead)
+}
+
+func (s *Server) handleRefsWriters(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return s.handleRefsByKind(ctx, request, trace.RefKindWrite)
+}
+
+func (s *Server) handleRefsGraph(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	symbolName, err := request.RequireString("symbol")
+	if err != nil {
+		return mcp.NewToolResultError("symbol parameter is required"), nil
+	}
+
+	compact := request.GetBool("compact", false)
+	format := request.GetString("format", "json")
+	project := request.GetString("project", "")
+
+	if format != "json" && format != "toon" {
+		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	workspace, root, err := s.resolveProjectContext(request, request.GetString("workspace", ""))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	var stores []trace.SymbolStore
+	if workspace != "" {
+		stores, err = trace.LoadWorkspaceSymbolStores(ctx, workspace, project)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to load workspace symbol stores: %v", err)), nil
+		}
+		defer trace.CloseSymbolStores(stores)
+	} else {
+		projectRootToUse := effectiveProjectRoot(s.projectRoot, root)
+		if projectRootToUse == "" {
+			return mcp.NewToolResultError("refs requires a project context; use --workspace parameter, start mcp-serve from a project directory, or pass root"), nil
+		}
+		symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRootToUse))
+		if err := symbolStore.Load(ctx); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to load symbol index: %v. Run 'grepai watch' first", err)), nil
+		}
+		defer symbolStore.Close()
+		stats, err := symbolStore.GetStats(ctx)
+		if err != nil || stats.TotalSymbols == 0 {
+			return mcp.NewToolResultError("symbol index is empty. Run 'grepai watch' first to build the index"), nil
+		}
+		stores = []trace.SymbolStore{symbolStore}
+	}
+
+	readers := make([]RefUsage, 0)
+	writers := make([]RefUsage, 0)
+	for _, ss := range stores {
+		r, err := ss.LookupReaders(ctx, symbolName)
+		if err == nil {
+			for _, ref := range r {
+				readers = append(readers, RefUsage{
+					Symbol: trace.ResolveCallerSymbol(ctx, ss, ref),
+					Access: ref.Kind,
+					AccessAt: trace.CallSite{
+						File:    ref.File,
+						Line:    ref.Line,
+						Context: ref.Context,
+					},
+				})
+			}
+		}
+		w, err := ss.LookupWriters(ctx, symbolName)
+		if err == nil {
+			for _, ref := range w {
+				writers = append(writers, RefUsage{
+					Symbol: trace.ResolveCallerSymbol(ctx, ss, ref),
+					Access: ref.Kind,
+					AccessAt: trace.CallSite{
+						File:    ref.File,
+						Line:    ref.Line,
+						Context: ref.Context,
+					},
+				})
+			}
+		}
+	}
+
+	var data any
+	if compact {
+		rc := make([]RefUsageCompact, 0, len(readers))
+		for _, usage := range readers {
+			rc = append(rc, RefUsageCompact{
+				Symbol: usage.Symbol,
+				Access: usage.Access,
+				AccessAt: CallSiteCompact{
+					File: usage.AccessAt.File,
+					Line: usage.AccessAt.Line,
+				},
+			})
+		}
+		wc := make([]RefUsageCompact, 0, len(writers))
+		for _, usage := range writers {
+			wc = append(wc, RefUsageCompact{
+				Symbol: usage.Symbol,
+				Access: usage.Access,
+				AccessAt: CallSiteCompact{
+					File: usage.AccessAt.File,
+					Line: usage.AccessAt.Line,
+				},
+			})
+		}
+		data = map[string]any{
+			"query":   symbolName,
+			"kind":    "property",
+			"mode":    "fast",
+			"readers": rc,
+			"writers": wc,
+		}
+	} else {
+		data = map[string]any{
+			"query":   symbolName,
+			"kind":    "property",
+			"mode":    "fast",
+			"readers": readers,
+			"writers": writers,
+		}
+	}
+
+	output, err := encodeOutput(data, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode results: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(output), nil
+}
+
+func (s *Server) handleRefsByKind(ctx context.Context, request mcp.CallToolRequest, kind string) (*mcp.CallToolResult, error) {
+	symbolName, err := request.RequireString("symbol")
+	if err != nil {
+		return mcp.NewToolResultError("symbol parameter is required"), nil
+	}
+
+	compact := request.GetBool("compact", false)
+	format := request.GetString("format", "json")
+	project := request.GetString("project", "")
+
+	if format != "json" && format != "toon" {
+		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	workspace, root, err := s.resolveProjectContext(request, request.GetString("workspace", ""))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Workspace mode
+	if workspace != "" {
+		stores, loadErr := trace.LoadWorkspaceSymbolStores(ctx, workspace, project)
+		if loadErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to load workspace symbol stores: %v", loadErr)), nil
+		}
+		defer trace.CloseSymbolStores(stores)
+		return s.handleRefsFromStores(ctx, symbolName, kind, compact, format, stores)
+	}
+
+	// Single-project mode (allow explicit root override)
+	projectRootToUse := effectiveProjectRoot(s.projectRoot, root)
+	if projectRootToUse == "" {
+		return mcp.NewToolResultError("refs requires a project context; use --workspace parameter, start mcp-serve from a project directory, or pass root"), nil
+	}
+
+	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRootToUse))
+	if err := symbolStore.Load(ctx); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load symbol index: %v. Run 'grepai watch' first", err)), nil
+	}
+	defer symbolStore.Close()
+
+	stats, err := symbolStore.GetStats(ctx)
+	if err != nil || stats.TotalSymbols == 0 {
+		return mcp.NewToolResultError("symbol index is empty. Run 'grepai watch' first to build the index"), nil
+	}
+
+	return s.handleRefsFromStores(ctx, symbolName, kind, compact, format, []trace.SymbolStore{symbolStore})
+}
+
+func (s *Server) handleRefsFromStores(ctx context.Context, symbolName string, kind string, compact bool, format string, stores []trace.SymbolStore) (*mcp.CallToolResult, error) {
+	usages := make([]RefUsage, 0)
+
+	for _, ss := range stores {
+		var refs []trace.Reference
+		var err error
+		if kind == trace.RefKindWrite {
+			refs, err = ss.LookupWriters(ctx, symbolName)
+		} else {
+			refs, err = ss.LookupReaders(ctx, symbolName)
+		}
+		if err != nil {
+			log.Printf("Warning: failed to lookup refs of %q: %v", symbolName, err)
+			continue
+		}
+
+		for _, ref := range refs {
+			usages = append(usages, RefUsage{
+				Symbol: trace.ResolveCallerSymbol(ctx, ss, ref),
+				Access: ref.Kind,
+				AccessAt: trace.CallSite{
+					File:    ref.File,
+					Line:    ref.Line,
+					Context: ref.Context,
+				},
+			})
+		}
+	}
+
+	label := "readers"
+	if kind == trace.RefKindWrite {
+		label = "writers"
+	}
+
+	var data any
+	if compact {
+		result := map[string]any{
+			"query": symbolName,
+			"kind":  "property",
+			"mode":  "fast",
+		}
+		comp := make([]RefUsageCompact, 0, len(usages))
+		for _, usage := range usages {
+			comp = append(comp, RefUsageCompact{
+				Symbol: usage.Symbol,
+				Access: usage.Access,
+				AccessAt: CallSiteCompact{
+					File: usage.AccessAt.File,
+					Line: usage.AccessAt.Line,
+				},
+			})
+		}
+		result[label] = comp
+		data = result
+	} else {
+		result := map[string]any{
+			"query": symbolName,
+			"kind":  "property",
+			"mode":  "fast",
+		}
+		result[label] = usages
+		data = result
+	}
+
+	output, err := encodeOutput(data, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode results: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(output), nil
+}
+
+// WorkspaceIndexStatus represents the status of a workspace index.
+type WorkspaceIndexStatus struct {
+	Workspace string                   `json:"workspace"`
+	Projects  []WorkspaceProjectStatus `json:"projects"`
+	Provider  string                   `json:"provider"`
+	Model     string                   `json:"model"`
+}
+
+// WorkspaceProjectStatus represents the status of a single project in a workspace.
+type WorkspaceProjectStatus struct {
+	Name         string `json:"name"`
+	Path         string `json:"path"`
+	SymbolsReady bool   `json:"symbols_ready"`
+	TotalSymbols int    `json:"total_symbols"`
+}
+
+// handleIndexStatus handles the grepai_index_status tool call.
+func (s *Server) handleIndexStatus(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	format := request.GetString("format", "json")
+
+	// Validate format
+	if format != "json" && format != "toon" {
+		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	workspace, root, err := s.resolveProjectContext(request, request.GetString("workspace", ""))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Workspace mode
+	if workspace != "" {
+		wsCfg, err := config.LoadWorkspaceConfig()
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to load workspace config: %v", err)), nil
+		}
+		if wsCfg == nil {
+			return mcp.NewToolResultError("no workspaces configured"), nil
+		}
+		ws, err := wsCfg.GetWorkspace(workspace)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("workspace not found: %v", err)), nil
+		}
+
+		wsStatus := WorkspaceIndexStatus{
+			Workspace: ws.Name,
+			Projects:  make([]WorkspaceProjectStatus, 0, len(ws.Projects)),
+			Provider:  ws.Embedder.Provider,
+			Model:     ws.Embedder.Model,
+		}
+
+		for _, p := range ws.Projects {
+			ps := WorkspaceProjectStatus{
+				Name: p.Name,
+				Path: p.Path,
+			}
+			ss := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(p.Path))
+			if loadErr := ss.Load(ctx); loadErr == nil {
+				if symbolStats, statsErr := ss.GetStats(ctx); statsErr == nil && symbolStats.TotalSymbols > 0 {
+					ps.SymbolsReady = true
+					ps.TotalSymbols = symbolStats.TotalSymbols
+				}
+				ss.Close()
+			}
+			wsStatus.Projects = append(wsStatus.Projects, ps)
+		}
+
+		output, err := encodeOutput(wsStatus, format)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to encode status: %v", err)), nil
+		}
+		return mcp.NewToolResultText(output), nil
+	}
+
+	// Single-project mode (allow explicit root override)
+	projectRootToUse := effectiveProjectRoot(s.projectRoot, root)
+	if projectRootToUse == "" {
+		return mcp.NewToolResultError("index status requires a project context; start mcp-serve from a project directory or pass root"), nil
+	}
+
+	// Load configuration
+	cfg, err := config.Load(projectRootToUse)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load configuration: %v", err)), nil
+	}
+
+	// Initialize store (respect root override)
+	var st store.VectorStore
+	if root != "" {
+		st, err = s.createStoreForRoot(ctx, cfg, root)
+	} else {
+		st, err = s.createStore(ctx, cfg)
+	}
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to initialize store: %v", err)), nil
+	}
+	defer st.Close()
+
+	// Get stats
+	stats, err := st.GetStats(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to get stats: %v", err)), nil
+	}
+
+	// Check symbol index
+	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRootToUse))
+	symbolsReady := false
+	if err := symbolStore.Load(ctx); err == nil {
+		if symbolStats, err := symbolStore.GetStats(ctx); err == nil && symbolStats.TotalSymbols > 0 {
+			symbolsReady = true
+		}
+		symbolStore.Close()
+	}
+
+	lastUpdated := "never"
+	if !stats.LastUpdated.IsZero() {
+		lastUpdated = stats.LastUpdated.Format("2006-01-02 15:04:05")
+	}
+	status := IndexStatus{
+		TotalFiles:   stats.TotalFiles,
+		TotalChunks:  stats.TotalChunks,
+		IndexSize:    formatBytes(stats.IndexSize),
+		LastUpdated:  lastUpdated,
+		Provider:     cfg.Embedder.Provider,
+		Model:        cfg.Embedder.Model,
+		SymbolsReady: symbolsReady,
+	}
+
+	// Check RPG status
+	rpgSt, _, rpgErr := s.tryLoadRPGForRoot(ctx, projectRootToUse)
+	if rpgErr != nil && !errors.Is(rpgErr, rpg.ErrRPGIndexOutdated) {
+		log.Printf("Warning: failed to load RPG status: %v", rpgErr)
+	}
+	if rpgSt != nil {
+		status.RPGEnabled = true
+		rpgStats := rpgSt.GetGraph().Stats()
+		status.RPGNodes = rpgStats.TotalNodes
+		status.RPGEdges = rpgStats.TotalEdges
+		rpgSt.Close()
+	}
+
+	output, err := encodeOutput(status, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode status: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(output), nil
+}
+
+// handleListWorkspaces handles the grepai_list_workspaces tool call.
+func (s *Server) handleListWorkspaces(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	format := request.GetString("format", "json")
+
+	// Validate format
+	if format != "json" && format != "toon" {
+		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	// Load workspace configuration
+	wsConfig, err := config.LoadWorkspaceConfig()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load workspace configuration: %v", err)), nil
+	}
+	if wsConfig == nil {
+		return mcp.NewToolResultText("[]"), nil
+	}
+
+	// Build workspace list (workspace-level information only).
+	type WorkspaceInfo struct {
+		Name string `json:"name"`
+	}
+
+	names := wsConfig.ListWorkspaces()
+	sort.Strings(names)
+
+	workspaces := make([]WorkspaceInfo, 0, len(names))
+	for _, name := range names {
+		workspaces = append(workspaces, WorkspaceInfo{Name: name})
+	}
+
+	output, err := encodeOutput(workspaces, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode workspaces: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(output), nil
+}
+
+// handleListProjects handles the grepai_list_projects tool call.
+func (s *Server) handleListProjects(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	workspace := s.resolveWorkspace(request.GetString("workspace", ""))
+	if workspace == "" {
+		return mcp.NewToolResultError("workspace parameter is required unless mcp-serve was started with --workspace"), nil
+	}
+
+	format := request.GetString("format", "json")
+
+	// Validate format
+	if format != "json" && format != "toon" {
+		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	// Load workspace configuration
+	wsConfig, err := config.LoadWorkspaceConfig()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load workspace configuration: %v", err)), nil
+	}
+
+	// Get specific workspace
+	wsEntry, exists := wsConfig.Workspaces[workspace]
+	if !exists {
+		return mcp.NewToolResultError(fmt.Sprintf("workspace '%s' not found", workspace)), nil
+	}
+
+	// Build projects list from wsEntry.Projects (slice of ProjectEntry)
+	type ProjectInfo struct {
+		Name string `json:"name"`
+		Path string `json:"path"`
+	}
+
+	projects := make([]ProjectInfo, 0, len(wsEntry.Projects))
+	for _, proj := range wsEntry.Projects {
+		projects = append(projects, ProjectInfo{
+			Name: proj.Name,
+			Path: proj.Path,
+		})
+	}
+
+	output, err := encodeOutput(projects, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode projects: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(output), nil
+}
+
+// createEmbedder creates an embedder based on configuration.
+func (s *Server) createEmbedder(cfg *config.Config) (embedder.Embedder, error) {
+	return embedder.NewFromConfig(cfg)
+}
+
+// createStore creates a vector store based on configuration.
+func (s *Server) createStore(ctx context.Context, cfg *config.Config) (store.VectorStore, error) {
+	switch cfg.Store.Backend {
+	case "gob":
+		indexPath := config.GetIndexPath(s.projectRoot)
+		gobStore := store.NewGOBStore(indexPath)
+		if err := gobStore.Load(ctx); err != nil {
+			return nil, fmt.Errorf("failed to load index: %w", err)
+		}
+		return gobStore, nil
+	case "postgres":
+		return store.NewPostgresStore(ctx, cfg.Store.Postgres.DSN, s.projectRoot, cfg.Embedder.GetDimensions(), cfg.Embedder.CacheNamespace())
+	case "qdrant":
+		collectionName := cfg.Store.Qdrant.Collection
+		if collectionName == "" {
+			collectionName = store.SanitizeCollectionName(s.projectRoot)
+		}
+		namespace := store.QdrantProjectNamespace(cfg.Store.Qdrant.Collection, s.projectRoot)
+		return store.NewQdrantStoreWithNamespace(ctx, cfg.Store.Qdrant.Endpoint, cfg.Store.Qdrant.Port, cfg.Store.Qdrant.UseTLS, collectionName, cfg.Store.Qdrant.APIKey, cfg.Embedder.GetDimensions(), namespace, true)
+	default:
+		return nil, fmt.Errorf("unknown storage backend: %s", cfg.Store.Backend)
+	}
+}
+
+// createStoreForRoot creates a vector store based on configuration but using an
+// explicit project root. This mirrors createStore but uses the provided root
+// for index path / collection naming instead of the server startup project.
+func (s *Server) createStoreForRoot(ctx context.Context, cfg *config.Config, projectRoot string) (store.VectorStore, error) {
+	switch cfg.Store.Backend {
+	case "gob":
+		indexPath := config.GetIndexPath(projectRoot)
+		gobStore := store.NewGOBStore(indexPath)
+		if err := gobStore.Load(ctx); err != nil {
+			return nil, fmt.Errorf("failed to load index: %w", err)
+		}
+		return gobStore, nil
+	case "postgres":
+		return store.NewPostgresStore(ctx, cfg.Store.Postgres.DSN, projectRoot, cfg.Embedder.GetDimensions(), cfg.Embedder.CacheNamespace())
+	case "qdrant":
+		collectionName := cfg.Store.Qdrant.Collection
+		if collectionName == "" {
+			collectionName = store.SanitizeCollectionName(projectRoot)
+		}
+		namespace := store.QdrantProjectNamespace(cfg.Store.Qdrant.Collection, projectRoot)
+		return store.NewQdrantStoreWithNamespace(ctx, cfg.Store.Qdrant.Endpoint, cfg.Store.Qdrant.Port, cfg.Store.Qdrant.UseTLS, collectionName, cfg.Store.Qdrant.APIKey, cfg.Embedder.GetDimensions(), namespace, true)
+	default:
+		return nil, fmt.Errorf("unknown storage backend: %s", cfg.Store.Backend)
+	}
+}
+
+// resolveProjectContext resolves the project context for a tool request: an
+// optional explicit workspace name and an optional "root" override. The
+// server-level workspace is auto-injected only when neither a workspace nor a
+// root is provided, so an explicit root always wins over a startup --workspace.
+// Passing both an explicit workspace and an explicit root is an error.
+func (s *Server) resolveProjectContext(request mcp.CallToolRequest, workspaceParam string) (string, string, error) {
+	rootParam := strings.TrimSpace(request.GetString("root", ""))
+	if workspaceParam == "" && s.workspaceName != "" && rootParam == "" {
+		workspaceParam = s.workspaceName
+	}
+	if rootParam == "" {
+		return workspaceParam, "", nil
+	}
+	if workspaceParam != "" {
+		return "", "", fmt.Errorf("cannot specify both workspace and root parameters")
+	}
+	abs, err := filepath.Abs(rootParam)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid root parameter: %v", err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", "", fmt.Errorf("root parameter does not exist: %s", abs)
+	}
+	if !info.IsDir() {
+		return "", "", fmt.Errorf("root parameter must be a directory: %s", abs)
+	}
+	return "", abs, nil
+}
+
+// effectiveProjectRoot picks between the server startup project and the
+// request-level root override.
+func effectiveProjectRoot(serverRoot, rootOverride string) string {
+	if rootOverride != "" {
+		return rootOverride
+	}
+	return serverRoot
+}
+
+// Serve starts the MCP server using stdio transport.
+func (s *Server) Serve() error {
+	// Create stdio server with title fix wrapper
+	stdioServer := server.NewStdioServer(s.mcpServer)
+
+	// Wrap stdout to intercept and fix responses
+	fixedStdout := &titleFixWriter{Writer: os.Stdout}
+
+	// Start listening with fixed stdout
+	ctx := context.Background()
+	return stdioServer.Listen(ctx, os.Stdin, fixedStdout)
+}
+
+// titleFixWriter wraps io.Writer to fix tool titles in responses
+type titleFixWriter struct {
+	Writer io.Writer
+}
+
+func (w *titleFixWriter) Write(p []byte) (n int, err error) {
+	// Try to parse as JSON
+	var data map[string]interface{}
+	if err2 := json.Unmarshal(p, &data); err2 != nil {
+		// Not valid JSON, write as-is
+		return w.Writer.Write(p)
+	}
+
+	// Check if this is a tools/list response
+	if result, ok := data["result"].(map[string]interface{}); ok {
+		if tools, ok := result["tools"].([]interface{}); ok {
+			// Fix each tool
+			for _, toolIf := range tools {
+				tool, ok := toolIf.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				// 1. Move title from annotations to root
+				if annotations, ok := tool["annotations"].(map[string]interface{}); ok {
+					if title, ok := annotations["title"].(string); ok {
+						tool["title"] = title
+						delete(annotations, "title")
+					}
+				}
+
+				// 2. Add $schema to inputSchema (required by Windsurf)
+				if inputSchema, ok := tool["inputSchema"].(map[string]interface{}); ok {
+					if _, hasSchema := inputSchema["$schema"]; !hasSchema {
+						inputSchema["$schema"] = "http://json-schema.org/draft-07/schema#"
+					}
+				}
+			}
+
+			// Marshal back and write with newline
+			fixed, _ := json.Marshal(data)
+			fixed = append(fixed, '\n')
+			return w.Writer.Write(fixed)
+		}
+	}
+
+	// Write original data
+	return w.Writer.Write(p)
+}
+
+// formatBytes formats bytes to human readable string.
+func formatBytes(b int64) string {
+	if b == 0 {
+		return "N/A"
+	}
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// tryLoadRPG attempts to load the RPG store for the server startup project.
+// Returns nil values if RPG is disabled or unavailable.
+// rpgProjectRoot picks the project whose RPG graph a tool call reads: the
+// server project, or a workspace project (#296). RPG graphs are stored per
+// project, so a workspace call needs one project unless it has only one.
+func (s *Server) rpgProjectRoot(request mcp.CallToolRequest) (string, error) {
+	workspaceName := strings.TrimSpace(request.GetString("workspace", ""))
+	if workspaceName == "" {
+		workspaceName = s.workspaceName
+	}
+	if workspaceName == "" {
+		return s.projectRoot, nil
+	}
+
+	wsCfg, err := config.LoadWorkspaceConfig()
+	if err != nil {
+		return "", fmt.Errorf("failed to load workspace config: %w", err)
+	}
+	if wsCfg == nil {
+		return "", fmt.Errorf("no workspaces configured")
+	}
+	ws, err := wsCfg.GetWorkspace(workspaceName)
+	if err != nil {
+		return "", fmt.Errorf("workspace not found: %w", err)
+	}
+
+	projectName := strings.TrimSpace(request.GetString("project", ""))
+	if projectName == "" {
+		if len(ws.Projects) == 1 {
+			return ws.Projects[0].Path, nil
+		}
+		return "", fmt.Errorf("RPG graphs are per project: set project to one of: %s", strings.Join(listWorkspaceProjectNames(ws.Projects), ", "))
+	}
+	for _, p := range ws.Projects {
+		if p.Name == projectName {
+			return p.Path, nil
+		}
+	}
+	return "", fmt.Errorf("project %q not found in workspace %q (projects: %s)", projectName, ws.Name, strings.Join(listWorkspaceProjectNames(ws.Projects), ", "))
+}
+
+// tryLoadRPGForRoot attempts to load the RPG store from an explicit project
+// root. Returns nil values if RPG is disabled or unavailable.
+func (s *Server) tryLoadRPGForRoot(ctx context.Context, projectRoot string) (rpg.RPGStore, *rpg.QueryEngine, error) {
+	if projectRoot == "" {
+		return nil, nil, nil
+	}
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load config: %w", err)
+	}
+	if !cfg.RPG.Enabled {
+		return nil, nil, nil
+	}
+	rpgStore := rpg.NewGOBRPGStore(config.GetRPGIndexPath(projectRoot))
+	if err := rpgStore.Load(ctx); err != nil {
+		if errors.Is(err, rpg.ErrRPGIndexOutdated) {
+			return nil, nil, rpg.ErrRPGIndexOutdated
+		}
+		return nil, nil, fmt.Errorf("failed to load RPG store: %w", err)
+	}
+	graph := rpgStore.GetGraph()
+	if graph.Stats().TotalNodes == 0 {
+		rpgStore.Close()
+		return nil, nil, nil
+	}
+	qe := rpg.NewQueryEngine(graph)
+	return rpgStore, qe, nil
+}
+
+// handleRPGSearch handles the grepai_rpg_search tool call.
+func (s *Server) handleRPGSearch(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	query, err := request.RequireString("query")
+	if err != nil {
+		return mcp.NewToolResultError("query parameter is required"), nil
+	}
+
+	scope := request.GetString("scope", "")
+	kindsStr := request.GetString("kinds", "")
+	limit := request.GetInt("limit", 10)
+	format := request.GetString("format", "json")
+
+	// Validate format
+	if format != "json" && format != "toon" {
+		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	// Load RPG
+	rpgRoot, rootErr := s.rpgProjectRoot(request)
+	if rootErr != nil {
+		return mcp.NewToolResultError(rootErr.Error()), nil
+	}
+	rpgSt, qe, loadErr := s.tryLoadRPGForRoot(ctx, rpgRoot)
+	if errors.Is(loadErr, rpg.ErrRPGIndexOutdated) {
+		return mcp.NewToolResultError("RPG index is outdated; run 'grepai watch' to rebuild"), nil
+	}
+	if loadErr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load RPG: %v", loadErr)), nil
+	}
+	if rpgSt == nil {
+		return mcp.NewToolResultError("RPG is not enabled or index is empty"), nil
+	}
+	defer rpgSt.Close()
+
+	// Parse kinds
+	var kinds []rpg.NodeKind
+	if kindsStr != "" {
+		kindParts := strings.Split(kindsStr, ",")
+		for _, k := range kindParts {
+			k = strings.TrimSpace(k)
+			switch k {
+			case "area":
+				kinds = append(kinds, rpg.KindArea)
+			case "category":
+				kinds = append(kinds, rpg.KindCategory)
+			case "subcategory":
+				kinds = append(kinds, rpg.KindSubcategory)
+			case "file":
+				kinds = append(kinds, rpg.KindFile)
+			case "symbol":
+				kinds = append(kinds, rpg.KindSymbol)
+			case "chunk":
+				kinds = append(kinds, rpg.KindChunk)
+			default:
+				return mcp.NewToolResultError(fmt.Sprintf("invalid kind: %s", k)), nil
+			}
+		}
+	}
+
+	// Build request
+	req := rpg.SearchNodeRequest{
+		Query: query,
+		Scope: scope,
+		Kinds: kinds,
+		Limit: limit,
+	}
+
+	// Execute search
+	results, err := qe.SearchNode(ctx, req)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
+	}
+
+	// Encode output
+	output, err := encodeOutput(results, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode results: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(output), nil
+}
+
+// handleRPGFetch handles the grepai_rpg_fetch tool call.
+func (s *Server) handleRPGFetch(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	nodeID, err := request.RequireString("node_id")
+	if err != nil {
+		return mcp.NewToolResultError("node_id parameter is required"), nil
+	}
+
+	format := request.GetString("format", "json")
+
+	// Validate format
+	if format != "json" && format != "toon" {
+		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	// Load RPG
+	rpgRoot, rootErr := s.rpgProjectRoot(request)
+	if rootErr != nil {
+		return mcp.NewToolResultError(rootErr.Error()), nil
+	}
+	rpgSt, qe, loadErr := s.tryLoadRPGForRoot(ctx, rpgRoot)
+	if errors.Is(loadErr, rpg.ErrRPGIndexOutdated) {
+		return mcp.NewToolResultError("RPG index is outdated; run 'grepai watch' to rebuild"), nil
+	}
+	if loadErr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load RPG: %v", loadErr)), nil
+	}
+	if rpgSt == nil {
+		return mcp.NewToolResultError("RPG is not enabled or index is empty"), nil
+	}
+	defer rpgSt.Close()
+
+	// Fetch node
+	result, err := qe.FetchNode(ctx, rpg.FetchNodeRequest{NodeID: nodeID})
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("fetch failed: %v", err)), nil
+	}
+
+	if result == nil {
+		return mcp.NewToolResultError(fmt.Sprintf("node not found: %s", nodeID)), nil
+	}
+
+	// Encode output
+	output, err := encodeOutput(result, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode result: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(output), nil
+}
+
+// handleRPGExplore handles the grepai_rpg_explore tool call.
+func (s *Server) handleRPGExplore(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	startNodeID, err := request.RequireString("start_node_id")
+	if err != nil {
+		return mcp.NewToolResultError("start_node_id parameter is required"), nil
+	}
+
+	direction := request.GetString("direction", "both")
+	depth := request.GetInt("depth", 2)
+	edgeTypesStr := request.GetString("edge_types", "")
+	limit := request.GetInt("limit", 100)
+	format := request.GetString("format", "json")
+
+	// Validate format
+	if format != "json" && format != "toon" {
+		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	// Validate direction
+	if direction != "forward" && direction != "reverse" && direction != "both" {
+		return mcp.NewToolResultError("direction must be 'forward', 'reverse', or 'both'"), nil
+	}
+
+	// Load RPG
+	rpgRoot, rootErr := s.rpgProjectRoot(request)
+	if rootErr != nil {
+		return mcp.NewToolResultError(rootErr.Error()), nil
+	}
+	rpgSt, qe, loadErr := s.tryLoadRPGForRoot(ctx, rpgRoot)
+	if errors.Is(loadErr, rpg.ErrRPGIndexOutdated) {
+		return mcp.NewToolResultError("RPG index is outdated; run 'grepai watch' to rebuild"), nil
+	}
+	if loadErr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load RPG: %v", loadErr)), nil
+	}
+	if rpgSt == nil {
+		return mcp.NewToolResultError("RPG is not enabled or index is empty"), nil
+	}
+	defer rpgSt.Close()
+
+	// Parse edge types
+	var edgeTypes []rpg.EdgeType
+	if edgeTypesStr != "" {
+		edgeParts := strings.Split(edgeTypesStr, ",")
+		for _, et := range edgeParts {
+			et = strings.TrimSpace(et)
+			switch et {
+			case "feature_parent":
+				edgeTypes = append(edgeTypes, rpg.EdgeFeatureParent)
+			case "contains":
+				edgeTypes = append(edgeTypes, rpg.EdgeContains)
+			case "invokes":
+				edgeTypes = append(edgeTypes, rpg.EdgeInvokes)
+			case "imports":
+				edgeTypes = append(edgeTypes, rpg.EdgeImports)
+			case "maps_to_chunk":
+				edgeTypes = append(edgeTypes, rpg.EdgeMapsToChunk)
+			case "semantic_sim":
+				edgeTypes = append(edgeTypes, rpg.EdgeSemanticSim)
+			default:
+				return mcp.NewToolResultError(fmt.Sprintf("invalid edge type: %s", et)), nil
+			}
+		}
+	}
+
+	// Build request
+	req := rpg.ExploreRequest{
+		StartNodeID: startNodeID,
+		Direction:   direction,
+		Depth:       depth,
+		EdgeTypes:   edgeTypes,
+		Limit:       limit,
+	}
+
+	// Execute exploration
+	result, err := qe.Explore(ctx, req)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("explore failed: %v", err)), nil
+	}
+
+	if result == nil {
+		return mcp.NewToolResultError(fmt.Sprintf("start node not found: %s", startNodeID)), nil
+	}
+
+	// Encode output
+	output, err := encodeOutput(result, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode result: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(output), nil
+}
+
+// mcpOutputMode maps MCP compact/format params to a stats.OutputMode string.
+func mcpOutputMode(compact bool, format string) stats.OutputMode {
+	if compact {
+		return stats.Compact
+	}
+	if format == "toon" {
+		return stats.Toon
+	}
+	return stats.Full
+}
+
+// recordMCPStats fires a goroutine to record a stats entry without blocking.
+func (s *Server) recordMCPStats(commandType, outputMode string, resultCount int, outputStr string) {
+	if s.recorder == nil {
+		return
+	}
+	entry := stats.Entry{
+		Timestamp:    time.Now().UTC().Format(time.RFC3339),
+		CommandType:  commandType,
+		OutputMode:   outputMode,
+		ResultCount:  resultCount,
+		OutputTokens: embedder.EstimateTokens(outputStr),
+		GrepTokens:   stats.GrepEquivalentTokens(resultCount),
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		_ = s.recorder.Record(ctx, entry)
+	}()
+}
+
+// handleStats handles the grepai_stats MCP tool call.
+func (s *Server) handleStats(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	includeHistory := request.GetBool("history", false)
+	limit := request.GetInt("limit", 30)
+
+	statsFilePath := stats.StatsPath(s.projectRoot)
+	entries, readErr := stats.ReadAll(statsFilePath)
+	if readErr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to read stats: %v", readErr)), nil
+	}
+
+	provider := ""
+	if cfg, cfgErr := config.Load(s.projectRoot); cfgErr == nil {
+		provider = cfg.Embedder.Provider
+	}
+
+	summary := stats.Summarize(entries, provider)
+
+	if !includeHistory {
+		output, encErr := encodeOutput(summary, "json")
+		if encErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to encode stats: %v", encErr)), nil
+		}
+		return mcp.NewToolResultText(output), nil
+	}
+
+	days := stats.HistoryByDay(entries)
+	if limit > 0 && len(days) > limit {
+		days = days[:limit]
+	}
+
+	histResult := struct {
+		Summary stats.Summary      `json:"summary"`
+		History []stats.DaySummary `json:"history"`
+	}{
+		Summary: summary,
+		History: days,
+	}
+
+	output, encErr := encodeOutput(histResult, "json")
+	if encErr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode stats: %v", encErr)), nil
+	}
+	return mcp.NewToolResultText(output), nil
+}

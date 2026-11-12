@@ -1,0 +1,398 @@
+import type { JsonObject } from "@dev.fast/json";
+import type {
+  ReviewServerHealth,
+  ReviewServerHealthWithToken,
+} from "@dev.fast/review-protocol";
+import { traceMachineEnabled } from "@dev.fast/trace-core";
+import { ReviewInputError } from "@dev.fast/whiteboard-document";
+import {
+  type AskAgentLauncher,
+  askAgentTakesMcp,
+  detectAskAgents,
+  launchAskAgent,
+} from "@review/ask/agents.js";
+import { AskThreads, type AskTools } from "@review/ask/threads.js";
+import {
+  readBuildCommit,
+  readReviewPackageVersion,
+} from "@review/package-paths.js";
+import {
+  type RenderRequest,
+  type RenderedFrame,
+  renderedFrameSchema,
+} from "@review/review-api/animation-render.js";
+import {
+  type AuthoringCapabilities,
+  type ReviewApiHooks,
+  createReviewApi,
+} from "@review/review-api/http.js";
+import type { LocalReviewData } from "@review/review-api/local-data.js";
+import type { ReviewStore } from "@review/review-api/store.js";
+import { mountSharingPublisher } from "@review/sharing/host.js";
+import { type Context, Hono } from "hono";
+import { streamSSE } from "hono/streaming";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { z } from "zod";
+
+import { mountFeedback } from "./feedback";
+import type { ReviewDesktopVerbRelay } from "./global-verb-relay";
+import {
+  type ReviewHonoEnv,
+  applyCorsHeaders,
+  corsPreflightResponse,
+  isAuthorizedRequest,
+  jsonResponse,
+  readBoundedRequestJson,
+} from "./hono-http";
+import { HttpJsonError, ReviewServerError } from "./http-json";
+
+const version = readReviewPackageVersion(import.meta.url);
+
+const commit = readBuildCommit(import.meta.url);
+
+/**
+ * What every review server shares: CORS, an open /health, token auth, and
+ * the /control relay a Desktop attaches to, with errors answered as JSON.
+ * Callers add their routes after.
+ */
+export function createReviewServerApp(input: {
+  token: string;
+  instanceId: string;
+  /** The review store's `serverId()`. */
+  serverId: string;
+  relay: ReviewDesktopVerbRelay;
+}): Hono<ReviewHonoEnv> {
+  const app = new Hono<ReviewHonoEnv>();
+  app.use("*", async (context, next) => {
+    await next();
+    applyCorsHeaders(context.req.raw, context.res);
+  });
+  app.options("*", (context) => corsPreflightResponse(context.req.raw));
+  // Open to any caller, but the stable ids only to one holding the token.
+  app.get("/health", (context) => {
+    const health: ReviewServerHealth = {
+      ok: true,
+      instanceId: input.instanceId,
+      desktopAttached: input.relay.attached,
+      version,
+    };
+
+    return serverJson(
+      200,
+      isAuthorizedRequest(context.req.raw, input.token)
+        ? ({
+            ...health,
+            serverId: input.serverId,
+            serverPid: process.pid,
+            commit,
+          } satisfies ReviewServerHealthWithToken)
+        : health,
+    );
+  });
+  app.use("*", async (context, next) => {
+    if (!isAuthorizedRequest(context.req.raw, input.token)) {
+      return serverJson(401, { ok: false, error: "Unauthorized" });
+    }
+
+    await next();
+  });
+  app.get("/control", (context) => openControlEvents(context, input.relay));
+  mountFeedback(app);
+  app.post("/control/result", async (context) => {
+    const accepted = input.relay.acceptResult(
+      // A rendered frame's PNG rides back in a result.
+      await readBoundedRequestJson(context.req.raw, VERB_RESULT_MAX_BYTES),
+    );
+
+    return serverJson(accepted ? 200 : 404, { ok: accepted });
+  });
+  answerErrorsAsJson(app);
+
+  return app;
+}
+
+export function answerErrorsAsJson(app: Hono<ReviewHonoEnv>) {
+  app.notFound(() => serverJson(404, { ok: false, error: "Not found." }));
+  app.onError((error) => {
+    const serverError = error instanceof ReviewServerError ? error : undefined;
+
+    const message = toError(error).message;
+
+    return serverJson(
+      serverError?.statusCode ?? httpJsonStatus(error),
+      serverError?.code
+        ? { ok: false, code: serverError.code, error: message }
+        : { ok: false, error: message },
+    );
+  });
+}
+
+export interface WhiteboardCoreInput {
+  profile: {
+    store: ReviewStore;
+    data: LocalReviewData;
+  };
+  /** Desktop's: share sign-in and imports. */
+  sharing?: boolean;
+  relay: ReviewDesktopVerbRelay;
+  token: string;
+  instanceId: string;
+  softwareMapEnabled?: boolean;
+  animations?: () => boolean;
+  status: () => JsonObject;
+  hooks?: ReviewApiHooks;
+  ask?: {
+    tools: AskTools;
+    /** Tests only: an in-process agent. */
+    launch?: AskAgentLauncher;
+    /** Where agents are found, and the environment they run in. */
+    env?: Promise<NodeJS.ProcessEnv>;
+  };
+}
+
+/** A verb result may carry a captured frame: a PNG of up to 1600 pixels on
+ * its longest edge, base64. */
+const VERB_RESULT_MAX_BYTES = 16 * 1024 * 1024;
+
+export function createWhiteboardCore(input: WhiteboardCoreInput) {
+  const { store, data } = input.profile;
+
+  const app = createReviewServerApp({
+    token: input.token,
+    instanceId: input.instanceId,
+    serverId: store.serverId(),
+    relay: input.relay,
+  });
+
+  const callbacks = relayReviewCallbacks(
+    input.relay,
+    input.softwareMapEnabled,
+    input.animations,
+  );
+
+  const { ask } = input;
+
+  const launch = ask?.launch ?? launchAskAgent;
+
+  const askThreads =
+    ask &&
+    new AskThreads(
+      async (agent, cwd, options) =>
+        launch(agent, cwd, { ...options, env: await ask.env }),
+      {
+        takesMcp: async (agent) => askAgentTakesMcp(agent, await ask.env),
+        ...ask.tools,
+      },
+    );
+
+  const closeDeletedThreads = () =>
+    askThreads?.closeDeletedReviews(
+      (id) => !store.has(id) || Boolean(store.read(id).trashedAt),
+    );
+
+  const stopLocal =
+    askThreads &&
+    store.subscribe((result) => {
+      if (result.deleted || result.lifecycle) closeDeletedThreads();
+    });
+
+  const api = createReviewApi(
+    store,
+    data,
+    callbacks.open,
+    input.sharing,
+    callbacks.capabilities,
+    () => traceMachineEnabled(),
+    input.status,
+    input.hooks,
+    askThreads && {
+      threads: askThreads,
+      agents: async () => detectAskAgents(await ask?.env),
+    },
+    callbacks.animations,
+    callbacks.render,
+  );
+
+  // Desktop's sharing host mounts the publisher with the rest of sharing.
+  if (!input.sharing) mountSharingPublisher(api, store, data);
+
+  return {
+    app,
+    api,
+    close: () => {
+      callbacks.close();
+      stopLocal?.();
+      closeDeletedThreads();
+      askThreads?.closeAll();
+    },
+  };
+}
+
+const capabilitiesAnswerSchema = z.object({
+  softwareMapEnabled: z.boolean(),
+  // Older Desktops omit it.
+  animationsEnabled: z.boolean().optional(),
+});
+
+/**
+ * The Desktop callbacks `createReviewApi` takes, answered over the relay.
+ * `animations` never asks Desktop: it is the last answer while one is
+ * attached, else the host's own.
+ */
+export function relayReviewCallbacks(
+  relay: ReviewDesktopVerbRelay,
+  softwareMapEnabled = false,
+  animations: () => boolean = () => false,
+) {
+  let desktopAnimations: boolean | undefined;
+
+  const capabilities = async (): Promise<AuthoringCapabilities> => {
+    if (!relay.attached) return { desktopAvailable: false, softwareMapEnabled };
+
+    const result = await relay.dispatch({
+      name: "authoringCapabilities",
+      args: {},
+    });
+
+    if (!result.ok) throw new ReviewInputError(result.error, 409);
+
+    const answer = capabilitiesAnswerSchema.parse(result.result);
+    desktopAnimations = answer.animationsEnabled;
+
+    return {
+      desktopAvailable: true,
+      softwareMapEnabled: answer.softwareMapEnabled,
+    };
+  };
+
+  const stop = relay.onAttachedChange(() => {
+    desktopAnimations = undefined;
+
+    if (relay.attached) capabilities().catch(() => {});
+  });
+
+  return {
+    capabilities,
+    animations: () => desktopAnimations ?? animations(),
+    close: stop,
+    async open(review: {
+      reviewId: string;
+      title: string;
+    }): Promise<{ softwareMapEnabled: boolean }> {
+      const result = await relay.dispatch({
+        name: "openApiReview",
+        args: review,
+      });
+
+      if (!result.ok) throw new ReviewInputError(result.error, 409);
+
+      return z.object({ softwareMapEnabled: z.boolean() }).parse(result.result);
+    },
+    async render(request: RenderRequest): Promise<RenderedFrame> {
+      if (!relay.attached)
+        throw new ReviewInputError(
+          "No Whiteboard Desktop is attached, so nothing can show the animation. Open the whiteboard in Desktop and render again.",
+          409,
+        );
+
+      const { reviewId, targetId, frame } = request;
+
+      const result = await relay.dispatch({
+        name: "renderAnimation",
+        args: { reviewId, targetId, frame },
+      });
+
+      if (!result.ok) throw new ReviewInputError(result.error, 409);
+
+      return renderedFrameSchema.parse(result.result);
+    },
+  };
+}
+
+function openControlEvents(
+  context: Context<ReviewHonoEnv>,
+  relay: ReviewDesktopVerbRelay,
+): Response {
+  let attached = false;
+
+  const response = streamSSE(context, async (output) => {
+    let finish!: () => void;
+
+    const disconnected = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+
+    const abort = new AbortController();
+
+    let pending: Promise<void> = output
+      .write(": attached\n\n")
+      .then(() => undefined);
+
+    const writer = {
+      signal: abort.signal,
+      write(frame: string) {
+        pending = pending.then(async () => {
+          await output.write(frame);
+        });
+      },
+      close() {
+        finish();
+        void output.close();
+      },
+    };
+
+    output.onAbort(() => {
+      abort.abort();
+      finish();
+    });
+    attached = relay.attach(writer);
+
+    if (!attached) {
+      finish();
+
+      return;
+    }
+
+    try {
+      await disconnected;
+      await pending;
+    } finally {
+      abort.abort();
+    }
+  });
+
+  if (!attached) {
+    void response.body?.cancel();
+
+    // A new Response: one built on the stream's context would keep its
+    // chunked framing beside a Content-Length.
+    return serverJson(409, {
+      ok: false,
+      error: "This server has no room for another Whiteboard Desktop.",
+    });
+  }
+
+  // Never reused: a kept-alive socket would hold shutdown open after the
+  // relay ends the stream.
+  response.headers.set("connection", "close");
+  response.headers.set("cache-control", "no-cache, no-transform");
+  response.headers.set("content-type", "text/event-stream; charset=utf-8");
+
+  return response;
+}
+
+export function serverJson<T>(status: number, body: T): Response {
+  // SAFETY: callers pass 2xx/4xx/5xx codes (literals, ReviewServerError and
+  // HttpJsonError statusCode); none is a bodyless 1xx/204/205/304 status.
+  return jsonResponse(body, status as ContentfulStatusCode, {
+    cacheControl: "no-store",
+  });
+}
+
+function httpJsonStatus(cause: unknown): number {
+  return cause instanceof HttpJsonError ? cause.statusCode : 400;
+}
+
+function toError(cause: unknown): Error {
+  return cause instanceof Error ? cause : new Error(String(cause));
+}

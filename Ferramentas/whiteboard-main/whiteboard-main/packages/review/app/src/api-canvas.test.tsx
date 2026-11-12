@@ -1,0 +1,1739 @@
+// @vitest-environment jsdom
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+import * as clipboard from "@canvas/ui/copy";
+import type {
+  JsonObject,
+  ReviewApiSummary,
+  ReviewCanvasBridge,
+  ReviewDiffFileWire,
+  ReviewDiffViewSpec,
+  ReviewPeekSpec,
+  ReviewSurfaceEvent,
+} from "@dev.fast/review-protocol";
+import {
+  ReviewInputError,
+  type ReviewTarget,
+  rangeAnchor,
+} from "@dev.fast/whiteboard-document";
+import { createReviewApi } from "@review/review-api/http";
+import { LocalReviewData } from "@review/review-api/local-data";
+import { type ReviewProviders, ReviewStore } from "@review/review-api/store";
+import { Hono } from "hono";
+import { act } from "react";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+
+import { askAnchor } from "./ask-anchor";
+import { mountReviewCanvas as mount } from "./desktop-entry";
+import { createSequenceTourEntry, sequenceView } from "./diagrams";
+import { testReviewBridge } from "./review-session-test-utils";
+
+let store: ReviewStore, directory: string;
+
+let providers: ReviewProviders;
+
+let canvas: ReturnType<typeof mount> | undefined;
+
+const pins = { repositoryId: "repo", base: "base", head: "head" };
+
+const command = <Operation,>(operation: Operation) =>
+  store.execute({ operation });
+
+beforeEach(() => {
+  localStorage.clear();
+  sessionStorage.clear();
+  directory = mkdtempSync(path.join(tmpdir(), "review-api-canvas-"));
+  providers = {
+    validatePins: async () => {},
+    validateSource: async () => {},
+    validateResource: async () => {},
+  };
+  store = new ReviewStore(path.join(directory, "review.db"), providers);
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  );
+  vi.stubGlobal("matchMedia", () => ({
+    matches: false,
+    addEventListener() {},
+    removeEventListener() {},
+  }));
+});
+
+afterEach(async () => {
+  await act(async () => canvas?.dispose());
+  canvas = undefined;
+  await store.close();
+  document.body.innerHTML = "";
+  localStorage.clear();
+  sessionStorage.clear();
+  vi.unstubAllGlobals();
+  rmSync(directory, { recursive: true, force: true });
+});
+
+it("shows agent migration guidance when an old review cannot be loaded", async () => {
+  const app = new Hono().route("/reviews-api", createReviewApi(store));
+  const container = document.createElement("div");
+  document.body.append(container);
+  await act(async () => {
+    canvas = mount(container, {
+      kind: "api",
+      reviewId: "11111111-1111-4111-8111-111111111111",
+      bridge: testReviewBridge(
+        {},
+        { request: async (url, init) => app.request(url, init) },
+      ),
+    });
+  });
+  await vi.waitFor(() => {
+    expect(container.textContent).toContain(
+      "ask your agent to migrate your old Whiteboard reviews",
+    );
+  });
+});
+
+it("mounts the existing canvas and preserves a section's DOM and collapsed state through live edits", async () => {
+  const review = await command({
+    type: "create",
+    title: "Live review",
+    target: { kind: "commits", ...pins },
+  });
+
+  const inserted = await command({
+    type: "edit",
+    reviewId: review.reviewId,
+    edit: {
+      type: "insert",
+      content: {
+        type: "section",
+        title: "Details",
+        children: [{ type: "markdown", markdown: "Original explanation" }],
+      },
+    },
+  });
+
+  const app = new Hono().route("/reviews-api", createReviewApi(store));
+  app.get("/reviews-api/:id/commits", (context) => context.json([]));
+  const ready = vi.fn<() => void>();
+  const displayedVersion = vi.fn<(version: number) => void>();
+
+  const bridge = testReviewBridge(
+    {},
+    {
+      request: async (url, init) => {
+        return app.request(url, init);
+      },
+      ready,
+      diffView: {
+        files: async () => [],
+        create: () => {
+          throw new Error("Diff is not mounted by this test.");
+        },
+      },
+    },
+  );
+
+  const container = document.createElement("div");
+  document.body.append(container);
+  await act(async () => {
+    canvas = mount(container, {
+      kind: "api",
+      reviewId: review.reviewId,
+      bridge: {
+        ...bridge,
+        setSourceView: (_selection, view) => displayedVersion(view.version),
+      },
+    });
+  });
+  await act(async () => {
+    await vi.waitFor(() =>
+      expect(container.textContent).toContain("Original explanation"),
+    );
+  });
+  expect(ready).toHaveBeenCalled();
+  expect(displayedVersion).toHaveBeenLastCalledWith(inserted.version);
+  expect(container.querySelector("h1")?.textContent).toBe("Live review");
+
+  const node = container.querySelector(
+    `[data-review-node-id="${inserted.targetId}"]`,
+  )!;
+
+  const toggle = node.querySelector<HTMLButtonElement>(
+    "button[aria-expanded]",
+  )!;
+
+  expect(toggle).toBeTruthy();
+  await act(async () => toggle.click());
+  expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  expect(node.textContent).toContain("1 paragraph");
+  let activityId = "";
+  await act(async () => {
+    activityId = store.activity.update(review.reviewId, {
+      action: "begin",
+    }).activityId!;
+  });
+  await vi.waitFor(async () => {
+    await act(async () => {});
+    expect(container.textContent).toContain("Agent working…");
+  });
+  expect(
+    container.querySelector(`[data-review-node-id="${inserted.targetId}"]`),
+  ).toBe(node);
+  expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  await act(async () => {
+    store.activity.update(review.reviewId, {
+      action: "update",
+      activityId,
+      focus: { targetId: inserted.targetId, description: "Adding details" },
+    });
+  });
+  await vi.waitFor(async () => {
+    await act(async () => {});
+    expect(container.textContent).toContain("Adding details");
+  });
+  expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  expect(displayedVersion).toHaveBeenLastCalledWith(inserted.version);
+  await act(async () => {
+    store.activity.update(review.reviewId, {
+      action: "update",
+      activityId,
+      focus: { description: "Checking the outline" },
+    });
+  });
+  await vi.waitFor(async () => {
+    await act(async () => {});
+    expect(container.textContent).toContain("Checking the outline");
+  });
+  await act(async () => {
+    store.activity.update(review.reviewId, { action: "end", activityId });
+  });
+  await vi.waitFor(async () => {
+    await act(async () => {});
+    expect(container.textContent).not.toContain("Agent working…");
+    expect(container.textContent).not.toContain("Checking the outline");
+  });
+  await act(async () => {
+    await command({
+      type: "edit",
+      reviewId: review.reviewId,
+      edit: {
+        type: "update",
+        targetId: inserted.targetId,
+        changes: { title: "Updated details" },
+      },
+    });
+  });
+  await act(async () => {
+    await vi.waitFor(() =>
+      expect(container.textContent).toContain("Updated details"),
+    );
+  });
+  expect(
+    container.querySelector(`[data-review-node-id="${inserted.targetId}"]`),
+  ).toBe(node);
+  expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  const section = store.read(review.reviewId).document[0]!;
+
+  if (section.type !== "section") throw new Error("Expected section");
+  await act(async () => {
+    await command({
+      type: "edit",
+      reviewId: review.reviewId,
+      edit: {
+        type: "update",
+        targetId: section.children[0]!.id,
+        changes: { markdown: "Original explanation\n\nAnother paragraph" },
+      },
+    });
+  });
+  await act(async () => {
+    await vi.waitFor(() => expect(node.textContent).toContain("2 paragraphs"));
+  });
+  expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  await act(async () => {
+    await command({
+      type: "edit",
+      reviewId: review.reviewId,
+      edit: {
+        type: "insert",
+        content: {
+          type: "markdown",
+          markdown: "## Next section\n\n<script>window.bad = true</script>",
+        },
+      },
+    });
+  });
+  await act(async () => {
+    await vi.waitFor(() =>
+      expect(container.textContent).toContain("Next section"),
+    );
+  });
+  expect(container.querySelector("script")).toBeNull();
+  expect(container.querySelector("h2")?.textContent).toContain(
+    "Updated details",
+  );
+  await act(async () => {
+    canvas!.update({
+      kind: "api",
+      reviewId: review.reviewId,
+      version: inserted.version,
+      bridge: {
+        ...bridge,
+        setSourceView: (_selection, view) => displayedVersion(view.version),
+      },
+    });
+  });
+  await act(async () => {
+    await vi.waitFor(() =>
+      expect(container.textContent).toContain("Back to latest"),
+    );
+  });
+  expect(container.textContent).not.toContain("Next section");
+  await act(async () => {
+    activityId = store.activity.update(review.reviewId, {
+      action: "begin",
+    }).activityId!;
+  });
+  expect(container.textContent).not.toContain("Agent working…");
+  await act(async () => {
+    await command({
+      type: "edit",
+      reviewId: review.reviewId,
+      edit: {
+        type: "insert",
+        content: {
+          type: "markdown",
+          markdown: "Written while viewing history",
+        },
+      },
+      activityId,
+    });
+  });
+  expect(container.textContent).not.toContain("Written while viewing history");
+
+  const latest = [
+    ...container.querySelectorAll<HTMLButtonElement>("button"),
+  ].filter((button) => button.textContent === "Back to latest");
+
+  expect(latest).toHaveLength(1);
+  await act(async () => latest[0]!.click());
+  await act(async () => {
+    await vi.waitFor(() =>
+      expect(container.textContent).toContain("Written while viewing history"),
+    );
+  });
+  expect(container.textContent).toContain("Agent working…");
+});
+
+it("keeps sequence step identities and supports explanation/code steps without invented source anchors", async () => {
+  const review = await command({
+    type: "create",
+    title: "Diagram",
+    target: { kind: "commits", ...pins },
+  });
+
+  const inserted = await command({
+    type: "edit",
+    reviewId: review.reviewId,
+    edit: {
+      type: "insert",
+      content: {
+        type: "sequence",
+        title: "Flow",
+        actors: { app: "App", db: "Database" },
+        steps: [
+          {
+            from: "app",
+            to: "db",
+            label: "Save",
+            explanation: "The server commits the edit.",
+          },
+          {
+            from: "db",
+            to: "app",
+            label: "Done",
+            code: { text: "return ok", language: "ts" },
+            style: "return",
+          },
+        ],
+      },
+    },
+  });
+
+  const node = store.read(review.reviewId).document[0]!;
+
+  if (node.type !== "sequence") throw new Error("Expected sequence");
+
+  const sequence = sequenceView({
+    id: node.id!,
+    title: node.title,
+    actors: node.actors,
+    steps: node.steps,
+  });
+
+  const tour = createSequenceTourEntry(sequence);
+  expect(sequence.id).toBe(inserted.targetId);
+  expect(tour.stops.map((stop) => stop.anchor.id)).toEqual(
+    node.steps.map((step) => step.id),
+  );
+  expect(tour.stops.map((stop) => stop.content)).toEqual([
+    { kind: "explanation", text: "The server commits the edit." },
+    { kind: "inline-code", text: "return ok", language: "ts" },
+  ]);
+});
+
+it("moves a board to Trash without changing the saved document", async () => {
+  const { reviewId } = await command({
+    type: "create",
+    title: "Dismiss me",
+    target: { kind: "commits", ...pins },
+  });
+
+  const app = new Hono().route("/reviews-api", createReviewApi(store));
+  app.get("/reviews-api/:id/commits", (context) => context.json([]));
+
+  const bridge = testReviewBridge(
+    {},
+    { request: async (url, init) => app.request(url, init) },
+  );
+
+  const container = document.createElement("div");
+  document.body.append(container);
+  await act(async () => {
+    canvas = mount(container, { kind: "api", reviewId, bridge });
+  });
+  await act(async () => {
+    await vi.waitFor(() =>
+      expect(container.querySelector("h1")?.textContent).toBe("Dismiss me"),
+    );
+  });
+
+  const dismiss = [
+    ...container.querySelectorAll<HTMLButtonElement>("button"),
+  ].find((button) => button.textContent === "Move to Trash")!;
+
+  await act(async () => dismiss.click());
+
+  await vi.waitFor(() =>
+    expect(store.list()[0]?.trashedAt).toEqual(expect.any(String)),
+  );
+  expect(store.read(reviewId).version).toBe(0);
+});
+
+it.each([false, true])(
+  "adds a retained trace (inline=%s) live and opens its full conversation",
+  async (inline) => {
+    const review = await command({
+      type: "create",
+      title: "Retained conversation",
+      target: { kind: "commits", ...pins },
+    });
+
+    const traceId = randomUUID();
+
+    const trace = {
+      label: "Imported authoring conversation",
+      events: [
+        { id: "question", role: "user", text: "Keep the original components." },
+        {
+          id: "answer",
+          role: "assistant",
+          text: "The source remains pinned while the canvas changes.",
+        },
+        { id: "result", role: "tool", text: "Saved successfully." },
+      ],
+    };
+
+    const app = new Hono().route("/reviews-api", createReviewApi(store));
+    app.get("/reviews-api/:id/commits", (context) => context.json([]));
+    app.get("/reviews-api/:id/agent-traces", (context) =>
+      context.json({ ok: true, sessions: [] }),
+    );
+    app.get(`/reviews-api/${review.reviewId}/resources/${traceId}`, (context) =>
+      context.json(trace),
+    );
+
+    const bridge = testReviewBridge(
+      {},
+      {
+        request: async (url, init) => app.request(url, init),
+        diffView: {
+          files: async () => [],
+          create: () => {
+            throw new Error("Diff is not used here.");
+          },
+        },
+      },
+    );
+
+    const container = document.createElement("div");
+    document.body.append(container);
+    await act(async () => {
+      canvas = mount(container, {
+        kind: "api",
+        reviewId: review.reviewId,
+        bridge,
+      });
+    });
+
+    const traceTab = () =>
+      [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent === "Trace",
+      );
+
+    await act(async () => {
+      await vi.waitFor(() =>
+        expect(container.querySelector("h1")?.textContent).toBe(
+          "Retained conversation",
+        ),
+      );
+    });
+    await vi.waitFor(() => expect(traceTab()).toBeUndefined());
+    await act(async () => {
+      await command({
+        type: "edit",
+        reviewId: review.reviewId,
+        edit: {
+          type: "insert",
+          content: inline
+            ? {
+                type: "markdown",
+                markdown: `- Before [source remains pinned](review-trace:${traceId}#answer) after.`,
+              }
+            : {
+                type: "trace_quote",
+                traceId,
+                eventId: "answer",
+                text: "source remains pinned",
+              },
+        },
+      });
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(traceTab()).toBeTruthy());
+    });
+    expect(container.querySelector('a[href^="#trace-"]')).toBeTruthy();
+
+    expect(container.querySelector("li")?.textContent).toBe(
+      inline ? "Before source remains pinned after." : undefined,
+    );
+    await act(async () => traceTab()!.click());
+    await act(async () => {
+      await vi.waitFor(() =>
+        expect(container.textContent).toContain(
+          "Imported authoring conversation",
+        ),
+      );
+    });
+    expect(container.textContent).toContain("Keep the original components.");
+    expect(container.textContent).toContain(
+      "The source remains pinned while the canvas changes.",
+    );
+    expect(container.textContent).not.toContain("Unable to load trace");
+  },
+);
+
+it("renders a code peek block on its pinned side without fetching source text", async () => {
+  const review = await command({
+    type: "create",
+    title: "Peek review",
+    target: { kind: "commits", ...pins },
+  });
+
+  await command({
+    type: "edit",
+    reviewId: review.reviewId,
+    edit: {
+      type: "insert",
+      content: {
+        type: "code_peek",
+        source: rangeAnchor({
+          side: "base",
+          file: "src/old.ts",
+          fromLine: 7,
+          toLine: 9,
+        }),
+      },
+    },
+  });
+
+  const app = new Hono();
+  app.get("/reviews-api/:id/progress", (c) =>
+    c.json({
+      files: [],
+      lenses: [],
+      resolvedSelections: {
+        [JSON.stringify(["src/old.ts", "base", 7, "base", 9])]: [
+          { file: "src/old.ts", side: "base", fromLine: 7, toLine: 9 },
+          { file: "src/old.ts", side: "head", fromLine: 12, toLine: 14 },
+        ],
+      },
+    }),
+  );
+  app.route("/reviews-api", createReviewApi(store));
+  app.get("/reviews-api/:id/commits", (context) => context.json([]));
+  const requested: string[] = [];
+  const created: ReviewPeekSpec[] = [];
+
+  const bridge = testReviewBridge(
+    {},
+    {
+      request: async (url, init) => {
+        requested.push(String(url));
+
+        return app.request(url, init);
+      },
+      peeks: {
+        async find() {
+          return { matchCount: 0 };
+        },
+        create: (spec) => {
+          created.push(spec);
+          const editor = document.createElement("div");
+          editor.className = "fixture-inline-editor";
+          spec.container.appendChild(editor);
+
+          return {
+            height: 180,
+            setActive() {},
+            setCollapsed() {},
+            async setFindQuery() {
+              return { matchCount: 0 };
+            },
+            revealFindMatch() {},
+            clearActiveFindMatch() {},
+            clearFind() {},
+            onDidChangeHeight: () => ({ dispose() {} }),
+            onDidError: () => ({ dispose() {} }),
+            dispose: () => {
+              editor.remove();
+            },
+          };
+        },
+      },
+    },
+  );
+
+  const container = document.createElement("div");
+  document.body.append(container);
+  await act(async () => {
+    canvas = mount(container, {
+      kind: "api",
+      reviewId: review.reviewId,
+      bridge: { ...bridge, setSourceView: () => {} },
+    });
+  });
+  await act(async () => {
+    await vi.waitFor(() => expect(created).toHaveLength(1));
+  });
+  expect(created[0]).toMatchObject({
+    path: "src/old.ts",
+    side: "base",
+    ranges: [
+      { side: "base", startLine: 7, endLine: 9 },
+      { side: "head", startLine: 12, endLine: 14 },
+    ],
+  });
+  expect(requested.filter((url) => url.includes("/source"))).toEqual([]);
+});
+
+it("copies prose and code from the displayed historical JSON review", async () => {
+  const review = await command({
+    type: "create",
+    title: "Copy review",
+    target: { kind: "commits", ...pins },
+  });
+
+  const inserted = await command({
+    type: "edit",
+    reviewId: review.reviewId,
+    edit: {
+      type: "insert",
+      content: { type: "markdown", markdown: "Selected historical prose" },
+    },
+  });
+
+  await command({
+    type: "set_target",
+    reviewId: review.reviewId,
+    target: { kind: "commits", ...pins, head: "new-head" },
+  });
+  const data = new LocalReviewData(store);
+  vi.spyOn(data, "commits").mockResolvedValue([]);
+  vi.spyOn(data, "sourcePins").mockImplementation(
+    async (snapshot) => snapshot.pins,
+  );
+  vi.spyOn(data, "comparison").mockImplementation(async (pins, commit) =>
+    commit ? { ...pins, base: "selected-parent", head: commit } : pins,
+  );
+  vi.spyOn(data, "quote").mockImplementation(async (sourcePins, source) => {
+    expect(source).toEqual({
+      side: sourcePins.head === "selected-commit" ? "base" : "head",
+      file: "example.ts",
+      fromLine: 2,
+      toLine: 2,
+    });
+
+    return {
+      ...source,
+      commit:
+        sourcePins.head === "selected-commit"
+          ? "selected-parent"
+          : sourcePins.head,
+      text:
+        sourcePins.head === "selected-commit"
+          ? "selected parent code"
+          : sourcePins.head === "head"
+            ? "historical source"
+            : "latest source",
+    };
+  });
+  const app = new Hono().route("/reviews-api", createReviewApi(store, data));
+  const listeners = new Set<Parameters<ReviewCanvasBridge["subscribe"]>[0]>();
+
+  const bridge = testReviewBridge(
+    {},
+    {
+      request: async (url, init) => app.request(url, init),
+      subscribe: (listener) => {
+        listeners.add(listener);
+
+        return {
+          dispose: () => {
+            listeners.delete(listener);
+          },
+        };
+      },
+    },
+  );
+
+  const write = vi.spyOn(clipboard, "copyText").mockResolvedValue(true);
+  const container = document.createElement("div");
+  document.body.append(container);
+
+  try {
+    await act(async () => {
+      canvas = mount(container, {
+        kind: "api",
+        reviewId: review.reviewId,
+        version: inserted.version,
+        bridge,
+      });
+    });
+    await act(async () => {
+      await vi.waitFor(() =>
+        expect(container.textContent).toContain("Selected historical prose"),
+      );
+    });
+
+    const prose = [...container.querySelectorAll("p")].find(
+      (node) => node.textContent === "Selected historical prose",
+    )!;
+
+    const range = document.createRange();
+    range.selectNodeContents(prose);
+    range.getClientRects = () => [new DOMRect(10, 50, 100, 20)] as never;
+    document.getSelection()!.removeAllRanges();
+    document.getSelection()!.addRange(range);
+    await act(async () => document.dispatchEvent(new Event("selectionchange")));
+
+    const copy = async () => {
+      await act(async () =>
+        container
+          .querySelector<HTMLButtonElement>('[aria-label="Copy ref"]')!
+          .click(),
+      );
+
+      return write.mock.lastCall![0];
+    };
+
+    const text = await copy();
+    expect(text).toContain(
+      `Session ID: ${review.reviewId}\nVersion: ${inserted.version}`,
+    );
+    expect(text).toContain("> Selected historical prose");
+    expect(text).toContain(
+      `session_get({"sessionId":"${review.reviewId}","version":${inserted.version},"full":true})`,
+    );
+    expect(text).not.toContain("review.mdx");
+
+    const selected: ReviewSurfaceEvent = {
+      event: "editorSelectionChanged",
+      reviewId: review.reviewId,
+      path: "example.ts",
+      range: { fromLine: 2, toLine: 2 },
+      sideContext: "head",
+      isEmpty: false,
+    };
+
+    await act(async () => {
+      for (const listener of listeners) listener(selected);
+    });
+    const code = await copy();
+    expect(code).toContain("historical source");
+    expect(code).toContain("example.ts:2-2 (head)");
+    expect(code).not.toContain("latest source");
+    expect(code).not.toContain("new-head");
+    await act(async () => {
+      for (const listener of listeners)
+        listener({
+          ...selected,
+          sideContext: "base",
+          apiSource: {
+            reviewId: review.reviewId,
+            version: inserted.version,
+            commit: "selected-commit",
+          },
+        });
+    });
+    const scopedCode = await copy();
+    expect(scopedCode).toContain("selected parent code");
+    expect(scopedCode).toContain("base: example.ts:2-2 (selected-parent)");
+    expect(scopedCode).toContain("Selected commit: selected-commit");
+    expect(scopedCode).not.toContain("historical source");
+
+    await act(async () => {
+      for (const listener of listeners)
+        listener({
+          ...selected,
+          reviewId: "another-review",
+          path: "unrelated.ts",
+        });
+    });
+    expect(container.querySelector('[aria-label="Copy ref"]')).toBeNull();
+    await act(async () => {
+      for (const listener of listeners)
+        listener({
+          ...selected,
+          selectedDiff: {
+            oldPath: "old.ts",
+            newPath: "example.ts",
+            oldStart: 2,
+            newStart: 2,
+            rows: [
+              { kind: "deleted", text: "before" },
+              { kind: "added", text: "after" },
+            ],
+          },
+        });
+    });
+    const diff = await copy();
+    expect(diff).toContain("Base: a/old.ts\nHead: b/example.ts");
+    expect(diff).toContain("-before\n+after");
+  } finally {
+    await data.close();
+    write.mockRestore();
+    document.getSelection()!.removeAllRanges();
+  }
+});
+
+it("offers Ask and Copy ref on a selected section title, anchored to its section", async () => {
+  const review = await command({
+    type: "create",
+    title: "Selectable headings",
+    target: { kind: "commits", ...pins },
+  });
+
+  const section = await command({
+    type: "edit",
+    reviewId: review.reviewId,
+    edit: {
+      type: "insert",
+      content: {
+        type: "section",
+        title: "Retry budget",
+        children: [{ type: "markdown", markdown: "Saves retry three times." }],
+      },
+    },
+  });
+
+  const app = new Hono().route("/reviews-api", createReviewApi(store));
+  app.get("/reviews-api/:id/commits", (context) => context.json([]));
+  const write = vi.spyOn(clipboard, "copyText").mockResolvedValue(true);
+  const container = document.createElement("div");
+  document.body.append(container);
+  await act(async () => {
+    canvas = mount(container, {
+      kind: "api",
+      reviewId: review.reviewId,
+      bridge: testReviewBridge(
+        {},
+        { request: async (url, init) => app.request(url, init) },
+      ),
+    });
+  });
+  await act(async () => {
+    await vi.waitFor(() =>
+      expect(container.textContent).toContain("Retry budget"),
+    );
+  });
+
+  const heading = container.querySelector<HTMLElement>(
+    `h2[data-review-node-id="${section.targetId}"]`,
+  )!;
+
+  const text = document
+    .createTreeWalker(heading, NodeFilter.SHOW_TEXT)
+    .nextNode()!;
+
+  const range = document.createRange();
+  range.setStart(text, 0);
+  range.setEnd(text, text.textContent!.length);
+  range.getClientRects = () => [new DOMRect(10, 50, 100, 20)] as never;
+  document.getSelection()!.removeAllRanges();
+  document.getSelection()!.addRange(range);
+  await act(async () => document.dispatchEvent(new Event("selectionchange")));
+
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>('[aria-label="Copy ref"]')!
+      .click(),
+  );
+  expect(write.mock.lastCall![0]).toContain("> Retry budget");
+  // Ask pins the passage to the section that holds it.
+  expect(askAnchor(range)).toMatchObject({
+    blockId: section.targetId,
+    text: "Retry budget",
+  });
+});
+
+it("names a worktree review's source as its base against the working copy, and a commit review's as two commits", async () => {
+  const head = "c14db2183b0e6c1f4a4a5c3f2d9e8b7a6f5e4d3c";
+
+  const store = new ReviewStore(path.join(directory, "worktree.db"), {
+    resolveTarget: async (target) => ({
+      target,
+      pins: { repositoryId: target.repositoryId, base: head, head },
+    }),
+    validatePins: async () => {},
+    validateSource: async () => {},
+    validateResource: async () => {},
+  });
+
+  const create = async (title: string, target: ReviewTarget) =>
+    (await store.execute({ operation: { type: "create", title, target } }))
+      .reviewId;
+
+  const app = new Hono().route("/reviews-api", createReviewApi(store));
+  app.get("/reviews-api/:id/commits", (context) => context.json([]));
+
+  const bridge = testReviewBridge(
+    {},
+    { request: async (url, init) => app.request(url, init) },
+  );
+
+  const open = async (reviewId: string, title: string) => {
+    await act(async () => canvas?.dispose());
+    document.body.innerHTML = "";
+    const container = document.createElement("div");
+    document.body.append(container);
+    await act(async () => {
+      canvas = mount(container, { kind: "api", reviewId, bridge });
+    });
+    await act(async () =>
+      vi.waitFor(() =>
+        expect(container.querySelector("h1")?.textContent).toBe(title),
+      ),
+    );
+
+    return container;
+  };
+
+  const source = (container: HTMLElement) =>
+    container.querySelector("[data-review-document-header] > div:last-child")
+      ?.textContent;
+
+  try {
+    const worktree = await open(
+      await create("Uncommitted work", {
+        kind: "worktree",
+        repositoryId: "repo",
+      }),
+      "Uncommitted work",
+    );
+
+    await vi.waitFor(() => expect(source(worktree)).toContain("c14db21"));
+
+    const committed = await open(
+      await create("Committed work", {
+        kind: "commits",
+        repositoryId: "repo",
+        base: head,
+        head,
+      }),
+      "Committed work",
+    );
+
+    // Base equal to head shows the head alone.
+    await vi.waitFor(() => expect(source(committed)).toContain("c14db21"));
+    expect(committed.querySelector("[aria-label=against]")).toBeNull();
+  } finally {
+    await store.close();
+  }
+});
+
+it("offers to dismiss a review whose worktree is gone, without reading its diff", async () => {
+  let removed = false;
+
+  const gone = new ReviewStore(path.join(directory, "gone.db"), {
+    resolveTarget: async (target) => {
+      if (removed)
+        throw new ReviewInputError(
+          "The selected local checkout is unavailable.",
+          404,
+        );
+
+      return { target, pins: { ...pins, worktreeRevision: "saved" } };
+    },
+    validatePins: async () => {},
+    validateSource: async () => {},
+    validateResource: async () => {},
+  });
+
+  try {
+    const { reviewId } = await gone.execute({
+      operation: {
+        type: "create",
+        title: "Moved review",
+        target: { kind: "worktree", repositoryId: pins.repositoryId },
+      },
+    });
+
+    await gone.execute({
+      operation: {
+        type: "edit",
+        reviewId,
+        edit: {
+          type: "insert",
+          content: {
+            type: "code_peek",
+            source: rangeAnchor({
+              side: "head",
+              file: "src/a.ts",
+              fromLine: 1,
+              toLine: 2,
+            }),
+          },
+        },
+      },
+    });
+    removed = true;
+    await gone.refreshWorktrees();
+    const app = new Hono().route("/reviews-api", createReviewApi(gone));
+    const commits = vi.fn<() => Response>(() => new Response("[]"));
+    app.get("/reviews-api/:id/commits", commits);
+    const progress = vi.fn<() => Response>(() => new Response("{}"));
+    app.get("/reviews-api/:id/progress", progress);
+    const files = vi.fn<() => Promise<never[]>>(async () => []);
+
+    const create = vi.fn<ReviewCanvasBridge["diffView"]["create"]>(() => {
+      throw new Error("The Diff view must not open.");
+    });
+
+    const bridge = testReviewBridge(
+      {},
+      {
+        request: async (url, init) => app.request(url, init),
+        diffView: { files, create },
+      },
+    );
+
+    const container = document.createElement("div");
+    document.body.append(container);
+    await act(async () => {
+      canvas = mount(container, { kind: "api", reviewId, bridge });
+    });
+    await act(async () =>
+      vi.waitFor(() =>
+        expect(container.textContent).toContain("Code unavailable"),
+      ),
+    );
+    await act(async () =>
+      container
+        .querySelector<HTMLButtonElement>('button[aria-label="Diff"]')!
+        .click(),
+    );
+
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(commits).not.toHaveBeenCalled();
+    expect(progress).not.toHaveBeenCalled();
+    expect(files).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+
+    const dismiss = () =>
+      [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent === "Move to Trash",
+      );
+
+    await act(async () => dismiss()!.click());
+    await vi.waitFor(() =>
+      expect(gone.list()[0]?.trashedAt).toEqual(expect.any(String)),
+    );
+    expect(dismiss()).toBeUndefined();
+  } finally {
+    await gone.close();
+  }
+});
+
+it("offers the Diff view for a live worktree review and refreshes it on each save", async () => {
+  const live = { ...pins, base: "head", worktreeRevision: "first-save" };
+
+  const worktree = new ReviewStore(path.join(directory, "worktree.db"), {
+    resolveTarget: async (target) => ({ target, pins: { ...live } }),
+    validatePins: async () => {},
+    validateSource: async () => {},
+    validateResource: async () => {},
+  });
+
+  try {
+    const { reviewId } = await worktree.execute({
+      operation: {
+        type: "create",
+        title: "Working files",
+        target: { kind: "worktree", repositoryId: pins.repositoryId },
+      },
+    });
+
+    const app = new Hono().route("/reviews-api", createReviewApi(worktree));
+    app.get("/reviews-api/:id/commits", (context) => context.json([]));
+    app.get("/reviews-api/:id/progress", (context) =>
+      context.json({ files: [], resolvedSelections: {}, lenses: [] }),
+    );
+    let progressReads = 0;
+
+    const files = vi.fn<() => Promise<ReviewDiffFileWire[]>>(async () => [
+      { path: "a.ts", status: "modified" as const, additions: 1, deletions: 0 },
+    ]);
+
+    const bridge = testReviewBridge(
+      {},
+      {
+        request: async (url, init) => {
+          if (
+            new URL(String(url), "http://localhost").pathname.endsWith(
+              "/progress",
+            )
+          )
+            progressReads++;
+
+          return app.request(url, init);
+        },
+        diffView: {
+          files,
+          create: () => {
+            throw new Error("Diff is not mounted by this test.");
+          },
+        },
+      },
+    );
+
+    const container = document.createElement("div");
+    document.body.append(container);
+    await act(async () => {
+      canvas = mount(container, { kind: "api", reviewId, bridge });
+    });
+    await act(async () =>
+      vi.waitFor(() => {
+        expect(container.querySelector("h1")?.textContent).toBe(
+          "Working files",
+        );
+        expect(files).toHaveBeenCalled();
+        expect(progressReads).toBeGreaterThan(0);
+      }),
+    );
+
+    expect(container.querySelector('button[aria-label="Diff"]')).not.toBeNull();
+
+    const [filesBefore, progressBefore] = [
+      files.mock.calls.length,
+      progressReads,
+    ];
+
+    live.worktreeRevision = "second-save";
+    await act(async () => {
+      await worktree.refreshWorktrees();
+    });
+
+    await vi.waitFor(async () => {
+      await act(async () => {});
+      expect(files.mock.calls.length).toBeGreaterThan(filesBefore);
+      expect(progressReads).toBeGreaterThan(progressBefore);
+    });
+  } finally {
+    await worktree.close();
+  }
+});
+
+it("leaves window errors to the workbench it shares a window with", async () => {
+  const review = await command({
+    type: "create",
+    title: "Errors",
+    target: { kind: "commits", ...pins },
+  });
+
+  const app = new Hono().route("/reviews-api", createReviewApi(store));
+  app.get("/reviews-api/:id/commits", (context) => context.json([]));
+  const telemetry: string[] = [];
+
+  const bridge = testReviewBridge(
+    {},
+    {
+      request: async (url, init) => {
+        if (
+          new URL(String(url), "http://localhost").pathname.endsWith(
+            "/telemetry/event",
+          )
+        )
+          telemetry.push(JSON.parse(String(init?.body)).name);
+
+        return app.request(url, init);
+      },
+      diffView: {
+        files: async () => [],
+        create: () => {
+          throw new Error("Diff is not mounted by this test.");
+        },
+      },
+    },
+  );
+
+  const container = document.createElement("div");
+  document.body.append(container);
+  await act(async () => {
+    canvas = mount(container, {
+      kind: "api",
+      reviewId: review.reviewId,
+      bridge: { ...bridge, setSourceView: () => {} },
+    });
+  });
+  await act(async () => {
+    await vi.waitFor(() =>
+      expect(container.querySelector("h1")?.textContent).toBe("Errors"),
+    );
+  });
+
+  // Stands in for the workbench's own handler, which reports this error.
+  const handled = (event: ErrorEvent) => event.preventDefault();
+  window.addEventListener("error", handled);
+  window.dispatchEvent(
+    new ErrorEvent("error", {
+      error: new Error("workbench failure"),
+      cancelable: true,
+    }),
+  );
+  window.removeEventListener("error", handled);
+  await act(async () => {});
+
+  expect(telemetry).not.toContain("client_error");
+});
+
+it("builds the full diff only once the Diff view is shown", async () => {
+  const review = await command({
+    type: "create",
+    title: "Lazy diff",
+    target: { kind: "commits", ...pins },
+  });
+
+  const app = new Hono().route("/reviews-api", createReviewApi(store));
+
+  app.get("/reviews-api/:id/commits", (context) => context.json([]));
+
+  const create = vi.fn<ReviewCanvasBridge["diffView"]["create"]>(() => {
+    throw new Error("Diff is not mounted by this test.");
+  });
+
+  const bridge = testReviewBridge(
+    {},
+    {
+      request: async (url, init) => app.request(url, init),
+      diffView: {
+        files: async () => [
+          { path: "a.ts", status: "modified", additions: 1, deletions: 1 },
+        ],
+        create,
+      },
+    },
+  );
+
+  const container = document.createElement("div");
+
+  document.body.append(container);
+  await act(async () => {
+    canvas = mount(container, {
+      kind: "api",
+      reviewId: review.reviewId,
+      bridge,
+    });
+  });
+  await act(async () =>
+    vi.waitFor(() =>
+      expect(container.querySelector("h1")?.textContent).toBe("Lazy diff"),
+    ),
+  );
+  expect(create).not.toHaveBeenCalled();
+
+  await act(async () =>
+    container
+      .querySelector<HTMLButtonElement>('button[aria-label="Diff"]')!
+      .click(),
+  );
+  await act(async () => vi.waitFor(() => expect(create).toHaveBeenCalled()));
+});
+
+function rewrittenWatch(
+  app: Hono,
+  rewrite: (line: { kind: string; value?: JsonObject }) => void,
+  requests: string[],
+): ReviewCanvasBridge["request"] {
+  const encoder = new TextEncoder();
+
+  return async (url, init) => {
+    requests.push(new URL(String(url), "http://localhost").pathname);
+    const response = await app.request(url, init);
+
+    if (
+      !new URL(String(url), "http://localhost").pathname.endsWith("/watch") ||
+      !response.body
+    )
+      return response;
+    const decoder = new TextDecoder();
+    let pending = "";
+
+    return new Response(
+      response.body.pipeThrough(
+        new TransformStream<Uint8Array, Uint8Array>({
+          transform(chunk, controller) {
+            pending += decoder.decode(chunk, { stream: true });
+            const lines = pending.split("\n");
+            pending = lines.pop()!;
+
+            for (const text of lines) {
+              const line = text && JSON.parse(text);
+
+              if (line) rewrite(line);
+              controller.enqueue(encoder.encode(`${JSON.stringify(line)}\n`));
+            }
+          },
+        }),
+      ),
+      response,
+    );
+  };
+}
+
+it("shows a lost remote host as a top-bar chip that retries the host and the stream", async () => {
+  const review = await command({
+    type: "create",
+    title: "Remote",
+    target: { kind: "commits", ...pins },
+  });
+
+  const app = new Hono().route("/reviews-api", createReviewApi(store));
+  app.get("/reviews-api/:id/commits", (context) => context.json([]));
+  let down = false;
+  let watches = 0;
+  let cut: (() => void) | undefined;
+
+  const bridge = testReviewBridge(
+    {},
+    {
+      request: async (url, init) => {
+        if (
+          !new URL(String(url), "http://localhost").pathname.endsWith("/watch")
+        )
+          return app.request(url, init);
+        watches++;
+
+        if (down)
+          return Response.json(
+            { ok: false, error: "wb-a is offline: it did not answer." },
+            { status: 503 },
+          );
+        const response = await app.request(url, init);
+
+        return new Response(
+          response.body!.pipeThrough(
+            new TransformStream({
+              start: (controller) => {
+                cut = () =>
+                  controller.error(
+                    new Error("wb-a is offline: it did not answer."),
+                  );
+              },
+            }),
+          ),
+          response,
+        );
+      },
+    },
+  );
+
+  let answer: (() => void) | undefined;
+
+  const retry = vi.fn<(alias: string) => Promise<void>>(async () => {
+    await new Promise<void>((resolve) => (answer = resolve));
+    down = false;
+  });
+
+  const remoteHosts = {
+    states: async () => [
+      down
+        ? {
+            alias: "wb-a",
+            state: "offline" as const,
+            detail: "wb-a is offline: it did not answer.",
+          }
+        : { alias: "wb-a", state: "online" as const },
+    ],
+    retry,
+    install: async () => {},
+    openSettings: async () => {},
+  };
+
+  const container = document.createElement("div");
+  document.body.append(container);
+  await act(async () => {
+    canvas = mount(container, {
+      kind: "api",
+      reviewId: review.reviewId,
+      host: "wb-a",
+      bridge: { ...bridge, remoteHosts, setSourceView: () => {} },
+    });
+  });
+  await act(() =>
+    vi.waitFor(() =>
+      expect(container.querySelector("h1")?.textContent).toBe("Remote"),
+    ),
+  );
+
+  down = true;
+  await act(async () => cut?.());
+
+  const chip = await vi.waitFor(() => {
+    const found = container.querySelector<HTMLButtonElement>(
+      "button.connection-chip",
+    );
+
+    expect(found?.textContent).toBe("wb-a offline");
+
+    return found!;
+  });
+
+  expect(chip.title).toBe(
+    "Click to retry\nwb-a is offline: it did not answer.",
+  );
+
+  const before = watches;
+  chip.focus();
+  await act(async () => chip.click());
+  expect(retry).toHaveBeenCalledWith("wb-a");
+
+  await act(async () => chip.click());
+  expect(retry).toHaveBeenCalledOnce();
+  expect(chip.disabled).toBe(false);
+  expect(chip.getAttribute("aria-busy")).toBe("true");
+  expect(document.activeElement).toBe(chip);
+
+  await act(async () => answer!());
+  await act(() =>
+    vi.waitFor(() => {
+      expect(container.querySelector(".connection-chip")).toBeNull();
+    }),
+  );
+  // The stream came back at once, not after its backoff.
+  expect(watches).toBe(before + 1);
+});
+
+it("shows why a remote review has not loaded, with its host's next step", async () => {
+  const install = vi.fn<(alias: string) => Promise<void>>(async () => {});
+
+  const container = document.createElement("div");
+  document.body.append(container);
+  await act(async () => {
+    canvas = mount(container, {
+      kind: "api",
+      reviewId: "11111111-1111-4111-8111-111111111111",
+      host: "wb-a",
+      bridge: testReviewBridge(
+        {},
+        {
+          remoteHosts: {
+            states: async () => [
+              {
+                alias: "wb-a",
+                state: "incompatible",
+                detail: "wb-a runs Whiteboard 0.1.0; this Desktop runs 0.2.0.",
+              },
+            ],
+            retry: async () => {},
+            install,
+            openSettings: async () => {},
+          },
+          request: async () =>
+            Response.json(
+              { ok: false, error: "wb-a runs Whiteboard 0.1.0." },
+              { status: 503 },
+            ),
+        },
+      ),
+    });
+  });
+
+  const waiting = await vi.waitFor(() => {
+    const found = container.querySelector<HTMLElement>(".host-waiting");
+
+    expect(found?.querySelector("h2")?.textContent).toBe(
+      "wb-a needs an update",
+    );
+
+    return found!;
+  });
+
+  expect(waiting.textContent).toContain(
+    "wb-a runs Whiteboard 0.1.0; this Desktop runs 0.2.0.",
+  );
+  await act(async () =>
+    [...waiting.querySelectorAll("button")]
+      .find((button) => button.textContent === "Install")!
+      .click(),
+  );
+  expect(install).toHaveBeenCalledWith("wb-a");
+});
+
+async function mountPeekReview(content: {
+  host?: string;
+  available?: ReviewApiSummary["available"];
+  /** The review's checkout is gone. */
+  sourceUnavailable?: boolean;
+}) {
+  const review = await command({
+    type: "create",
+    title: "Peek review",
+    target: { kind: "commits", ...pins },
+  });
+
+  await command({
+    type: "edit",
+    reviewId: review.reviewId,
+    edit: {
+      type: "insert",
+      content: {
+        type: "code_peek",
+        source: rangeAnchor({
+          side: "base",
+          file: "src/a.ts",
+          fromLine: 1,
+          toLine: 2,
+        }),
+      },
+    },
+  });
+
+  const app = new Hono();
+  app.get("/reviews-api/:id/progress", (c) =>
+    c.json({
+      files: [],
+      lenses: [],
+      resolvedSelections: {
+        [JSON.stringify(["src/a.ts", "base", 1, "base", 2])]: [
+          { file: "src/a.ts", side: "base", fromLine: 1, toLine: 2 },
+        ],
+      },
+    }),
+  );
+  let data: LocalReviewData | undefined;
+
+  // The store's refresh, which runs before each read with local data, finds
+  // the checkout gone.
+  if (content.sourceUnavailable) {
+    const gone = async () => {
+      throw new ReviewInputError("Checkout is gone.", 404);
+    };
+
+    providers.resolveTarget = async (target, pinned) => ({
+      target,
+      pins: pinned ?? pins,
+    });
+    providers.sourcePins = gone;
+    data = new LocalReviewData(store);
+    vi.spyOn(data, "discoverPullRequest").mockImplementation(
+      async (snapshot) => snapshot,
+    );
+    vi.spyOn(data, "sourcePins").mockImplementation(gone);
+  }
+
+  app.route("/reviews-api", createReviewApi(store, data));
+  app.get("/reviews-api/:id/commits", (context) => context.json([]));
+  const requested: string[] = [];
+  const inline: ReviewPeekSpec[] = [];
+  const diffs: ReviewDiffViewSpec[] = [];
+
+  const bridge = testReviewBridge(
+    {},
+    {
+      request: async (url, init) => {
+        requested.push(new URL(String(url), "http://localhost").pathname);
+
+        return app.request(url, init);
+      },
+      peeks: {
+        async find() {
+          return { matchCount: 0 };
+        },
+        create: (spec) => {
+          inline.push(spec);
+
+          return {
+            height: 180,
+            setActive() {},
+            setCollapsed() {},
+            async setFindQuery() {
+              return { matchCount: 0 };
+            },
+            revealFindMatch() {},
+            clearActiveFindMatch() {},
+            clearFind() {},
+            onDidChangeHeight: () => ({ dispose() {} }),
+            onDidError: () => ({ dispose() {} }),
+            dispose() {},
+          };
+        },
+      },
+      diffView: {
+        files: async () => [
+          { path: "src/a.ts", status: "modified", additions: 1, deletions: 0 },
+        ],
+        create: (spec) => {
+          diffs.push(spec);
+
+          return {
+            focus() {},
+            onDidError: () => ({ dispose() {} }),
+            dispose() {},
+          };
+        },
+      },
+    },
+  );
+
+  const container = document.createElement("div");
+  document.body.append(container);
+
+  const mounted = {
+    kind: "api" as const,
+    reviewId: review.reviewId,
+    bridge: { ...bridge, setSourceView: () => {} },
+    ...content,
+  };
+
+  // A gone checkout shows its banner and opens no peek.
+  const ready = content.sourceUnavailable
+    ? () => container.textContent?.includes("Local checkout unavailable.")
+    : () => inline.length === 1;
+
+  await act(async () => {
+    canvas = mount(container, mounted);
+  });
+  await act(async () => {
+    await vi.waitFor(() => expect(ready()).toBe(true));
+  });
+
+  const setAvailable = (available: (typeof content)["available"]) =>
+    act(async () => canvas!.update({ ...mounted, available }));
+
+  const button = (label: string) =>
+    [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+      (candidate) =>
+        candidate.textContent === label ||
+        candidate.getAttribute("aria-label") === label,
+    );
+
+  return { container, inline, diffs, requested, button, setAvailable };
+}
+
+it.each([
+  { available: undefined, shown: true },
+  {
+    available: { sourceWindows: false },
+    shown: false,
+  },
+])(
+  "shows the source tree only where source windows are available ($available)",
+  async ({ available, shown }) => {
+    const { button } = await mountPeekReview({ available });
+
+    expect(Boolean(button("Source tree"))).toBe(shown);
+  },
+);
+
+it("keeps Source tree on a remote review whose Source windows are off, disabled with the reason", async () => {
+  const { button } = await mountPeekReview({
+    host: "devbox",
+    available: {
+      sourceWindows: false,
+      reason: "devbox offline.",
+    },
+  });
+
+  expect(button("Source tree")?.disabled).toBe(true);
+  expect(button("Source tree")?.title).toBe("devbox offline.");
+});
+
+it("keeps the open peeks and Diff view when the host's source windows go away and return", async () => {
+  const on = { sourceWindows: true };
+
+  const { inline, diffs, button, setAvailable } = await mountPeekReview({
+    host: "devbox",
+    available: on,
+  });
+
+  await act(async () => button("Diff")!.click());
+  await act(async () => {
+    await vi.waitFor(() => expect(diffs).toHaveLength(1));
+  });
+
+  await setAvailable({ sourceWindows: false });
+  await setAvailable(on);
+
+  expect(inline).toHaveLength(1);
+  expect(diffs).toHaveLength(1);
+});
+
+it.each([
+  { host: undefined, shown: true },
+  { host: "devbox", shown: false },
+])(
+  "shows the share control, and the trace tab only for a laptop review (host $host)",
+  async ({ host }) => {
+    const shown = host === undefined;
+
+    const { button, requested } = await mountPeekReview({
+      host,
+      ...(host && {
+        available: { sourceWindows: false },
+      }),
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(Boolean(button("Trace"))).toBe(shown));
+    });
+    expect(button("Share review")).toBeDefined();
+    expect(requested.some((path) => path.endsWith("/agent-traces"))).toBe(
+      shown,
+    );
+  },
+);
+
+it("hides the share control while the review's checkout is gone", async () => {
+  const { button } = await mountPeekReview({ sourceUnavailable: true });
+
+  expect(button("Share review")).toBeUndefined();
+});

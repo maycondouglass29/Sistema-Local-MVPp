@@ -1,0 +1,1058 @@
+import { AgentLogo } from "@canvas/ui/brand-icons";
+import { focusStyles } from "@canvas/ui/focus";
+import { useTooltip } from "@canvas/ui/tooltip";
+import type { AskHistoryEntry } from "@review/ask/thread-state";
+import * as stylex from "@stylexjs/stylex";
+import {
+  type CSSProperties,
+  type ReactElement,
+  type RefObject,
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { createPortal, flushSync } from "react-dom";
+
+import { resolveAskAnchor } from "./ask-anchor";
+import { useAskHistory } from "./ask-history";
+import { setCssHighlight } from "./css-highlights";
+import { useOptionalReviewPanelStore } from "./review-panel";
+import type { AskPassage } from "./review-panel-model";
+import type { AskOpenOptions, ReviewPanelStore } from "./review-panel-store";
+import { fontSize, leading, radius, space } from "./scale.stylex";
+import { withClass } from "./stylex-props";
+import { tokens } from "./tokens.stylex";
+
+/** The CSS highlight that washes each passage a conversation is about. */
+const ASK_HIGHLIGHT = "ask-thread";
+
+/** Deepens the wash of the passage whose pin or words the pointer is on. */
+const ASK_ACTIVE_HIGHLIGHT = "ask-thread-active";
+
+/** A passage's conversations, and the elements its pin is laid out by. */
+interface AskMark {
+  /** The occurrence's place in the document text. */
+  key: string;
+  quote: string;
+  /** Newest first, like the history. */
+  entries: AskHistoryEntry[];
+  /** Its words, which are washed. */
+  range: Range;
+  /** What its pin is level with: the passage's block. */
+  block: HTMLElement;
+  /** The outermost list or table, which its pin stays clear of. */
+  lane: HTMLElement;
+  /** The review block holding it, by its id: what its pin is anchored to. */
+  anchor: { id: string; element: HTMLElement };
+}
+
+/** The pins level with one line, side by side in reading order. */
+interface PinRow {
+  key: string;
+  marks: AskMark[];
+  /** From the top of the review block they are anchored to, to the pins,
+   * level with their line. */
+  offset: number;
+  /** From that review block's left to the right of their lane. */
+  laneEnd: number;
+}
+
+/** A pin's height: its line, padding and border. */
+const PIN_HEIGHT = 22;
+
+/** Pins the gutter has room for side by side. A row with more shows its
+ * first and folds the rest into a +N chip, which is narrower than a pin. */
+const ROW_PINS = 2;
+
+function fold(row: PinRow) {
+  const shown = row.marks.length > ROW_PINS ? 1 : ROW_PINS;
+
+  return { shown: row.marks.slice(0, shown), folded: row.marks.slice(shown) };
+}
+
+/** Logos a pin shows; its count covers the rest. */
+const PIN_LOGOS = 2;
+
+/** How long an opened row of ticks stays after the pointer leaves it. */
+const CLOSE_DELAY = 150;
+
+/** The +N chip's key in `active`: the pointer on it pairs it with every
+ * passage it folds. */
+const moreKey = (row: PinRow) => `more:${row.key}`;
+
+/** Whether a row would run past the article's edge in its gutter: past the
+ * prose, where the probe stands, or past its lane's wider block. Offsets
+ * ignore the article's scroll and the row's own place. */
+function overflows(
+  article: HTMLElement,
+  probe: HTMLElement,
+  row: HTMLElement,
+  lane: HTMLElement,
+) {
+  const laneEnd =
+    lane.getBoundingClientRect().right -
+    article.getBoundingClientRect().left -
+    article.clientLeft;
+
+  return (
+    Math.max(probe.offsetLeft, laneEnd + GUTTER_GAP) + row.offsetWidth >
+    article.clientWidth
+  );
+}
+
+/** Opens a pin's conversations: the one, or the list of them. Passages
+ * folded together open as one list. */
+function openMarks(
+  panels: ReviewPanelStore | null,
+  marks: readonly AskMark[],
+  options: AskOpenOptions = {},
+) {
+  openAskConversations(
+    panels,
+    marks.flatMap((mark) => mark.entries),
+    marks.map((mark) => mark.quote).join(" · "),
+    marks.length > 1,
+    options,
+  );
+}
+
+/** Opens one conversation, or the list of several. */
+export function openAskConversations(
+  panels: ReviewPanelStore | null,
+  entries: readonly AskHistoryEntry[],
+  quote: string,
+  several = false,
+  options: AskOpenOptions = {},
+) {
+  const [newest] = entries;
+
+  if (!newest) return;
+
+  const passage: AskPassage = {
+    quote,
+    threadIds: entries.map((entry) => entry.id),
+  };
+
+  if (several) passage.several = true;
+
+  panels?.getState().openAskView(
+    entries.length === 1
+      ? {
+          type: "saved",
+          threadId: newest.id,
+          selection: newest.selection,
+          agent: newest.agent,
+        }
+      : { type: "history", passage },
+    options,
+  );
+}
+
+const PASSAGE_BLOCKS =
+  "p, li, blockquote, pre, td, th, dd, figcaption, h1, h2, h3, h4, h5, h6";
+
+/** The outermost list or table a block is in, within the article; else the
+ * block itself. */
+function outermost(block: HTMLElement, article: HTMLElement): HTMLElement {
+  let lane = block;
+
+  for (
+    let container = block.closest<HTMLElement>(CONTAINER_BLOCKS);
+    container && article.contains(container);
+    container =
+      container.parentElement?.closest<HTMLElement>(CONTAINER_BLOCKS) ?? null
+  )
+    lane = container;
+
+  return lane;
+}
+
+const CONTAINER_BLOCKS = "ul, ol, dl, table";
+
+/** Names review blocks as CSS anchors, `id → name`, from a stylesheet of
+ * its own. Pins are anchored only through here, and never by writing onto
+ * the document's elements: a board's blocks belong to its editor, which
+ * takes any change to them for an edit and draws the block afresh, losing
+ * the name and the words a wash was drawn over. */
+function useAnchorNames(
+  article: HTMLElement | null,
+  names: ReadonlyMap<string, string>,
+) {
+  useLayoutEffect(() => {
+    if (!article || !names.size) return;
+    // SAFETY: an element's root node is its document or a shadow root.
+    const root = article.getRootNode() as Document | ShadowRoot;
+    const sheet = new CSSStyleSheet();
+
+    sheet.replaceSync(
+      [...names]
+        .map(
+          ([id, name]) =>
+            `[data-review-node-id="${CSS.escape(id)}"] { anchor-name: ${name}; }`,
+        )
+        .join("\n"),
+    );
+    root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
+
+    return () => {
+      root.adoptedStyleSheets = root.adoptedStyleSheets.filter(
+        (adopted) => adopted !== sheet,
+      );
+    };
+  }, [article, names]);
+}
+
+interface FoundMarks {
+  marks: AskMark[];
+  /** Conversations whose passage changed. */
+  outdated: Set<string>;
+}
+
+/** From a block's top to the middle of its first line, less half a pin. */
+function firstLineOffset(block: HTMLElement) {
+  const style = getComputedStyle(block);
+  const fontSize = parseFloat(style.fontSize);
+
+  const line =
+    style.lineHeight === "normal"
+      ? fontSize * 1.2
+      : parseFloat(style.lineHeight) *
+        (style.lineHeight.endsWith("px") ? 1 : fontSize);
+
+  return (
+    parseFloat(style.borderTopWidth) +
+    parseFloat(style.paddingTop) +
+    (line - PIN_HEIGHT) / 2
+  );
+}
+
+/** From the top of a mark's review block to its pin, centred on the
+ * passage's first line. */
+function offsetOf(mark: AskMark): number {
+  const top = mark.anchor.element.getBoundingClientRect().top;
+  const rects = [...mark.range.getClientRects()];
+
+  // A passage starting where a line wraps has an empty box at the end of
+  // the line before.
+  const filled = rects.filter((rect) => rect.width > 0);
+
+  const line = (filled.length ? filled : rects).reduce<DOMRect | undefined>(
+    (topmost, rect) => (!topmost || rect.top < topmost.top ? rect : topmost),
+    undefined,
+  );
+
+  // A hidden block draws no lines.
+  return line
+    ? line.top - top + line.height / 2 - PIN_HEIGHT / 2
+    : mark.block.getBoundingClientRect().top -
+        top +
+        firstLineOffset(mark.block);
+}
+
+/** Lays out the pins as the document is drawn now: in reading order, which
+ * is also the order Tab reaches them, each beside its passage's own line.
+ * Pins for passages on one line of a block share a row. */
+function layOutRows(marks: readonly AskMark[]): PinRow[] {
+  const placed = marks.map((mark) => ({
+    mark,
+    offset: Math.round(offsetOf(mark)),
+    laneEnd: Math.round(
+      mark.lane.getBoundingClientRect().right -
+        mark.anchor.element.getBoundingClientRect().left,
+    ),
+  }));
+
+  placed.sort(
+    (above, below) =>
+      (above.mark.block === below.mark.block
+        ? 0
+        : above.mark.block.compareDocumentPosition(below.mark.block) &
+            Node.DOCUMENT_POSITION_FOLLOWING
+          ? -1
+          : 1) ||
+      above.mark.range.compareBoundaryPoints(
+        Range.START_TO_START,
+        below.mark.range,
+      ),
+  );
+
+  const rows: PinRow[] = [];
+
+  for (const { mark, offset, laneEnd } of placed) {
+    const row = rows.at(-1);
+
+    // Lines are further apart than half a pin; words in a smaller font on
+    // the same line are not.
+    if (
+      row?.marks[0]!.block === mark.block &&
+      Math.abs(row.offset - offset) < PIN_HEIGHT / 2
+    )
+      row.marks.push(mark);
+    else rows.push({ key: mark.key, marks: [mark], offset, laneEnd });
+  }
+
+  return rows;
+}
+
+function sameRows(before: readonly PinRow[], after: readonly PinRow[]) {
+  return (
+    before.length === after.length &&
+    before.every(
+      (row, index) =>
+        row.offset === after[index]!.offset &&
+        row.laneEnd === after[index]!.laneEnd &&
+        row.marks.length === after[index]!.marks.length &&
+        row.marks.every((mark, at) => mark === after[index]!.marks[at]),
+    )
+  );
+}
+
+/** Finds each asked-about passage in the document by its anchor, washes
+ * it, and names what its pin is laid out by. A passage whose block is
+ * gone, or whose words an edit touched, is outdated. */
+function findMarks(
+  article: HTMLElement,
+  entries: readonly AskHistoryEntry[],
+  board: string | null,
+): FoundMarks {
+  // Conversations about the same words share a mark.
+  const found = new Map<
+    string,
+    { range: Range; anchor: AskMark["anchor"]; entries: AskHistoryEntry[] }
+  >();
+
+  const outdated = new Set<string>();
+
+  for (const entry of entries) {
+    const { target } = entry.selection;
+
+    // Block ids are unique only per board.
+    const anchoredOn = entry.anchor?.board ?? board;
+
+    if (anchoredOn !== board) continue;
+
+    // Only a selection in a review block has a place to mark.
+    if (target.kind !== "text" || !target.anchor) continue;
+    const at = resolveAskAnchor(article, target.anchor);
+
+    if (!at) {
+      outdated.add(entry.id);
+      continue;
+    }
+
+    const key = `${anchoredOn}#${target.anchor.blockId}:${at.start}:${at.end}`;
+    const range = at.range;
+    const mark = found.get(key);
+
+    if (mark) mark.entries.push(entry);
+    else
+      found.set(key, {
+        range,
+        anchor: { id: target.anchor.blockId, element: at.block },
+        entries: [entry],
+      });
+  }
+
+  const marks: AskMark[] = [];
+
+  for (const [key, { range, anchor, entries: asked }] of found) {
+    const start =
+      range.startContainer instanceof Element
+        ? range.startContainer
+        : range.startContainer.parentElement;
+
+    const block = start?.closest<HTMLElement>(PASSAGE_BLOCKS) ?? null;
+
+    if (!block || !article.contains(block)) continue;
+
+    marks.push({
+      key,
+      quote: range.toString().trim().replace(/\s+/gu, " "),
+      entries: asked,
+      range,
+      block,
+      // Pins run in one lane for every kind of block: level with a table
+      // narrower than the prose, and outside a block wider than it.
+      lane: outermost(block, article),
+      anchor,
+    });
+  }
+
+  setCssHighlight(
+    article,
+    ASK_HIGHLIGHT,
+    marks.map(({ range }) => range),
+  );
+
+  return { marks, outdated };
+}
+
+function rowStyle(
+  prefix: string,
+  index: number,
+  names: ReadonlyMap<string, string>,
+  row: PinRow,
+): CSSProperties {
+  const [lead] = row.marks;
+
+  // SAFETY: the `--ask-pin-*` keys are CSS custom properties, which React
+  // forwards to style.setProperty; the CSSProperties typings only omit custom
+  // names.
+  return {
+    "--ask-pin-row": `${prefix}-row-${index}`,
+    "--ask-pin-block": names.get(lead!.anchor.id),
+    "--ask-pin-offset": `${row.offset}px`,
+    "--ask-pin-lane-end": `${row.laneEnd}px`,
+    "--ask-pin-above": `${prefix}-row-${index - 1}`,
+  } as CSSProperties;
+}
+
+/** How far a press may move and still be a click rather than a drag. */
+const CLICK_SLOP = 4;
+
+/** What a click inside the article does itself, rather than open a pin's
+ * conversations: the pins, links and controls. */
+const CLICKABLE =
+  "[data-ask-pins], a, button, input, textarea, select, [role=button]";
+
+/** Whether the pointer is on a mark's words. */
+function under(mark: AskMark, x: number, y: number) {
+  return [...mark.range.getClientRects()].some(
+    (rect) =>
+      x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom,
+  );
+}
+
+/** Marks what each saved conversation asked about, as the margin notes of
+ * the review: the passage is washed and a pin beside it reopens it. The
+ * pointer on either deepens the wash and outlines the pin, pairing them. */
+export function AskThreadMarks({
+  articleRef,
+  revision,
+}: {
+  articleRef: RefObject<HTMLElement | null>;
+  /** The rendered document; a new one is searched again. */
+  revision: string;
+}): ReactElement | null {
+  const history = useAskHistory();
+
+  const entries = history?.entries;
+  const board = history?.board ?? null;
+  const reportOutdated = history?.reportOutdated;
+  const [article, setArticle] = useState<HTMLElement | null>(null);
+
+  const [marks, setMarks] = useState<AskMark[]>([]);
+  const [rows, setRows] = useState<PinRow[]>([]);
+
+  const [active, setActive] = useState<string | null>(null);
+  // The passages a click on their words opened, which stay paired with
+  // their pins until a click elsewhere.
+  const [chosen, choose] = useState<readonly string[]>([]);
+  const panels = useOptionalReviewPanelStore();
+
+  // When the gutter is too narrow for any row, every row rests as a tick;
+  // the pointer or focus on one opens it.
+  const [ticked, setTicked] = useState(false);
+  const [opened, setOpened] = useState<string | null>(null);
+
+  const rowElements = useRef(new Map<string, HTMLElement>());
+
+  const closing = useRef(0);
+
+  useEffect(() => setArticle(articleRef.current), [articleRef, revision]);
+
+  useEffect(() => {
+    if (!article || !entries?.length) {
+      setMarks([]);
+      reportOutdated?.(new Set());
+
+      return;
+    }
+
+    let frame = 0;
+
+    const place = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const found = findMarks(article, entries, board);
+
+        setMarks(found.marks);
+        reportOutdated?.(found.outdated);
+      });
+    };
+
+    place();
+
+    return () => {
+      cancelAnimationFrame(frame);
+      setCssHighlight(article, ASK_HIGHLIGHT, []);
+    };
+  }, [article, entries, board, revision, reportOutdated]);
+
+  // A narrower column can wrap a passage onto another line of its block,
+  // and an edit above it in its review block moves it down, so its pin's
+  // offset is measured again when either resizes, as is its lane's end.
+  // Across the page the pins track the text without this, by their anchors.
+  useLayoutEffect(() => {
+    if (!article || !marks.length) {
+      setRows((before) => (before.length ? [] : before));
+
+      return;
+    }
+
+    let laid: PinRow[] | undefined;
+
+    // Most resizes leave every passage on its line.
+    const layOut = () => {
+      const after = layOutRows(marks);
+
+      if (laid && sameRows(laid, after)) return;
+      laid = after;
+      setRows(after);
+    };
+
+    layOut();
+
+    const resized = new ResizeObserver(layOut);
+
+    for (const element of new Set(
+      marks.flatMap((mark) => [mark.block, mark.lane, mark.anchor.element]),
+    ))
+      resized.observe(element);
+
+    return () => resized.disconnect();
+  }, [article, marks]);
+
+  // The pointer on a passage's words pairs it with its pin.
+  useEffect(() => {
+    if (!article || !marks.length) return;
+    let frame = 0;
+
+    const move = (event: PointerEvent) => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        // Its pins are inside the article too, and pair themselves.
+        if (
+          event.target instanceof Element &&
+          event.target.closest("[data-ask-pins]")
+        )
+          return;
+
+        setActive(
+          marks.find((mark) => under(mark, event.clientX, event.clientY))
+            ?.key ?? null,
+        );
+      });
+    };
+
+    const leave = () => {
+      cancelAnimationFrame(frame);
+      setActive(null);
+    };
+
+    article.addEventListener("pointermove", move);
+    article.addEventListener("pointerleave", leave);
+
+    return () => {
+      cancelAnimationFrame(frame);
+      article.removeEventListener("pointermove", move);
+      article.removeEventListener("pointerleave", leave);
+    };
+  }, [article, marks]);
+
+  // A plain click on a passage's words opens its conversations, as its pin
+  // does, while an editor places its caret there as usual; a click on no
+  // passage lets go of the one opened. A drag, a selection, a modifier, a
+  // second click or the keyboard never opens one, so editing a passage's
+  // words leaves its conversations be. Only listened to: the article's
+  // blocks may belong to an editor.
+  useEffect(() => {
+    if (!article) return;
+    let pressed: { x: number; y: number } | null = null;
+
+    const press = (event: PointerEvent) => {
+      pressed =
+        event.isPrimary && event.button === 0
+          ? { x: event.clientX, y: event.clientY }
+          : null;
+    };
+
+    const click = (event: MouseEvent) => {
+      const from = pressed;
+
+      pressed = null;
+
+      if (
+        !from ||
+        event.button !== 0 ||
+        event.detail !== 1 ||
+        event.shiftKey ||
+        event.altKey ||
+        event.metaKey ||
+        event.ctrlKey ||
+        Math.hypot(event.clientX - from.x, event.clientY - from.y) >
+          CLICK_SLOP ||
+        (event.target instanceof Element && event.target.closest(CLICKABLE)) ||
+        article.ownerDocument.getSelection()?.isCollapsed === false
+      )
+        return;
+
+      const hit = marks.filter((mark) =>
+        under(mark, event.clientX, event.clientY),
+      );
+
+      choose((before) =>
+        before.length || hit.length ? hit.map((mark) => mark.key) : before,
+      );
+      // The caret stays where the click put it.
+      openMarks(panels, hit, { keepFocus: true });
+    };
+
+    article.addEventListener("pointerdown", press);
+    article.addEventListener("click", click);
+
+    return () => {
+      article.removeEventListener("pointerdown", press);
+      article.removeEventListener("click", click);
+    };
+  }, [article, marks, panels]);
+
+  const revealRequest = history?.revealRequest;
+
+  useEffect(() => {
+    if (!article || !revealRequest) return;
+    const target = revealRequest.selection.target;
+
+    if (target?.kind !== "text" || !target.anchor) return;
+    const at = resolveAskAnchor(article, target.anchor);
+    const node = at?.range.startContainer;
+    const element = node instanceof Element ? node : node?.parentElement;
+    element
+      ?.closest(".review-section--collapsed")
+      ?.dispatchEvent(new CustomEvent("review-section-expand"));
+
+    const frame = requestAnimationFrame(() =>
+      element?.scrollIntoView({ block: "center" }),
+    );
+
+    return () => cancelAnimationFrame(frame);
+  }, [article, revealRequest, revision]);
+
+  const historyId =
+    history?.previewId ?? (active || chosen.length ? null : revealRequest?.id);
+
+  const isActive = useCallback(
+    (mark: AskMark) => mark.key === active || chosen.includes(mark.key),
+    [active, chosen],
+  );
+
+  const activeMarks = useMemo(() => {
+    if (historyId)
+      return marks.filter((mark) =>
+        mark.entries.some((entry) => entry.id === historyId),
+      );
+
+    const more = rows.find((row) => moreKey(row) === active);
+
+    if (more) return fold(more).folded;
+
+    // The pointer's passage, else the one a click opened.
+    return marks.filter((mark) =>
+      active ? mark.key === active : chosen.includes(mark.key),
+    );
+  }, [active, chosen, historyId, marks, rows]);
+
+  useEffect(() => {
+    const ranges = activeMarks.flatMap(({ range }) => (range ? [range] : []));
+
+    if (!article || !ranges.length) return;
+    // Over the resting wash.
+    setCssHighlight(article, ASK_ACTIVE_HIGHLIGHT, ranges, 1);
+
+    return () => setCssHighlight(article, ASK_ACTIVE_HIGHLIGHT, []);
+  }, [article, activeMarks]);
+
+  const prefix = `--ask-${useId().replace(/[^a-zA-Z0-9-]/g, "")}`;
+
+  const names = useMemo(() => {
+    const named = new Map<string, string>();
+
+    for (const { anchor } of marks)
+      if (!named.has(anchor.id))
+        named.set(anchor.id, `${prefix}-${named.size}`);
+
+    return named;
+  }, [marks, prefix]);
+
+  useAnchorNames(article, names);
+
+  // A row with no room in the gutter moves inside, where it would cover the
+  // line's end. Then every row rests as a tick in the article's padding, so
+  // one page never mixes pins and ticks. Seen again as the article resizes,
+  // before it paints; the pins keep their places by their anchors meanwhile.
+  const laidRows = useRef(rows);
+  const probe = useRef<HTMLSpanElement>(null);
+
+  const see = useCallback(() => {
+    if (!article || !probe.current) return;
+    const gutter = probe.current;
+
+    setTicked(
+      laidRows.current.some((row) => {
+        const element = rowElements.current.get(row.key);
+
+        return (
+          !!element && overflows(article, gutter, element, row.marks[0]!.lane)
+        );
+      }),
+    );
+  }, [article]);
+
+  useLayoutEffect(() => {
+    laidRows.current = rows;
+
+    const keys = new Set(rows.map((row) => row.key));
+
+    for (const key of rowElements.current.keys())
+      if (!keys.has(key)) rowElements.current.delete(key);
+
+    see();
+  }, [rows, see]);
+
+  // One observer for the article's life: one made while observers report
+  // would miss this round.
+  useLayoutEffect(() => {
+    if (!article) return;
+    const resized = new ResizeObserver(() => flushSync(see));
+
+    resized.observe(article);
+
+    return () => resized.disconnect();
+  }, [article, see]);
+
+  useEffect(() => () => clearTimeout(closing.current), []);
+
+  const layer = useMemo(() => {
+    const open = (key: string) => {
+      clearTimeout(closing.current);
+      setOpened(key);
+    };
+
+    const close = () => {
+      clearTimeout(closing.current);
+      closing.current = window.setTimeout(() => setOpened(null), CLOSE_DELAY);
+    };
+
+    return rows.flatMap((row, index) => {
+      const { shown, folded } = fold(row);
+
+      // The pointer on its words opens a row too.
+      const isOpen =
+        ticked &&
+        (opened === row.key ||
+          active === moreKey(row) ||
+          row.marks.some((mark) => mark.key === active));
+
+      return [
+        <div
+          key={row.key}
+          ref={(element) => {
+            if (element) rowElements.current.set(row.key, element);
+          }}
+          {...stylex.props(
+            styles.row,
+            ticked && styles.rowInside,
+            ticked && !isOpen && styles.rowResting,
+            isOpen && styles.rowOpen,
+          )}
+          style={rowStyle(prefix, index, names, row)}
+          onPointerEnter={ticked ? () => open(row.key) : undefined}
+          onPointerLeave={ticked ? close : undefined}
+          onFocus={ticked ? () => open(row.key) : undefined}
+          onBlur={
+            ticked
+              ? (event) => {
+                  if (!event.currentTarget.contains(event.relatedTarget))
+                    close();
+                }
+              : undefined
+          }
+        >
+          {ticked ? (
+            <button
+              type="button"
+              {...stylex.props(focusStyles.ring, styles.tick)}
+              aria-label={
+                row.marks.length === 1
+                  ? `Show the pin for “${row.marks[0]!.quote.slice(0, 60)}”`
+                  : `Show the ${row.marks.length} pins on this line`
+              }
+              // Into its first pin, shown first so it can take focus.
+              onClick={(event) => {
+                const pins = event.currentTarget.parentElement;
+
+                flushSync(() => open(row.key));
+                pins?.querySelector<HTMLElement>(".ask-mark-pin")?.focus();
+              }}
+            >
+              <span {...stylex.props(styles.tickMark)} />
+            </button>
+          ) : null}
+          {shown.map((mark) => (
+            <AskPin
+              key={mark.key}
+              mark={mark}
+              active={isActive(mark)}
+              onActive={setActive}
+            />
+          ))}
+          {folded.length ? (
+            <AskMore
+              marks={folded}
+              active={active === moreKey(row) || folded.some(isActive)}
+              onActive={(on) => setActive(on ? moreKey(row) : null)}
+            />
+          ) : null}
+        </div>,
+      ];
+    });
+  }, [active, isActive, names, opened, prefix, rows, ticked]);
+
+  if (!article || !marks.length) return null;
+
+  return createPortal(
+    <div
+      {...stylex.props(styles.layer)}
+      data-ask-pins=""
+      data-review-copy-ignore=""
+    >
+      <span ref={probe} {...stylex.props(styles.probe)} />
+      {layer}
+    </div>,
+    article,
+  );
+}
+
+export function truncate(text: string, length: number) {
+  const flat = text.trim().replace(/\s+/gu, " ");
+
+  return flat.length > length ? `${flat.slice(0, length - 1)}…` : flat;
+}
+
+/** A passage's pin: its agents, newest first, and how many conversations. */
+function AskPin({
+  mark,
+  active,
+  onActive,
+}: {
+  mark: AskMark;
+  active: boolean;
+  onActive: (key: string | null) => void;
+}): ReactElement {
+  const panels = useOptionalReviewPanelStore();
+  const [newest] = mark.entries;
+  const count = mark.entries.length;
+  const agents = [...new Set(mark.entries.map((entry) => entry.agent))];
+
+  const label =
+    count === 1
+      ? `Open the conversation about “${mark.quote.slice(0, 60)}”`
+      : `${count} conversations about “${mark.quote.slice(0, 60)}”`;
+
+  const question = newest?.question ?? newest?.title ?? "";
+
+  const tooltip = useTooltip(
+    count === 1
+      ? truncate(question, 120)
+      : `${count} conversations · ${truncate(question, 100)}`,
+    { quick: true },
+  );
+
+  return (
+    <button
+      ref={tooltip}
+      type="button"
+      // Marker class: the pointer on a pin is not on its words.
+      {...withClass("ask-mark-pin", focusStyles.ring, styles.pin)}
+      data-active={active || undefined}
+      aria-label={label}
+      onPointerEnter={() => onActive(mark.key)}
+      onPointerLeave={() => onActive(null)}
+      onFocus={() => onActive(mark.key)}
+      onBlur={() => onActive(null)}
+      onClick={() => openMarks(panels, [mark])}
+    >
+      {/* Newest first; the count says how many conversations there are. */}
+      {agents.slice(0, PIN_LOGOS).map((agent) => (
+        <AgentLogo key={agent} agent={agent} size="inline" />
+      ))}
+      {/* One conversation needs no count. */}
+      {count > 1 ? <span {...stylex.props(styles.count)}>{count}</span> : null}
+    </button>
+  );
+}
+
+/** The passages a row folds past its first pins: how many, and their words
+ * in the tooltip. */
+function AskMore({
+  marks,
+  active,
+  onActive,
+}: {
+  marks: AskMark[];
+  active: boolean;
+  onActive: (on: boolean) => void;
+}): ReactElement {
+  const panels = useOptionalReviewPanelStore();
+  const count = marks.reduce((sum, mark) => sum + mark.entries.length, 0);
+  const quotes = marks.map((mark) => `“${truncate(mark.quote, 40)}”`);
+
+  const tooltip = useTooltip(
+    marks.length === 1
+      ? `${quotes[0]} · ${truncate(marks[0]!.entries[0]?.question ?? marks[0]!.entries[0]?.title ?? "", 80)}`
+      : quotes.join(" · "),
+    {
+      quick: true,
+      detail: count === 1 ? undefined : `${count} conversations`,
+    },
+  );
+
+  return (
+    <button
+      ref={tooltip}
+      type="button"
+      {...stylex.props(focusStyles.ring, styles.pin, styles.more)}
+      data-active={active || undefined}
+      aria-label={`${marks.length} more: ${quotes.join(", ")}`}
+      onPointerEnter={() => onActive(true)}
+      onPointerLeave={() => onActive(false)}
+      onFocus={() => onActive(true)}
+      onBlur={() => onActive(false)}
+      onClick={() => openMarks(panels, marks)}
+    >
+      +{marks.length}
+    </button>
+  );
+}
+
+/** Between the prose, or a wider block beside it, and its pins. */
+const GUTTER_GAP = 10;
+
+/** Where the prose ends. */
+const PROSE_END = `50% + min(100% - 2 * ${tokens.reviewDocumentPaddingInline}, ${tokens.reviewProseMaxWidth}) / 2`;
+
+/** Past the prose, or past a wider block beside it. */
+const GUTTER = `calc(max(${PROSE_END}, anchor(left) + var(--ask-pin-lane-end)) + ${GUTTER_GAP}px)`;
+
+const styles = stylex.create({
+  layer: {
+    display: "contents",
+  },
+  // Beside its passages' line, in the gutter past the prose or a wider
+  // block, below the row above; hidden with a collapsed section.
+  row: {
+    position: "absolute",
+    // Its tick under its pins.
+    zIndex: 0,
+    display: "flex",
+    gap: space.s4,
+    positionAnchor: "var(--ask-pin-block)",
+    anchorName: "var(--ask-pin-row)",
+    top: "max(calc(anchor(top) + var(--ask-pin-offset)), calc(anchor(var(--ask-pin-above) bottom, -99999px) + 4px))",
+    left: GUTTER,
+    positionVisibility: "anchors-visible",
+  },
+  // Where the gutter past the prose starts, to see whether rows fit. Not
+  // anchored: anchored probes beside anchored rows kept Chromium laying the
+  // page out every frame once scrolled, until it crashed.
+  probe: {
+    position: "absolute",
+    top: 0,
+    left: `calc(${PROSE_END} + ${GUTTER_GAP}px)`,
+    width: 0,
+    height: 0,
+    visibility: "hidden",
+    pointerEvents: "none",
+  },
+  // A narrow document has little margin; the pins stay inside it rather
+  // than making the page scroll sideways.
+  rowInside: {
+    left: "auto",
+    right: space.s4,
+  },
+  // Only its tick shows.
+  rowResting: {
+    visibility: "hidden",
+  },
+  // Over the line's end.
+  rowOpen: {
+    filter: `drop-shadow(0 2px 6px ${tokens.shadowColorSoft})`,
+  },
+  // In the article's padding, centred on the line; its hit area reaches the
+  // edge.
+  tick: {
+    position: "absolute",
+    zIndex: -1,
+    top: 0,
+    right: `-${space.s4}`,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    width: "16px",
+    height: `${PIN_HEIGHT}px`,
+    padding: 0,
+    borderWidth: 0,
+    backgroundColor: tokens.transparent,
+    visibility: "visible",
+    cursor: "pointer",
+    borderRadius: radius.control,
+  },
+  tickMark: {
+    width: "3px",
+    height: "14px",
+    borderRadius: radius.hairline,
+    backgroundColor: tokens.accent,
+  },
+  // Quiet at rest, so a much-asked document stays calm; the accent is for
+  // the pin paired with the pointer's passage.
+  pin: {
+    display: "flex",
+    alignItems: "center",
+    gap: space.s4,
+    padding: space.s4,
+    borderWidth: "1px",
+    borderStyle: "solid",
+    borderColor: {
+      default: tokens.ruleSoft,
+      ":is([data-active])": tokens.accent,
+      ":focus-visible": tokens.accent,
+    },
+    borderRadius: radius.control,
+    backgroundColor: {
+      default: tokens.raised,
+      ":is([data-active])": tokens.accentSoft,
+      ":focus-visible": tokens.accentSoft,
+    },
+    color: tokens.ink,
+    fontFamily: tokens.chromeFont,
+    fontSize: fontSize.micro,
+    lineHeight: leading.px14,
+    whiteSpace: "nowrap",
+    cursor: "pointer",
+  },
+  more: {
+    paddingInline: space.s4,
+    color: {
+      default: tokens.inkMuted,
+      ":is([data-active])": tokens.accent,
+      ":focus-visible": tokens.accent,
+    },
+  },
+  count: {
+    paddingRight: space.s2,
+  },
+});

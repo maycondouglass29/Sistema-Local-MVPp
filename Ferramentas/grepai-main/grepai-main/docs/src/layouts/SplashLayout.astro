@@ -1,0 +1,27 @@
+---
+import BaseLayout from './BaseLayout.astro';
+import Header from '../components/global/Header.astro';
+import Footer from '../components/global/Footer.astro';
+import CopyCodeButton from '../components/global/CopyCodeButton.astro';
+
+interface Props {
+  title: string;
+  description?: string;
+  software?: boolean;
+}
+
+const { title, description, software = false } = Astro.props;
+---
+
+<BaseLayout title={title} description={description} software={software}>
+  <Header />
+
+  <main class="flex-1">
+    <slot />
+  </main>
+
+  <Footer />
+
+  <!-- Copy code button functionality -->
+  <CopyCodeButton />
+</BaseLayout>

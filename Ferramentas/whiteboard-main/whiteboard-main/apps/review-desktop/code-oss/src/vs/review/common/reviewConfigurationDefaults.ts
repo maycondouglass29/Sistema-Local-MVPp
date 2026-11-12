@@ -1,0 +1,192 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) dev.fast. All rights reserved.
+ *  Licensed under the MIT License. See LICENSE in the repository root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/**
+ * Review's configuration data: setting keys and default values, with no imports
+ * and no side effects.
+ *
+ * This module is deliberately import-free. `vs/review/node/reviewUserConfigImport.ts`
+ * reads these keys from the Electron main process, which `src/main.ts` reaches
+ * before `startup()` calls `bootstrapESM()` — the step that installs
+ * `globalThis._VSCODE_NLS_MESSAGES`. Anything imported here is evaluated inside
+ * that pre-bootstrap window, where a packaged build's mangled `localize(2488, null)`
+ * throws `!!! NLS MISSING: 2488 !!!` into a modal, before any window or log exists.
+ *
+ * Registration lives in `reviewConfiguration.ts`, which imports this file and owns
+ * the configuration-registry calls. Never add an import here, and never re-export
+ * these values from `reviewConfiguration.ts` — a re-export would put the
+ * configuration registry back on the main process's import path.
+ *
+ * Enforced by `scripts/main-bootstrap-imports.test.mjs`.
+ */
+
+export const REVIEW_KEYMAP_SETTING = 'review.keymap';
+export const REVIEW_TELEMETRY_SETTING = 'review.telemetry.enabled';
+/** Unregistered: settings.json only. */
+export const REVIEW_SERVICE_URL_SETTING = 'review.serviceUrl';
+export const REVIEW_SOFTWARE_MAP_SETTING = 'review.experimental.softwareMap.enabled';
+/** Code OSS's own setting, registered in `update.config.contribution.ts`. */
+export const REVIEW_SHOW_RELEASE_NOTES_SETTING = 'update.showReleaseNotes';
+export const REVIEW_UPDATE_PILL_SETTING = 'review.update.showPill';
+export const REVIEW_REMOTE_HOSTS_SETTING = 'review.remote.hosts';
+export const REVIEW_REMOTE_INSTALL_SETTING = 'review.remote.install';
+export const REVIEW_REMOTE_INSTALL_MODES = ['ask', 'always', 'never'] as const;
+export const REVIEW_KEYMAPS = ['none', 'vim', 'emacs', 'sublime'] as const;
+export type ReviewKeymap = typeof REVIEW_KEYMAPS[number];
+export const REVIEW_OPEN_FILES_IN_SETTING = 'review.openFilesIn';
+export const REVIEW_OPEN_FILES_IN_CHOICES = ['whiteboard', 'vscode', 'cursor', 'zed', 'intellij', 'application'] as const;
+export const REVIEW_OPEN_FILES_IN_APPLICATION_SETTING = 'review.openFilesInApplication';
+export const REVIEW_READY_NOTIFICATION_SETTING = 'review.notifications.reviewReady';
+export const REVIEW_READY_NOTIFICATION_CHOICES = ['notificationAndBadge', 'notification', 'off'] as const;
+export const REVIEW_DIAGRAM_FULLSCREEN_ON_CLICK_SETTING = 'review.diagrams.fullscreenOnClick';
+export const REVIEW_DOCUMENT_WIDTH_SETTING = 'review.documentWidth';
+export const REVIEW_DIFF_COLOR_THEME_SETTING = 'review.diffColorTheme';
+export const REVIEW_INLINE_LINE_NUMBERS_SETTING = 'review.inlineDiffs.showLineNumbers';
+export const REVIEW_PEEK_SIDE_BY_SIDE_SETTING = 'review.peeks.renderSideBySide';
+export const REVIEW_DOCUMENT_WIDTH_CHOICES = ['standard', 'wide', 'full'] as const;
+export const REVIEW_DOCUMENT_FONT_SIZE_SETTING = 'review.document.fontSize';
+export const REVIEW_DOCUMENT_FONT_SIZE_BASE = 15;
+export const REVIEW_READING_FONT_SETTING = 'review.readingFont';
+export const REVIEW_READING_FONTS = ['serif', 'sans'] as const;
+export const REVIEW_READING_FONT_FAMILY_SETTING = 'review.readingFontFamily';
+export const EDITOR_FONT_SIZE_SETTING = 'editor.fontSize';
+export const EDITOR_FONT_FAMILY_SETTING = 'editor.fontFamily';
+export const EDITOR_FONT_LIGATURES_SETTING = 'editor.fontLigatures';
+export const DIFF_EDITOR_FONT_SIZE_SETTING = 'diffEditor.fontSize';
+export const DIFF_EDITOR_WORD_WRAP_SETTING = 'diffEditor.wordWrap';
+export const DIFF_EDITOR_IGNORE_TRIM_WHITESPACE_SETTING = 'diffEditor.ignoreTrimWhitespace';
+
+export const reviewConfigurationDefaults = {
+	[REVIEW_SOFTWARE_MAP_SETTING]: false,
+	[REVIEW_REMOTE_HOSTS_SETTING]: [],
+	[REVIEW_REMOTE_INSTALL_SETTING]: 'ask',
+	[REVIEW_TELEMETRY_SETTING]: true,
+	'telemetry.telemetryLevel': 'off',
+	'telemetry.enableTelemetry': false,
+	'telemetry.enableCrashReporter': false,
+	'telemetry.editStats.enabled': false,
+	'security.workspace.trust.enabled': false,
+	'js/ts.experimental.useTsgo': true,
+	'typescript.experimental.useTsgo': true,
+	// Review files are read-only: a squiggle names an error the reader cannot fix.
+	'problems.visibility': false,
+	'workbench.enableExperiments': false,
+	'workbench.commandPalette.experimental.enableNaturalLanguageSearch': false,
+	'workbench.settings.enableNaturalLanguageSearch': false,
+	'window.autoDetectColorScheme': true,
+	'workbench.colorTheme': 'Review Dark',
+	'workbench.preferredDarkColorTheme': 'Review Dark',
+	'workbench.preferredLightColorTheme': 'Review Light',
+	'workbench.startupEditor': 'none',
+	'workbench.activityBar.location': 'hidden',
+	'workbench.statusBar.visible': false,
+	'window.title': 'Whiteboard',
+	'window.commandCenter': false,
+	'workbench.navigationControl.enabled': true,
+	'window.menuBarVisibility': 'hidden',
+	'workbench.editor.showTabs': 'none',
+	'workbench.editor.editorActionsLocation': 'hidden',
+	// Reduce tab widths when the row fills. The native tab control truncates the
+	// labels first. It keeps horizontal scrolling after tabs reach their minimum.
+	'workbench.editor.tabSizing': 'shrink',
+	// Keep wheel, trackpad, keyboard, and active-tab scrolling. Hide only the
+	// scrollbar, which would otherwise sit across the bottom of the pill row.
+	'workbench.editor.titleScrollbarVisibility': 'hidden',
+	// Home is the only sticky editor in Review. "compact" makes a sticky tab show
+	// its icon alone, so the Home pill lost its name. "normal" shows the home
+	// icon and the word "Home".
+	'workbench.editor.pinnedTabSizing': 'normal',
+	// A sticky tab shows an unpin button in place of its close button. Home is
+	// always sticky and the reader cannot unpin it, so the button is dead chrome.
+	'workbench.editor.tabActionUnpinVisibility': false,
+	'workbench.layoutControl.enabled': false,
+	// Diffs and code peeks are Monaco editors, and Monaco takes its font from
+	// this setting rather than from CSS. Geist Mono is bundled with the canvas
+	// stylesheet (its @font-face rules are hoisted out of the canvas scope), so
+	// the editors share the chrome and code face of the whiteboard design. The
+	// tail is Monaco's own macOS default stack.
+	'editor.fontFamily': '"Geist Mono", Menlo, Monaco, "Courier New", monospace',
+	// Matches the canvas's code blocks. Listing it here also keeps the
+	// first-run import from carrying over a VS Code size; Settings exposes it
+	// instead.
+	[EDITOR_FONT_SIZE_SETTING]: 13,
+	[DIFF_EDITOR_FONT_SIZE_SETTING]: 12,
+	'editor.minimap.enabled': false,
+	// A 10px lane on both axes, as in the canvas; review.css insets the slider
+	// to the same 6px pill.
+	'editor.scrollbar.verticalScrollbarSize': 10,
+	'editor.scrollbar.horizontalScrollbarSize': 10,
+	'diffEditor.renderIndicators': false,
+	'breadcrumbs.enabled': false,
+	'git.enabled': false,
+	// Retain read-only protection when opening a legacy Review-owned checkout.
+	// New review sources use immutable virtual documents; LSP targets are local files.
+	'files.readonlyInclude': { '/**/.git/dev-fast/worktrees/**': true },
+	// Keep read-only badges from crowding Review's compact file tabs.
+	'workbench.editor.decorations.badges': false,
+	'chat.disableAIFeatures': true,
+	'extensions.ignoreRecommendations': true,
+	'workbench.tips.enabled': false
+} as const;
+
+/**
+ * Defaults that keep the curated built-in extensions quiet.
+ *
+ * Review ships no marketplace, so an extension that prompts to install or update
+ * something offers the reader a dead end. Most keys here close one such prompt.
+ * Keep this aligned with the curated groups in
+ * `scripts/curated-extensions.manifest.mjs`, whose contract test is
+ * `scripts/curated-extensions.test.mjs`.
+ */
+export const curatedExtensionConfigurationDefaults = {
+	// Otherwise ty runs any `ty` on PATH instead of its bundled build.
+	'ty.importStrategy': 'useBundled',
+
+	// golang.go asks users to fill in a survey on a timer.
+	'go.survey.prompt': false,
+	// Prompts to `go install` newer tools against a toolchain Review does not ship.
+	'go.toolsManagement.checkForUpdates': 'off',
+	// These run the tests or offer to scan the module.
+	'go.enableCodeLens': { runtest: false },
+	'go.diagnostic.vulncheck': 'Off',
+
+	// "This file is not linked to a Cargo project" — routine when the review is
+	// scoped to a subdirectory of a workspace.
+	'rust-analyzer.showUnlinkedFileNotification': false,
+	'rust-analyzer.notifications.cargoTomlNotFound': false,
+	'rust-analyzer.showRequestFailedErrorNotification': false,
+	// These build the checkout. A review only needs navigation.
+	'rust-analyzer.checkOnSave': false,
+	'rust-analyzer.lens.run.enable': false,
+	'rust-analyzer.lens.debug.enable': false,
+	// These run the checkout's build scripts and proc macros; proc macros imply build scripts.
+	'rust-analyzer.cargo.buildScripts.enable': false,
+	'rust-analyzer.procMacro.enable': false,
+
+	// The Swift extension can offer to install Swiftly. Review uses the Swift
+	// toolchain that the user installed and made available on the shell PATH.
+	'swift.disableSwiftlyInstallPrompt': true,
+	// These write files into the checkout or build the package.
+	'swift.autoGenerateLaunchConfigurations': false,
+	'swift.showTestCodeLenses': false,
+
+	// The .NET support extension must not send its own telemetry or expose AI
+	// tools. C# uses the system .NET SDK that Review resolves from the shell PATH.
+	'dotnetAcquisitionExtension.enableTelemetry': false,
+	'dotnetAcquisitionExtension.enableLanguageModelTools': false,
+	// These download packages or build the project.
+	'dotnet.projects.enableAutomaticRestore': false,
+	'csharp.suppressDotnetRestoreNotification': true,
+	'dotnet.codeLens.enableTestsCodeLens': false
+
+	// vscodevim.vim and tuttieee.emacs-mcx contribute no prompts.
+	// ms-vscode.sublime-keybindings asks once, on first activation, whether to
+	// import Sublime Text settings. It has no setting to turn that off.
+} as const;
+
+export const reviewAgentsWindowDefaultOverrides = {
+	'window.title': reviewConfigurationDefaults['window.title'],
+	'workbench.navigationControl.enabled': reviewConfigurationDefaults['workbench.navigationControl.enabled'],
+} as const;

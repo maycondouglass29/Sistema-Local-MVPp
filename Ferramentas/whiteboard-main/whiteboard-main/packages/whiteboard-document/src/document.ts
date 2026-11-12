@@ -1,0 +1,1264 @@
+import {
+  type JsonValue,
+  isJsonArray,
+  isJsonObject,
+  isStringValue,
+} from "@dev.fast/json";
+import { z } from "zod";
+
+import { animationCode } from "./blocks/animation.js";
+import {
+  type FlowDiagramEdge,
+  type FlowDiagramNode,
+  flowEdgeSchema,
+  flowNodeInsertSchema,
+  flowNodeSchema,
+} from "./blocks/flow_diagram.js";
+import {
+  type Block,
+  type BlockType,
+  blockKindSchemas,
+  blockSchema,
+  blocks,
+  writableBlockTypes,
+} from "./blocks/index.js";
+import { type Step, stepSchema, stepSources } from "./blocks/sequence.js";
+import type { Lens } from "./diff-lenses.js";
+import { ReviewInputError } from "./input-error.js";
+import {
+  type Anchor,
+  type LensSource,
+  commitLinkTarget,
+  parseAnchor,
+  selectionProblem,
+  sourceAnchors,
+} from "./lens-selection.js";
+import {
+  type MarkdownNode,
+  linkDestinations,
+  markdownNodes,
+  markdownText,
+  parseMarkdown,
+  rewriteLinkDestinations,
+} from "./markdown.js";
+import {
+  type FileLineRange,
+  type SourcePins,
+  fileLineRangeSchema,
+  sourcePinsSchema,
+} from "./source.js";
+
+export { ReviewInputError } from "./input-error.js";
+
+export { type FileLineRange, type SourcePins, fileLineRangeSchema };
+
+export {
+  type Block,
+  type BlockType,
+  blockSchema,
+  blocks,
+  checkReferences,
+  componentReference,
+  documentAdvice,
+  writableBlockTypes,
+} from "./blocks/index.js";
+
+export { type Frame, frameSchema } from "./blocks/call_stack_diff.js";
+
+export {
+  type DatabaseActor,
+  type DatabaseField,
+  type DatabaseLensBlock,
+  type DatabaseOperation,
+  type DatabaseStore,
+  databaseActorSchema,
+  databaseLensSchema,
+  fieldSchema,
+  operationSchema,
+  storeSchema,
+} from "./blocks/database_lens.js";
+
+export {
+  type SequenceBlock,
+  type Step,
+  sequenceSchema,
+  stepSchema,
+  stepSources,
+} from "./blocks/sequence.js";
+
+const text = z.string();
+
+const label = text.trim().min(1);
+
+export const pinsSchema = z.strictObject({
+  repositoryId: label,
+  base: label,
+  head: label,
+});
+
+/** Source identity retained internally for a saved worktree generation. */
+/** worktreeRevision is a refresh token, never an address for stored source. */
+export type Pins = z.infer<typeof pinsSchema> & { worktreeRevision?: string };
+
+export { sourcePinsSchema };
+
+/** The pins one source reference reads at: its own when it names them,
+ * otherwise its document's. A reference with base-less pins reads base at
+ * head, like a commits target without a base. */
+export function anchorPins(
+  source: { pins?: SourcePins },
+  documentPins: Pins | undefined,
+): Pins {
+  if (source.pins)
+    return {
+      repositoryId: source.pins.repositoryId,
+      base: source.pins.base ?? source.pins.head,
+      head: source.pins.head,
+    };
+
+  if (!documentPins)
+    throw new ReviewInputError(
+      "This source names no repository or commit, and the document has no pins.",
+    );
+
+  return documentPins;
+}
+
+/** Distinct explicit pins named by a document's references, for validation. */
+export function explicitPins(references: { source: { pins?: SourcePins } }[]) {
+  const seen = new Map<string, Pins>();
+
+  for (const { source } of references)
+    if (source.pins) {
+      const pins = anchorPins(source, undefined);
+      seen.set(JSON.stringify(pins), pins);
+    }
+
+  return [...seen.values()];
+}
+
+/** Every repository a document's references can read by their own pins,
+ * found without parsing Markdown: a Markdown link reads at its block's pins. */
+export function pinnedRepositoryIds(document: Block[]): Set<string> {
+  const ids = new Set<string>();
+
+  for (const element of elements(document))
+    if (element.type === "markdown" && element.pins)
+      ids.add(element.pins.repositoryId);
+
+  for (const { source } of documentReferences(document, {
+    tolerant: true,
+    markdown: false,
+  }))
+    if (source.pins) ids.add(source.pins.repositoryId);
+
+  return ids;
+}
+
+const targets = <Repository extends Record<string, z.ZodType>>(
+  repository: Repository,
+) =>
+  z.discriminatedUnion("kind", [
+    /** The project of the repository, no change: a plan. */
+    z.strictObject({
+      kind: z.literal("project"),
+      ...repository,
+    }),
+    z.strictObject({
+      kind: z.literal("worktree"),
+      ...repository,
+      base: label.optional(),
+    }),
+    z.strictObject({
+      kind: z.literal("commits"),
+      ...repository,
+      head: label,
+      base: label.optional(),
+    }),
+  ]);
+
+export const reviewTargetSchema = targets({ repositoryId: label });
+
+/** Targets as agents write them: a checkout path instead of a repository id,
+ * plus a PR by URL or number. */
+export const pathTargetSchema = z.discriminatedUnion("kind", [
+  ...targets({ repositoryPath: label }).options,
+  z.strictObject({
+    kind: z.literal("pullRequest"),
+    repositoryPath: label,
+    pullRequest: z.union([label, z.number().int().positive()]),
+  }),
+]);
+
+export type ReviewTarget = z.infer<typeof reviewTargetSchema>;
+
+/** Everything with an id: blocks, and the units diagrams are drawn from. */
+export type Element = Block | Step | FlowDiagramNode | FlowDiagramEdge;
+
+/** A diagram unit: addressed on its own, but only ever inside its diagram. */
+export type Unit = Step | FlowDiagramNode | FlowDiagramEdge;
+
+const unitTypes = new Set(["step", "flow_node", "flow_edge"]);
+
+export const isUnit = (element: Element): element is Unit =>
+  unitTypes.has(element.type);
+
+/** The reference id of a code peek an animation or clip names: the canvas
+ * finds the peek's resolved anchor by it. */
+export const animationCodeId = (blockId: string, name: string) =>
+  `${blockId}:code:${name}`;
+
+/** Rewrites old review-source: and review-trace: links to their whiteboard: form. */
+export function canonicalLink(href: string): string {
+  return href.replace(
+    /^review-(source|trace):/i,
+    (_, kind: string) => `whiteboard:${kind.toLowerCase()}/`,
+  );
+}
+
+/** Markdown link destinations and definitions that begin with `target`, a
+ * regex source; the match's first group is what comes before it. */
+const linkDestination = (target: string) =>
+  new RegExp(String.raw`(\]\(\s*<?|^\s*\[[^\]\n]+\]:\s*<?)` + target, "gim");
+
+function rewriteMarkdown<T>(
+  value: T,
+  rewrite: (markdown: string) => string,
+): T {
+  const visit = (node: JsonValue) => {
+    if (isJsonArray(node)) node.forEach(visit);
+    else if (isJsonObject(node))
+      for (const [key, field] of Object.entries(node))
+        if (key === "markdown" && isStringValue(field)) {
+          const rewritten = rewrite(field);
+
+          if (rewritten !== field) node[key] = rewritten;
+        } else visit(field);
+  };
+
+  // SAFETY: documents and edits are JSON; only Markdown text changes.
+  visit(value as JsonValue);
+
+  return value;
+}
+
+const retiredLinks = linkDestination("review-(source|trace):");
+
+/** Rewrites old link prefixes in link destinations only, not code. */
+export function respellLinks(markdown: string): string {
+  if (!/review-(source|trace):/i.test(markdown)) return markdown;
+
+  return rewriteLinkDestinations(markdown, (span) =>
+    span.replace(
+      retiredLinks,
+      (_, before: string, kind: string) =>
+        `${before}whiteboard:${kind.toLowerCase()}/`,
+    ),
+  );
+}
+
+/** Every Markdown text in `document` with its links spelled the current
+ * way. */
+export function respellDocumentLinks<T>(document: T): T {
+  return rewriteMarkdown(document, respellLinks);
+}
+
+export function respellEditLinks(edit: Edit): Edit {
+  return rewriteMarkdown(edit, respellLinks);
+}
+
+/** Names a block from outside its board. Block ids are unique only within a board. */
+export type BlockRef = { board: string; block: string };
+
+export type BoardRef = BlockRef | { board: string; block?: undefined };
+
+/** Parses whiteboard:board/<id> or whiteboard:board/<id>#<blockId>. */
+export function boardLink(href: string): BoardRef | undefined {
+  const match = /^whiteboard:board\/([^#/]+)(?:#(.+))?$/.exec(href);
+
+  if (!match) return undefined;
+
+  try {
+    const board = decodeURIComponent(match[1]!);
+
+    return match[2] === undefined
+      ? { board }
+      : { board, block: decodeURIComponent(match[2]) };
+  } catch {
+    return undefined;
+  }
+}
+
+/** A link from a block to a board or one of its blocks. */
+export interface BoardLinkRef {
+  from: BlockRef;
+  to: BoardRef;
+}
+
+const parsedBlocks = new WeakMap<
+  object,
+  { markdown: string; nodes: MarkdownNode[] }
+>();
+
+/** Parsed once per text; a save reads links, sources and resources from
+ * it. */
+function blockNodes(block: { markdown: string }): MarkdownNode[] {
+  const cached = parsedBlocks.get(block);
+
+  if (cached?.markdown === block.markdown) return cached.nodes;
+
+  const nodes = [...markdownNodes(parseMarkdown(block.markdown))];
+
+  parsedBlocks.set(block, { markdown: block.markdown, nodes });
+
+  return nodes;
+}
+
+/** Every board link in a document. Malformed links are skipped; writes reject them. */
+export function boardLinks(board: string, document: Block[]): BoardLinkRef[] {
+  return elements(document).flatMap((element) =>
+    element.type === "markdown"
+      ? blockNodes(element).flatMap((node) => {
+          const to =
+            node.type === "link" ? boardLink(node.url ?? "") : undefined;
+
+          return to ? [{ from: { board, block: element.id! }, to }] : [];
+        })
+      : [],
+  );
+}
+
+/** Inline trace quotes keep paragraph/list layout while using retained resources. */
+export function traceQuoteLink(
+  href: string,
+): { traceId: string; eventId: string } | undefined {
+  const match = /^whiteboard:trace\/([^#]+)#(.+)$/.exec(canonicalLink(href));
+
+  return match
+    ? {
+        traceId: decodeURIComponent(match[1]!),
+        eventId: decodeURIComponent(match[2]!),
+      }
+    : undefined;
+}
+
+export function resourceReference(
+  block: Block,
+): { id: string; kind: "image" | "trace" | "map" } | undefined {
+  switch (block.type) {
+    case "image":
+      return { id: block.assetId, kind: "image" };
+    case "trace_quote":
+      return { id: block.traceId, kind: "trace" };
+    case "software_map":
+      return { id: block.mapVersionId, kind: "map" };
+    default:
+      return undefined;
+  }
+}
+
+export function resourceReferences(document: Block[]): Block[] {
+  return elements(document).flatMap((block): Block[] => {
+    if (block.type !== "markdown")
+      return block.type === "image" ||
+        block.type === "trace_quote" ||
+        block.type === "software_map"
+        ? [block]
+        : [];
+
+    return blockNodes(block).flatMap((node): Block[] => {
+      if (
+        node.type !== "link" ||
+        !canonicalLink(node.url ?? "").startsWith("whiteboard:trace/")
+      )
+        return [];
+      const quote = traceQuoteLink(node.url ?? "");
+
+      if (!quote) throw new ReviewInputError("Invalid trace quote link.");
+
+      return [{ type: "trace_quote", ...quote, text: markdownText(node) }];
+    });
+  });
+}
+
+/**
+ * Source-bearing items share their owning element's stable identity.
+ * `tolerant` skips malformed Markdown source links instead of rejecting, for
+ * content that is already stored.
+ */
+function documentReferences(
+  document: Block[],
+  {
+    tolerant = false,
+    markdown = true,
+    repositoryId,
+  }: {
+    tolerant?: boolean;
+    markdown?: boolean;
+    /** The board's repository, which commit links read from. */
+    repositoryId?: string;
+  } = {},
+): {
+  id: string;
+  source: LensSource;
+  label?: string;
+  peek?: boolean;
+}[] {
+  const reject = (message: string): [] => {
+    if (tolerant) return [];
+    throw new ReviewInputError(message);
+  };
+
+  type Reference = {
+    id: string;
+    source: LensSource;
+    label?: string;
+    peek?: boolean;
+  };
+
+  // An anchor reads at its holder's pins, else its block's.
+  const select = (anchor: Anchor, pins?: SourcePins): LensSource[] => {
+    const parsed = parseAnchor(anchor);
+
+    if (!parsed) return reject(`Not a source anchor: ${anchor}`);
+    const source = pins ? { ...parsed, pins } : parsed;
+    const problem = selectionProblem(source);
+
+    return problem ? reject(problem) : [source];
+  };
+
+  return elements(document).flatMap<Reference>((element) => {
+    if (element.type === "markdown" && !markdown) return [];
+
+    if (element.type === "markdown")
+      return blockNodes(element).flatMap((node) => {
+        if (node.type !== "link") return [];
+        const href = canonicalLink(node.url ?? "");
+
+        if (!href.startsWith("whiteboard:source/")) {
+          // Trace links are checked by resourceReferences.
+          if (href.startsWith("whiteboard:trace/")) return [];
+
+          // Board links are checked against the store on write.
+          if (href.startsWith("whiteboard:board/"))
+            return boardLink(href)
+              ? []
+              : reject(
+                  `Use whiteboard:board/<sessionId> or whiteboard:board/<sessionId>#<blockId> to link a board, in block ${element.id}.`,
+                );
+
+          if (/^(?:https?:\/\/|mailto:|#)/i.test(href)) return [];
+
+          return reject(
+            `Unsupported Markdown link ${JSON.stringify(href)} in block ${element.id}. Use [label](whiteboard:source/head/path#L10-L24) or whiteboard:source/base/path#L10-L24 for repository files, whiteboard:source/diff/path#L84-R90 across sides, or whiteboard:source/<commit>/path#L10-L24 at a commit of the board's repository, with a repository-relative path and verified line numbers. Link another board as whiteboard:board/<sessionId>, or one of its blocks as whiteboard:board/<sessionId>#<blockId>. External links must use https://, http://, or mailto:; document anchors use #heading.`,
+          );
+        }
+
+        let target: string;
+
+        try {
+          target = decodeURIComponent(href.slice("whiteboard:source/".length));
+        } catch {
+          return reject("Invalid URL encoding in source link.");
+        }
+
+        // A commit of the board's repository: the commit is the link's pins.
+        const commit = commitLinkTarget(target);
+
+        if (commit)
+          return repositoryId
+            ? select(commit.anchor, {
+                repositoryId,
+                head: commit.commit,
+              }).map((source) => ({
+                id: `${element.id}:${node.url}`,
+                source,
+              }))
+            : reject(
+                `A commit link names a commit of the board's repository, and this board has none, in block ${element.id}.`,
+              );
+
+        // Links share the anchor grammar blocks use.
+        const anchor = target.replace(/^(head|base|diff)\//i, (side) =>
+          side.toLowerCase(),
+        );
+
+        if (!parseAnchor(anchor))
+          return reject(
+            "Use whiteboard:source/head/path#L10-L24 (or base, diff/path#L84-R90 across sides, or <commit>/path#L10-L24 at a commit of the board's repository) for a source link.",
+          );
+
+        return select(anchor, element.pins).map((source) => ({
+          id: `${element.id}:${node.url}`,
+          source,
+        }));
+      });
+
+    if (element.type === "code_peek")
+      return select(element.source, element.pins).map((source) => ({
+        id: element.id!,
+        source,
+        label: element.caption,
+        peek: true,
+      }));
+
+    // A step, frame and operation render the range as a peek, so a
+    // whitespace-only range is an authoring mistake for each of them; prose
+    // links and context sources only need the range to exist.
+    // Each of a step's ranges is its own reference, so a stale one marks only
+    // itself. The first keeps the step's id, as a single source always had.
+    if (element.type === "sequence")
+      return element.steps.flatMap((step) =>
+        stepSources(step).flatMap((anchor, index) =>
+          select(anchor, step.pins ?? element.pins).map((source) => ({
+            id: index ? `${step.id}:source:${index}` : step.id!,
+            source,
+            label: step.label,
+            peek: true,
+          })),
+        ),
+      );
+
+    if (element.type === "flow_diagram")
+      return element.nodes.flatMap((node) =>
+        node.attachments.flatMap((attachment, index) =>
+          attachment.sources.flatMap((anchor, sourceIndex) =>
+            select(anchor, attachment.pins ?? element.pins).map((source) => ({
+              id: `${element.id}:${node.key}:${index}:${sourceIndex}`,
+              source,
+              label: attachment.label,
+              peek: true,
+            })),
+          ),
+        ),
+      );
+
+    if (element.type === "animation" || element.type === "clip")
+      return Object.entries(element.code).flatMap(([name, entry]) => {
+        const code = animationCode(entry);
+
+        return select(code.source, element.pins).map((source) => ({
+          id: animationCodeId(element.id!, name),
+          source,
+          label: code.label ?? name,
+          peek: true,
+        }));
+      });
+
+    if (element.type === "call_stack_diff")
+      return [...element.base, ...element.head].flatMap((frame) => {
+        const pins = frame.pins ?? element.pins;
+
+        return [
+          ...select(frame.source, pins).map((source) => ({
+            id: frame.id!,
+            source,
+            label: frame.label,
+            peek: true,
+          })),
+          ...(frame.contextSources ?? []).flatMap((anchor, index) =>
+            select(anchor, pins).map((source) => ({
+              id: `${frame.id}:context:${index}`,
+              source,
+            })),
+          ),
+          ...(frame.callSite
+            ? select(frame.callSite, pins).map((source) => ({
+                id: `${frame.id}:call-site`,
+                source,
+                label: frame.label,
+                peek: true,
+              }))
+            : []),
+        ];
+      });
+
+    if (element.type === "database_lens")
+      return [
+        ...Object.entries(element.stores).flatMap(([storeKey, store]) =>
+          Object.entries(store.collections).flatMap(([key, collection]) =>
+            collection.source
+              ? select(collection.source, element.pins).map((source) => ({
+                  id: `${element.id}:schema:${storeKey}:${key}`,
+                  source,
+                  label: collection.label,
+                  peek: true,
+                }))
+              : [],
+          ),
+        ),
+        ...element.useCases.flatMap((useCase) =>
+          useCase.operations.flatMap((operation) =>
+            select(operation.source, operation.pins ?? element.pins).map(
+              (source) => ({
+                id: operation.id!,
+                source,
+                label: operation.label,
+                peek: true,
+              }),
+            ),
+          ),
+        ),
+      ];
+
+    return [];
+  });
+}
+
+/** All authored attachments, including code peeks, select the aligned diff. */
+export const selectionReferences = documentReferences;
+
+const commitLinkDestination = linkDestination(
+  String.raw`whiteboard:source\/([0-9a-f]{7,40})\/`,
+);
+
+const hasCommitLink = /whiteboard:source\//i;
+
+/** Commits named by commit links, not by code samples. */
+export function commitLinkCommits(document: Block[]): string[] {
+  const commits = new Set<string>();
+
+  for (const element of elements(document))
+    if (element.type === "markdown" && hasCommitLink.test(element.markdown))
+      for (const { from, to } of linkDestinations(blockNodes(element)))
+        for (const match of element.markdown
+          .slice(from, to)
+          .matchAll(commitLinkDestination))
+          commits.add(match[2]!);
+
+  return [...commits];
+}
+
+/** Rewrites the commits Markdown commit links name, as a short commit
+ * becomes the full one on save. */
+export function respellCommitLinks(
+  document: Block[],
+  commits: ReadonlyMap<string, string>,
+): Block[] {
+  return rewriteMarkdown(document, (markdown) =>
+    hasCommitLink.test(markdown)
+      ? rewriteLinkDestinations(markdown, (span) =>
+          span.replace(
+            commitLinkDestination,
+            (_, before: string, commit: string) =>
+              `${before}whiteboard:source/${commits.get(commit) ?? commit}/`,
+          ),
+        )
+      : markdown,
+  );
+}
+
+/** Blocks that carry pins of their own for the references in them. */
+const pinnedBlockTypes = new Set([
+  "markdown",
+  "code_peek",
+  "sequence",
+  "flow_diagram",
+  "call_stack_diff",
+  "database_lens",
+]);
+
+const hasSideLink = /whiteboard:source\/(head|base)\//i;
+
+const sideLinkDestination = linkDestination(
+  String.raw`whiteboard:source\/(head|base)\/`,
+);
+
+/**
+ * Makes every reference that reads at the document's pins carry them
+ * itself, for a board about to lose its pins: Markdown head/ and base/
+ * links become commit links, and a block whose references still lean on
+ * the document's pins (any anchor, or a diff/ link) takes them as its own.
+ * Nothing changes what it points at.
+ */
+export function pinDocumentReferences(document: Block[], pins: Pins): Block[] {
+  const own: SourcePins = {
+    repositoryId: pins.repositoryId,
+    base: pins.base,
+    head: pins.head,
+  };
+
+  const pinned = structuredClone(document);
+
+  for (const element of elements(pinned)) {
+    if (!pinnedBlockTypes.has(element.type)) continue;
+
+    // SAFETY: every pinned block type has optional source pins of its own.
+    const block = element as Block & { pins?: SourcePins };
+
+    if (block.pins) continue;
+
+    if (block.type === "markdown") {
+      block.markdown = respellLinks(block.markdown);
+
+      if (hasSideLink.test(block.markdown))
+        block.markdown = rewriteLinkDestinations(block.markdown, (span) =>
+          span.replace(
+            sideLinkDestination,
+            (_, before: string, side: string) =>
+              `${before}whiteboard:source/${side.toLowerCase() === "base" ? pins.base : pins.head}/`,
+          ),
+        );
+    }
+
+    if (
+      documentReferences([block], { tolerant: true }).some(
+        (reference) => !reference.source.pins,
+      )
+    )
+      block.pins = own;
+  }
+
+  return pinned;
+}
+
+/** The repository a board's commit links read from: its target's. */
+export function boardRepositoryId(board: {
+  target?: { repositoryId: string };
+  pins?: { repositoryId: string };
+}): string | undefined {
+  return board.target?.repositoryId ?? board.pins?.repositoryId;
+}
+
+/** Per-side read coordinates for endpoint validation and retained source quotes. */
+export function sourceReferences(
+  document: Block[],
+  options: { tolerant?: boolean; repositoryId?: string } = {},
+) {
+  return selectionReferences(document, options).flatMap((ref) =>
+    sourceAnchors(ref.source).map((source) => ({ ...ref, source })),
+  );
+}
+
+/** Includes lenses and maps without inline ranges. */
+/** Whether a board reads code at its own pins: a commit link or a block
+ * with pins of its own names its commits itself. */
+export function readsAtBoardPins(review: {
+  document: Block[];
+  lenses?: readonly Lens[];
+}): boolean {
+  return Boolean(
+    sourceReferences(review.document, { tolerant: true }).some(
+      (reference) => !reference.source.pins,
+    ) ||
+    review.lenses?.length ||
+    resourceReferences(review.document).some(
+      (block) => block.type === "software_map",
+    ),
+  );
+}
+
+export const documentSchema = z.array(blockSchema);
+
+/** Discriminated by type, like blockSchema, so a malformed insert reports
+ * its own kind's issues. */
+export const contentSchema = z.discriminatedUnion("type", [
+  ...blockKindSchemas(),
+  stepSchema,
+  flowNodeInsertSchema,
+  flowEdgeSchema,
+]);
+
+const placement = { parentId: label.optional(), afterId: label.optional() };
+
+function edits<
+  Content extends z.ZodType,
+  Replacement extends z.ZodType,
+  Value extends z.ZodType,
+>(content: Content, replacement: Replacement, value: Value) {
+  return z.discriminatedUnion("type", [
+    z.strictObject({ type: z.literal("insert"), content, ...placement }),
+    z.strictObject({
+      type: z.literal("replace"),
+      targetId: label,
+      content: replacement,
+    }),
+    z.strictObject({
+      type: z.literal("update"),
+      targetId: label,
+      changes: z.record(text, value),
+    }),
+    z.strictObject({ type: z.literal("move"), targetId: label, ...placement }),
+    z.strictObject({ type: z.literal("remove"), targetId: label }),
+  ]);
+}
+
+export const editSchema = edits(contentSchema, blockSchema, z.json());
+
+export type Edit = z.infer<typeof editSchema>;
+
+const namedByType = (types: readonly string[]) =>
+  z
+    .looseObject({ type: z.enum(types) })
+    .describe("Fields depend on type; see the tool description.");
+
+/** What agents are shown: content names only its type, from the types a
+ * host publishes. The host parses editSchema, reporting the named kind's
+ * issues. */
+export function publishedEdits(
+  types: readonly BlockType[] = writableBlockTypes,
+) {
+  return edits(
+    namedByType([...types, "step", "flow_node", "flow_edge"]),
+    namedByType(types),
+    z.unknown(),
+  );
+}
+
+/**
+ * What one saved version did, for a canvas drawing the document as the
+ * agent writes it: the edit's kind, the element it landed on, and the block
+ * that element belongs to (itself, for a block; its diagram, for a unit).
+ */
+export interface EditSummary {
+  type: Edit["type"];
+  targetId: string;
+  /** For a lens, the lens itself. */
+  blockId: string;
+  /** What the target is: a block type, a unit type, or a Diff-view lens. */
+  kind: Element["type"] | "lens";
+  unit?: Unit["type"];
+  /** The edge a new flow node arrived with, drawn right after the node. */
+  linkId?: string;
+  /** An update's patched fields, so the canvas can draw only what changed. */
+  fields?: string[];
+  /** A diagram written whole: its units in the order a hand would draw
+   * them, so the canvas can trace the whole diagram in one quick pass. */
+  units?: string[];
+  /** The agent whose courier draws this edit, when the host could tell. */
+  activityId?: string;
+  /** The Ask thread that made this edit, if any. */
+  threadId?: string;
+}
+
+/** A component an edit wrote, named so the author can address it. */
+export interface WrittenComponent {
+  id: string;
+  type: Element["type"];
+}
+
+/** What applying an edit produced: the target, what it is, the first-level
+ * children an insert or replace gave it fresh IDs, and the edge a node came
+ * with. */
+export interface Applied {
+  targetId: string;
+  type: Element["type"];
+  children?: WrittenComponent[];
+  linkId?: string;
+}
+
+/** The block an element belongs to: itself, or the diagram around a unit. */
+export function enclosingBlock(
+  document: Element[],
+  id: string,
+): { block: Element; element: Element } | undefined {
+  for (const block of elements(document)) {
+    if (block.id === id) return { block, element: block };
+
+    for (const list of childLists(block))
+      for (const element of list)
+        if (element.id === id && isUnit(element)) return { block, element };
+  }
+
+  return undefined;
+}
+
+/** Summarize an edit against the document it was applied to. A removed
+ * element is found in the document before the edit; everything else after. */
+export function summarizeEdit(
+  edit: Edit,
+  applied: Applied,
+  before: Element[],
+  after: Element[],
+): EditSummary | undefined {
+  const found = enclosingBlock(
+    edit.type === "remove" ? before : after,
+    applied.targetId,
+  );
+
+  if (!found?.block.id) return undefined;
+
+  const summary: EditSummary = {
+    type: edit.type,
+    targetId: applied.targetId,
+    blockId: found.block.id,
+    kind: found.element.type,
+  };
+
+  if (isUnit(found.element)) summary.unit = found.element.type;
+
+  if (applied.linkId) summary.linkId = applied.linkId;
+
+  if (edit.type === "update") summary.fields = Object.keys(edit.changes);
+
+  if (edit.type === "insert" || edit.type === "replace") {
+    const units = drawOrder(found.element);
+
+    if (units.length) summary.units = units;
+  }
+
+  return summary;
+}
+
+/** The order a hand draws a diagram: a sequence step by step; a flow node by
+ * node, each edge as soon as both of its ends are on the board. */
+export function drawOrder(element: Element): string[] {
+  if (element.type === "sequence")
+    return element.steps.flatMap((step) => (step.id ? [step.id] : []));
+
+  if (element.type !== "flow_diagram") return [];
+
+  const order: string[] = [];
+  const drawn = new Set<string>();
+  const waiting = [...element.edges];
+
+  for (const node of element.nodes) {
+    if (node.id) order.push(node.id);
+
+    drawn.add(node.key);
+
+    for (let i = 0; i < waiting.length; ) {
+      const edge = waiting[i]!;
+
+      if (drawn.has(edge.from) && drawn.has(edge.to)) {
+        if (edge.id) order.push(edge.id);
+
+        waiting.splice(i, 1);
+      } else i++;
+    }
+  }
+
+  return order;
+}
+
+/** The arrays an element's children live in, so an edit can splice the
+ * real list. A flow diagram keeps its nodes and edges apart. */
+export function childLists(element: Element): Element[][] {
+  if ("children" in element) return [element.children];
+
+  if (element.type === "sequence") return [element.steps];
+
+  if (element.type === "flow_diagram") return [element.nodes, element.edges];
+
+  return [];
+}
+
+export function children(element: Element): Element[] {
+  return childLists(element).flat();
+}
+
+export function elements(document: Element[]): Element[] {
+  return document.flatMap((element) => [
+    element,
+    ...elements(children(element)),
+  ]);
+}
+
+const unitParent = {
+  step: "sequence",
+  flow_node: "flow_diagram",
+  flow_edge: "flow_diagram",
+} as const;
+
+/** What to do instead of patching a field an update can't reach. */
+function patchRefusal(key: string, element: Element): string {
+  if (key === "base" || key === "head")
+    return `A call stack's frames change only by replacing it: send {type:"replace", targetId:"${element.id}", content} with the whole call_stack_diff.`;
+
+  if (key === "nodes" || key === "edges" || key === "steps")
+    return `Edit a diagram's ${key} one at a time by their own IDs (session_get lists them), or replace the diagram.`;
+
+  if (key === "children")
+    return `Edit a ${element.type}'s children by their own IDs, or insert into it with parentId "${element.id}".`;
+
+  if (key === "id" || key === "type")
+    return `A component's ${key} can't change; replace it instead.`;
+
+  return `Cannot patch ${key}; replace the ${element.type} instead.`;
+}
+
+const structural = new Set([
+  "nodes",
+  "edges",
+  "id",
+  "type",
+  "children",
+  "steps",
+  "actors",
+  "stores",
+  "useCases",
+  "base",
+  "head",
+]);
+
+const idPrefix = (element: Element) =>
+  element.type === "sequence" || element.type === "flow_diagram"
+    ? "diagram"
+    : element.type === "step"
+      ? "step"
+      : element.type === "flow_node"
+        ? "node"
+        : element.type === "flow_edge"
+          ? "edge"
+          : "block";
+
+/** Flow units saved before they had ids or types get both on the next
+ * write, so a stored diagram can be drawn on unit by unit. */
+export function adoptFlowUnits(
+  document: Element[],
+  allocate: (prefix: string) => string,
+): void {
+  for (const element of elements(document)) {
+    if (element.type === "flow_diagram") {
+      for (const node of element.nodes) node.type ??= "flow_node";
+
+      for (const edge of element.edges) edge.type ??= "flow_edge";
+    }
+
+    if (isUnit(element) && element.id === undefined)
+      element.id = allocate(idPrefix(element));
+  }
+}
+
+/** Mutate a private candidate. Only the store owns allocation and commits. */
+/** Assign server ids to an element tree that arrives without any. */
+export function assignFreshIds(
+  element: Element,
+  allocate: (prefix: string) => string,
+): void {
+  assignIds(element, allocate, true);
+}
+
+/** Give ids to the parts of an element tree that have none, keeping the
+ * rest: a person's save names the blocks it kept and leaves new ones bare. */
+export function assignMissingIds(
+  element: Element,
+  allocate: (prefix: string) => string,
+): void {
+  assignIds(element, allocate, false);
+}
+
+function assignIds(
+  element: Element,
+  allocate: (prefix: string) => string,
+  fresh: boolean,
+): void {
+  const assign = (item: { id?: string }, prefix: string) => {
+    if (item.id === undefined) item.id = allocate(prefix);
+    else if (fresh)
+      throw new ReviewInputError("IDs are assigned by the server.");
+  };
+
+  assign(element, idPrefix(element));
+
+  for (const child of children(element)) assignIds(child, allocate, fresh);
+
+  if (element.type === "call_stack_diff")
+    for (const frame of [...element.base, ...element.head])
+      assign(frame, "frame");
+
+  if (element.type === "database_lens")
+    for (const useCase of element.useCases) {
+      assign(useCase, "case");
+
+      for (const op of useCase.operations) assign(op, "operation");
+    }
+}
+
+export function applyEdit(
+  document: Block[],
+  edit: Edit,
+  allocate: (prefix: string) => string,
+): Applied {
+  adoptFlowUnits(document, allocate);
+
+  const locate = (id: string): { element: Element; siblings: Element[] } => {
+    const find = (
+      siblings: Element[],
+    ): ReturnType<typeof locate> | undefined => {
+      for (const element of siblings) {
+        if (element.id === id) return { element, siblings };
+
+        for (const list of childLists(element)) {
+          const found = find(list);
+
+          if (found) return found;
+        }
+      }
+    };
+
+    const found = find(document);
+
+    if (!found) throw new ReviewInputError(`Target ${id} does not exist.`);
+
+    return found;
+  };
+
+  const fresh = (element: Element) => assignFreshIds(element, allocate);
+
+  const place = (
+    element: Element,
+    parentId?: string,
+    afterId?: string,
+    from?: Element[],
+  ) => {
+    const parent = parentId ? locate(parentId).element : undefined;
+
+    if (parent && elements([element]).includes(parent))
+      throw new ReviewInputError("Cannot move a block inside itself.");
+
+    if (!isUnit(element) && parent && !("children" in parent))
+      throw new ReviewInputError(
+        `${parentId} is a ${parent.type}, which holds no components: insert into a section or callout, or at the top level.`,
+      );
+
+    if (isUnit(element) && parent?.type !== unitParent[element.type])
+      throw new ReviewInputError(
+        `A ${element.type} belongs inside a ${unitParent[element.type]}.`,
+      );
+
+    // A unit's parent type was checked just above: a flow diagram's lists
+    // are [nodes, edges]; every other container has one list.
+    const siblings: Element[] = parent
+      ? (childLists(parent)[element.type === "flow_edge" ? 1 : 0] ?? document)
+      : document;
+
+    if (afterId === element.id)
+      throw new ReviewInputError("An element cannot follow itself.");
+
+    if (afterId !== undefined && !siblings.some((s) => s.id === afterId))
+      throw new ReviewInputError("afterId must identify a sibling.");
+
+    // Resolve the destination before detaching, then compute its final position.
+    if (from) from.splice(from.indexOf(element), 1);
+
+    const index =
+      afterId === undefined
+        ? siblings.length
+        : siblings.findIndex((s) => s.id === afterId) + 1;
+
+    siblings.splice(index, 0, element);
+  };
+
+  if (edit.type === "insert") {
+    // A node that arrives with its edge: the node is placed first, then the
+    // edge joins it to the board, so the layout has both from the start.
+    if (edit.content.type === "flow_node" && edit.content.link) {
+      const { link, ...node } = edit.content;
+
+      if ((link.from === undefined) === (link.to === undefined))
+        throw new ReviewInputError(
+          "A link names exactly one of from or to: the node already on the board.",
+        );
+      fresh(node);
+      place(node, edit.parentId, edit.afterId);
+
+      const edge: FlowDiagramEdge = {
+        type: "flow_edge",
+        from: link.from ?? node.key,
+        to: link.to ?? node.key,
+      };
+
+      if (link.label !== undefined) edge.label = link.label;
+
+      if (link.style !== undefined) edge.style = link.style;
+      fresh(edge);
+      place(edge, edit.parentId);
+
+      return { targetId: node.id!, type: node.type, linkId: edge.id! };
+    }
+
+    fresh(edit.content);
+    place(edit.content, edit.parentId, edit.afterId);
+
+    return written(edit.content);
+  }
+
+  const { element, siblings } = locate(edit.targetId);
+  const index = siblings.indexOf(element);
+
+  switch (edit.type) {
+    case "update": {
+      if (!Object.keys(edit.changes).length)
+        throw new ReviewInputError("Supply at least one field to update.");
+
+      for (const key of Object.keys(edit.changes))
+        if (
+          structural.has(key) ||
+          ["__proto__", "constructor", "prototype"].includes(key)
+        )
+          throw new ReviewInputError(patchRefusal(key, element));
+
+      if ("link" in edit.changes)
+        throw new ReviewInputError(
+          "A link only comes with a new node; insert a flow_edge instead.",
+        );
+
+      const merged = Object.fromEntries(
+        Object.entries({ ...element, ...edit.changes }).filter(
+          ([, value]) => value !== null,
+        ),
+      );
+
+      siblings[index] = contentSchema.parse(merged);
+      break;
+    }
+
+    case "remove":
+      siblings.splice(index, 1);
+
+      // A node takes its edges with it: an edge with a missing end is not a
+      // state the diagram can be in, and the agent asked for the node to go.
+      if (element.type === "flow_node") {
+        const diagram = elements(document).find(
+          (candidate) =>
+            candidate.type === "flow_diagram" && candidate.nodes === siblings,
+        );
+
+        if (diagram?.type === "flow_diagram")
+          diagram.edges = diagram.edges.filter(
+            (edge) => edge.from !== element.key && edge.to !== element.key,
+          );
+      }
+
+      break;
+    case "replace":
+      if (isUnit(element))
+        throw new ReviewInputError(
+          `Patch the ${element.type} or replace its diagram.`,
+        );
+      fresh(edit.content);
+      edit.content.id = element.id;
+      siblings[index] = edit.content;
+
+      return written(edit.content);
+    case "move":
+      // Names are diagram-local: moving a unit between diagrams is an explicit replacement, not a move.
+      if (
+        isUnit(element) &&
+        !childLists(locate(edit.parentId ?? "").element).includes(siblings)
+      )
+        throw new ReviewInputError(
+          `Move a ${element.type} within its own diagram.`,
+        );
+      place(element, edit.parentId, edit.afterId, siblings);
+      break;
+  }
+
+  return { targetId: edit.targetId, type: element.type };
+}
+
+/** An inserted or replaced component and its first-level children: blocks
+ * in a container, or a diagram's steps, or its nodes then its edges. */
+function written(element: Element): Applied {
+  const applied: Applied = { targetId: element.id!, type: element.type };
+
+  const list = children(element).map((child) => ({
+    id: child.id!,
+    type: child.type,
+  }));
+
+  if (list.length) applied.children = list;
+
+  return applied;
+}

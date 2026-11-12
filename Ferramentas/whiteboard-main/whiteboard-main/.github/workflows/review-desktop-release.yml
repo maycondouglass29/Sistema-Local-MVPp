@@ -1,0 +1,584 @@
+name: Whiteboard Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Platforms to release"
+        required: true
+        type: choice
+        options:
+          - all
+          - macos-arm64
+          - macos-x64
+          - linux
+          - windows
+        default: all
+      bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+      release_source:
+        description: "Release main's tip, promote a published preview tag, or release any tag on origin."
+        required: true
+        type: choice
+        options:
+          - main
+          - preview
+          - tag
+        default: main
+      preview_tag:
+        description: "Preview tag to promote, e.g. v0.0.32-preview.20260907.7. Required when release_source is preview."
+        required: false
+        type: string
+        default: ""
+      source_tag:
+        description: "Tag to release as is, e.g. a hotfix cherry-picked onto an earlier release. Required when release_source is tag."
+        required: false
+        type: string
+        default: ""
+      version:
+        description: "Existing release tag to build again for the selected platforms, e.g. v0.2.4. Skips the bump; bump, release_source, preview_tag and source_tag are ignored."
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "Build and validate only. Do not tag, upload, or publish."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# Per selection, so backfilling one platform does not wait behind a release of
+# another. Latest aliases only move forward, so overlapping runs are safe.
+concurrency:
+  group: review-desktop-release-${{ inputs.platforms }}
+  cancel-in-progress: false
+
+jobs:
+  approve:
+    name: Approve release
+    environment: review-release-approval
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: echo "Release approved"
+
+  version:
+    needs: approve
+    name: Tag release
+    # Approval is handled by approve; this environment supplies credentials.
+    environment: review-release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.existing.outputs.version || steps.bump.outputs.version || steps.dryrun.outputs.version }}
+      tag: ${{ steps.existing.outputs.tag || steps.bump.outputs.tag }}
+      commit: ${{ steps.existing.outputs.commit || steps.bump.outputs.commit || steps.dryrun.outputs.commit }}
+    steps:
+      # The `main` ruleset requires a pull request and the "Review Desktop"
+      # check, and lists DeployKey as its only non-admin bypass actor. Checking
+      # out over SSH with the release deploy key is therefore the one way this
+      # job can land the version bump on main directly.
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+
+      - name: Verify Linux release prerequisites
+        if: ${{ !inputs.dry_run && (inputs.platforms == 'all' || inputs.platforms == 'linux') }}
+        env:
+          SIGNING_KEY: ${{ secrets.LINUX_REPOSITORY_SIGNING_KEY }}
+          SIGNING_FINGERPRINT: ${{ vars.LINUX_REPOSITORY_SIGNING_FINGERPRINT }}
+          R2_BUCKET: ${{ vars.R2_RELEASE_BUCKET }}
+        run: |
+          test -n "$SIGNING_KEY"
+          test -n "$R2_BUCKET"
+          [[ "$SIGNING_FINGERPRINT" =~ ^[A-F0-9]{40}$ ]]
+          curl -fsS https://install.dev.fast/repos/health | python3 -c 'import json,sys; assert json.load(sys.stdin) == {"schemaVersion": 1, "format": "rpm"}'
+          curl -fsS https://install.dev.fast/repos/apt/health | python3 -c 'import json,sys; assert json.load(sys.stdin) == {"schemaVersion": 1, "format": "deb"}'
+          curl -fsS https://install.dev.fast/repos/arch/health | python3 -c 'import json,sys; assert json.load(sys.stdin) == {"schemaVersion": 1, "format": "pacman"}'
+
+      # A backfill builds missing platforms for a release that already exists:
+      # no bump, no tag, no new GitHub release.
+      - name: Use the existing release
+        if: ${{ inputs.version }}
+        id: existing
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="$(printf '%s' "$VERSION_INPUT" | tr -d '[:space:]')"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version '${TAG}' is not a release tag (vX.Y.Z)."
+            exit 1
+          fi
+          if ! git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::${TAG} does not exist on origin."
+            exit 1
+          fi
+          git fetch --no-tags origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+          COMMIT=$(git rev-parse "refs/tags/${TAG}^{commit}")
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          echo "Backfilling Whiteboard ${TAG} from ${COMMIT}."
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+
+      # Every read-only gate lives here so a dry run rehearses the same checks a
+      # real run must pass, and so the write step below re-derives nothing.
+      - name: Resolve release version
+        if: ${{ !inputs.version }}
+        id: resolve
+        shell: bash
+        env:
+          BUMP: ${{ inputs.bump }}
+          RELEASE_SOURCE: ${{ inputs.release_source }}
+          PREVIEW_TAG_INPUT: ${{ inputs.preview_tag }}
+          SOURCE_TAG_INPUT: ${{ inputs.source_tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A dispatch form field left with stale text arrives as a non-empty
+          # string, so trim before testing for emptiness.
+          PREVIEW_TAG="$(printf '%s' "$PREVIEW_TAG_INPUT" | tr -d '[:space:]')"
+          SOURCE_TAG="$(printf '%s' "$SOURCE_TAG_INPUT" | tr -d '[:space:]')"
+
+          if [ "$RELEASE_SOURCE" != "preview" ] && [ -n "$PREVIEW_TAG" ]; then
+            echo "::error::preview_tag only applies when release_source is 'preview'. Clear the field, or set release_source to 'preview'."
+            exit 1
+          fi
+          if [ "$RELEASE_SOURCE" != "tag" ] && [ -n "$SOURCE_TAG" ]; then
+            echo "::error::source_tag only applies when release_source is 'tag'. Clear the field, or set release_source to 'tag'."
+            exit 1
+          fi
+
+          CURRENT=$(node -p "require('./apps/review-desktop/package.json').version")
+          # The pattern must stay an unquoted variable: bash matches a quoted
+          # right-hand side as a literal string, not as a regex.
+          version_re='^([0-9]+)\.([0-9]+)\.([0-9]+)$'
+          if [[ ! $CURRENT =~ $version_re ]]; then
+            echo "::error::apps/review-desktop/package.json is at '${CURRENT}', which is not X.Y.Z. ${GITHUB_REF_NAME} must never carry a prerelease version."
+            exit 1
+          fi
+          MAJOR="${BASH_REMATCH[1]}"
+          MINOR="${BASH_REMATCH[2]}"
+          PATCH="${BASH_REMATCH[3]}"
+
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+            *) echo "::error::unknown bump type '${BUMP}'"; exit 1 ;;
+          esac
+
+          VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          TAG="v${VERSION}"
+
+          if [ "$RELEASE_SOURCE" = "preview" ]; then
+            if [ -z "$PREVIEW_TAG" ]; then
+              echo "::error::release_source 'preview' requires preview_tag, e.g. v${VERSION}-preview.$(date -u +%Y%m%d).1 — take it from the preview run that published the build you are promoting."
+              exit 1
+            fi
+            if [ "$BUMP" != "patch" ]; then
+              echo "::error::a preview always targets the next patch, so promoting one requires bump 'patch' (got '${BUMP}'). Release from ${GITHUB_REF_NAME} for a minor or major."
+              exit 1
+            fi
+
+            preview_re='^v([0-9]+\.[0-9]+\.[0-9]+)-preview\.[0-9]{8}\.[0-9]+$'
+            if [[ ! $PREVIEW_TAG =~ $preview_re ]]; then
+              echo "::error::preview_tag '${PREVIEW_TAG}' is not a preview tag. Expected vX.Y.Z-preview.YYYYMMDD.N, as pushed by review-desktop-preview.yml."
+              exit 1
+            fi
+            PREVIEW_VERSION="${BASH_REMATCH[1]}"
+
+            if ! git ls-remote --exit-code --tags origin "refs/tags/${PREVIEW_TAG}" >/dev/null 2>&1; then
+              echo "::error::${PREVIEW_TAG} does not exist on origin. Only a preview that finished publishing from ${GITHUB_REF_NAME} is tagged."
+              exit 1
+            fi
+            # `+` so a tag already in this checkout cannot block the fetch, and
+            # `^{commit}` peels a lightweight and an annotated tag alike.
+            git fetch --no-tags origin "+refs/tags/${PREVIEW_TAG}:refs/tags/${PREVIEW_TAG}"
+            SOURCE_COMMIT=$(git rev-parse "refs/tags/${PREVIEW_TAG}^{commit}")
+
+            # Whatever merged since the preview published stays out of this
+            # release: promotion ships the commit that was actually tested. It
+            # must still be on ${GITHUB_REF_NAME}, so a branch that never landed
+            # cannot be released. Asked over the API because this checkout is
+            # shallow and has no history to walk.
+            STATUS=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${GITHUB_REF_NAME}...${SOURCE_COMMIT}" --jq .status)
+            case "$STATUS" in
+              identical | behind) ;;
+              *)
+                echo "::error::${PREVIEW_TAG} was built from ${SOURCE_COMMIT}, which is not on ${GITHUB_REF_NAME} (${STATUS}). Only a preview built from a commit that landed can be promoted."
+                exit 1
+                ;;
+            esac
+            # Load-bearing: a preview computes its version from the package.json
+            # it was built against, so this is what catches a preview that
+            # straddled another release and now targets a version already cut.
+            if [ "$PREVIEW_VERSION" != "$VERSION" ]; then
+              echo "::error::${PREVIEW_TAG} targets ${PREVIEW_VERSION}, but the next patch from ${CURRENT} is ${VERSION}. That preview predates a release; publish a new one."
+              exit 1
+            fi
+
+            echo "Promoting ${PREVIEW_TAG} (${SOURCE_COMMIT}) to Whiteboard ${TAG}."
+          elif [ "$RELEASE_SOURCE" = "tag" ]; then
+            if [ -z "$SOURCE_TAG" ]; then
+              echo "::error::release_source 'tag' requires source_tag."
+              exit 1
+            fi
+            if ! git ls-remote --exit-code --tags origin "refs/tags/${SOURCE_TAG}" >/dev/null 2>&1; then
+              echo "::error::${SOURCE_TAG} does not exist on origin."
+              exit 1
+            fi
+            git fetch --no-tags origin "+refs/tags/${SOURCE_TAG}:refs/tags/${SOURCE_TAG}"
+            SOURCE_COMMIT=$(git rev-parse "refs/tags/${SOURCE_TAG}^{commit}")
+            echo "Releasing ${SOURCE_TAG} (${SOURCE_COMMIT}) as Whiteboard ${TAG}."
+          else
+            echo "Releasing Whiteboard ${TAG} from ${GITHUB_REF_NAME}."
+          fi
+
+          # Remote write-state, checked only where a push actually follows. Both
+          # run before anything is written, so a doomed run stops without
+          # leaving a tag or a commit behind.
+          if [ "$DRY_RUN" != "true" ]; then
+            if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+              echo "::error::${TAG} already exists on origin. Delete it before re-running."
+              exit 1
+            fi
+
+            git fetch origin "${GITHUB_REF_NAME}"
+            if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
+              echo "::error::${GITHUB_REF_NAME} moved since this run started. Re-run the workflow."
+              exit 1
+            fi
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - name: Bump version and create tag
+        if: ${{ !inputs.dry_run && !inputs.version }}
+        id: bump
+        shell: bash
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          SOURCE_COMMIT: ${{ steps.resolve.outputs.source_commit }}
+        run: |
+          # product.json carries the same number to the running app, which shows
+          # it in the About panel, alongside the stable channel identity.
+          # `scripts/product-hardening.test.mjs` fails if these drift apart.
+          node apps/review-desktop/scripts/stamp-release-channel.mjs \
+            --version "$VERSION" \
+            --quality stable
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add apps/review-desktop/package.json apps/review-desktop/code-oss/product.json packages/review/package.json
+          git commit -m "chore(review-desktop): bump version to ${VERSION} [skip ci]"
+
+          # The tag marks what shipped, which for a promotion is the commit the
+          # preview was built from rather than this bump. The build jobs stamp
+          # the version onto that tree, the way the preview run stamped its own.
+          # The bump still lands on ${GITHUB_REF_NAME} because the next release
+          # derives its version from there.
+          TARGET="${SOURCE_COMMIT:-$(git rev-parse HEAD)}"
+          git tag "$TAG" "$TARGET"
+          # Atomic: the previous release left an orphan tag on origin because
+          # the branch push was rejected after the tag push had already landed.
+          git push --atomic origin "HEAD:${GITHUB_REF_NAME}" "$TAG"
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$TARGET" >> "$GITHUB_OUTPUT"
+
+      - name: Dry-run version
+        if: ${{ inputs.dry_run && !inputs.version }}
+        id: dryrun
+        shell: bash
+        env:
+          RELEASE_SOURCE: ${{ inputs.release_source }}
+          RESOLVED_VERSION: ${{ steps.resolve.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.resolve.outputs.source_commit }}
+        run: |
+          if [ "$RELEASE_SOURCE" != "main" ]; then
+            # The build jobs stamp the promoted version into this same commit,
+            # so the artifacts a promotion dry run validates carry it too.
+            VERSION="$RESOLVED_VERSION"
+          else
+            # Nothing stamps a release-from-main dry run, so the artifacts carry
+            # the version already committed here.
+            VERSION=$(node -p "require('./apps/review-desktop/package.json').version")
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit=${SOURCE_COMMIT:-$(git rev-parse HEAD)}" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft GitHub Release
+        if: ${{ !inputs.dry_run && !inputs.version }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.bump.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "Whiteboard ${{ steps.bump.outputs.version }}" \
+            --draft \
+            --generate-notes
+
+  remote:
+    name: Publish remote tarballs
+    needs: version
+    # xz compresses on every core.
+    runs-on: review_big_boy
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      COMMIT: ${{ needs.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.version.outputs.commit }}
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Install build dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install Code OSS native build prerequisites
+        run: |
+          # The hosted runner image lists an HTTP Azure mirror first. That
+          # mirror can accept the release file and then hang on package indexes.
+          echo 'https://archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxkbfile-dev libkrb5-dev libsecret-1-dev
+      - name: Setup Code OSS Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: apps/review-desktop/code-oss/.nvmrc
+          cache: npm
+          cache-dependency-path: apps/review-desktop/code-oss/**/package-lock.json
+      - name: Compute Code OSS dependency key
+        id: code-oss-inputs
+        run: |
+          DIGEST=$(node apps/review-desktop/scripts/code-oss-bootstrap.mjs digest apps/review-desktop/code-oss)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+      - name: Restore Code OSS dependencies
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            apps/review-desktop/code-oss/node_modules
+            apps/review-desktop/code-oss/build/node_modules
+            apps/review-desktop/code-oss/extensions/node_modules
+            apps/review-desktop/code-oss/extensions/*/node_modules
+            apps/review-desktop/code-oss/extensions/*/server/node_modules
+            apps/review-desktop/code-oss/.build/distro/npm/node_modules
+            apps/review-desktop/code-oss/.build/distro/npm/remote/node_modules
+            apps/review-desktop/code-oss/.build/distro/npm/remote/web/node_modules
+            ~/.cache/node-gyp
+          key: ${{ runner.os }}-code-oss-deps-v3-${{ steps.code-oss-inputs.outputs.digest }}
+          restore-keys: |
+            ${{ runner.os }}-code-oss-deps-v3-
+      - name: Check for published remote tarballs
+        if: ${{ !inputs.dry_run }}
+        id: existing
+        run: |
+          mkdir -p remote-artifacts
+          FOUND=0
+          for t in linux-x64 linux-arm64; do
+            NAME="whiteboard-remote-${VERSION}-${t}.tar.xz.sha256"
+            STATUS=$(curl -sS --retry 3 --retry-all-errors -o "remote-artifacts/$NAME" -w '%{http_code}' "https://install.dev.fast/releases/${VERSION}/remote/$NAME")
+            case "$STATUS" in
+              200) FOUND=$((FOUND + 1)) ;;
+              404) rm -f "remote-artifacts/$NAME" ;;
+              *) echo "::error::${NAME} answered ${STATUS}" >&2; exit 1 ;;
+            esac
+          done
+          if [ "$FOUND" = 1 ]; then
+            echo "::error::Only one remote tarball for ${VERSION} is published; fix releases/${VERSION}/remote/ on R2 by hand." >&2
+            exit 1
+          fi
+          echo "published=$([ "$FOUND" = 2 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - name: Build the remote tarballs
+        if: ${{ steps.existing.outputs.published != 'true' }}
+        run: |
+          source apps/review-desktop/scripts/code-oss-dependencies.sh
+          ensure_code_oss_dependencies "$PWD/apps/review-desktop" "$PWD/apps/review-desktop/code-oss"
+          node apps/review-desktop/scripts/build-remote-tarball.mjs --target linux-x64 --target linux-arm64 \
+            --out remote-artifacts --version "$VERSION" --commit "$COMMIT"
+          cp packages/review/remote/install.sh remote-artifacts/install.sh
+      # Release assets, then R2, then the pin: a rerun that finds the tarballs on
+      # R2 skips both uploads, and no Desktop build may pin a tarball R2 lacks.
+      - name: Attach the remote tarballs to the GitHub Release
+        if: ${{ !inputs.dry_run && steps.existing.outputs.published != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber remote-artifacts/*.tar.xz remote-artifacts/*.sha256 remote-artifacts/install.sh
+      - name: Upload the remote tarballs to R2
+        if: ${{ !inputs.dry_run && steps.existing.outputs.published != 'true' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ vars.R2_ENDPOINT_URL }}
+          AWS_REGION: auto
+          R2_BUCKET: ${{ vars.R2_RELEASE_BUCKET }}
+        run: |
+          PREFIX="s3://${R2_BUCKET}/releases/${VERSION}/remote/"
+          aws s3 cp remote-artifacts/ "$PREFIX" --recursive --exclude "*" --include "*.tar.xz" --content-type application/x-xz
+          aws s3 cp remote-artifacts/ "$PREFIX" --recursive --exclude "*" --include "*.sha256" --content-type text/plain
+          aws s3 cp remote-artifacts/install.sh "${PREFIX}install.sh" --content-type text/plain
+      # Platform builds start before this job ends and wait for this pin only
+      # when they package (wait-for-run-artifact.mjs).
+      - name: Pin the remote tarballs
+        run: |
+          mkdir -p remote-pin
+          node apps/review-desktop/scripts/stamp-remote-artifacts.mjs remote-artifacts "$VERSION" "https://install.dev.fast/releases/${VERSION}/remote" > remote-pin/pin.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: whiteboard-remote-pin-${{ env.VERSION }}
+          path: remote-pin/pin.json
+          overwrite: true
+
+  npm:
+    name: Publish npm package
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      COMMIT: ${{ needs.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.version.outputs.commit }}
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+      - name: Install build dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Resolve dist-tag and publication state
+        id: npm
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          DIST_TAG=$(node scripts/review-cli-release.mjs dist-tag "$VERSION")
+          if PUBLISHED=$(node scripts/review-cli-release.mjs published "$VERSION" "$COMMIT"); then
+            :
+          elif [ "$DRY_RUN" = true ]; then
+            echo "::warning::@dev.fast/whiteboard@${VERSION} exists on npm from another commit, or the registry check failed (see above); this dry run skips publish validation."
+            PUBLISHED=true
+          else
+            exit 1
+          fi
+          echo "dist_tag=$DIST_TAG" >> "$GITHUB_OUTPUT"
+          echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
+      - name: Build release tarball
+        run: |
+          jq -n --arg version "$VERSION" --arg commit "$COMMIT" '{$version, $commit}' > release-plan.json
+          node scripts/pack-review-cli.mjs release-artifacts
+      - name: Test installed tarball without Desktop
+        run: node scripts/smoke-review-cli.mjs "release-artifacts/dev.fast-whiteboard-${VERSION}.tgz" "$VERSION"
+      - name: Validate npm publish command
+        if: ${{ steps.npm.outputs.published != 'true' }}
+        env:
+          DIST_TAG: ${{ steps.npm.outputs.dist_tag }}
+        run: npm publish "./release-artifacts/dev.fast-whiteboard-${VERSION}.tgz" --dry-run --registry=https://registry.npmjs.org --access public --tag "$DIST_TAG" --ignore-scripts
+      - name: Retain tested package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: whiteboard-npm-${{ env.VERSION }}
+          path: release-artifacts/*.tgz
+          if-no-files-found: error
+      - name: Publish tested package
+        if: ${{ !inputs.dry_run && steps.npm.outputs.published != 'true' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DIST_TAG: ${{ steps.npm.outputs.dist_tag }}
+        run: |
+          test -n "$NODE_AUTH_TOKEN" || { echo 'NPM_TOKEN secret is missing.' >&2; exit 1; }
+          npm publish "./release-artifacts/dev.fast-whiteboard-${VERSION}.tgz" --registry=https://registry.npmjs.org --access public --tag "$DIST_TAG" --provenance --ignore-scripts
+
+  linux:
+    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'linux' }}
+    needs: version
+    permissions:
+      contents: write
+      actions: read
+    uses: ./.github/workflows/review-linux-build.yml
+    with:
+      commit: ${{ needs.version.outputs.commit }}
+      version: ${{ needs.version.outputs.version }}
+      release_signing: ${{ !inputs.dry_run }}
+      channel: stable
+      publish: ${{ !inputs.dry_run }}
+      release_tag: ${{ needs.version.outputs.tag }}
+    secrets: inherit
+
+  # Signs even on a dry run, so the run validates exactly what would ship.
+  windows:
+    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'windows' }}
+    needs: version
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+    uses: ./.github/workflows/review-windows-build.yml
+    with:
+      commit: ${{ needs.version.outputs.commit }}
+      version: ${{ needs.version.outputs.version }}
+      sign: true
+      channel: stable
+      publish: ${{ !inputs.dry_run }}
+      release_tag: ${{ needs.version.outputs.tag }}
+    secrets: inherit
+
+  macos-arm64:
+    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'macos-arm64' }}
+    needs: version
+    permissions:
+      contents: write
+      actions: read
+    uses: ./.github/workflows/review-macos-build.yml
+    with:
+      commit: ${{ needs.version.outputs.commit }}
+      version: ${{ needs.version.outputs.version }}
+      target: darwin-arm64
+      channel: stable
+      publish: ${{ !inputs.dry_run }}
+      release_tag: ${{ needs.version.outputs.tag }}
+    secrets: inherit
+
+  macos-x64:
+    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'macos-x64' }}
+    needs: version
+    permissions:
+      contents: write
+      actions: read
+    uses: ./.github/workflows/review-macos-build.yml
+    with:
+      commit: ${{ needs.version.outputs.commit }}
+      version: ${{ needs.version.outputs.version }}
+      target: darwin-x64
+      channel: stable
+      publish: ${{ !inputs.dry_run }}
+      release_tag: ${{ needs.version.outputs.tag }}
+    secrets: inherit

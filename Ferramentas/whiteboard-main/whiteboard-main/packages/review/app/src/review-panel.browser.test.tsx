@@ -1,0 +1,521 @@
+import { REVIEW_CANVAS_RESUME_EVENT } from "@dev.fast/review-protocol";
+import { type ReactNode, act, useEffect, useRef, useState } from "react";
+import { createRoot } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { ReviewDebugSettingsProvider } from "./debug-settings";
+import { ReviewSessionProvider } from "./host/review-session";
+import { GuidedTourPanel, ReviewPanelHost } from "./review-components";
+import { ReviewProvider } from "./review-context";
+import {
+  ReviewPanelProvider,
+  useReviewPanel,
+  useSuppressPanelMotionOnCanvasResume,
+} from "./review-panel";
+import type { PeekAnchor } from "./review-panel-model";
+import type { GuidedTour } from "./review-panel-model";
+import { testReviewSession } from "./review-session-test-utils";
+
+let root: ReturnType<typeof createRoot> | undefined;
+
+const session = testReviewSession();
+
+// The scroller under the panel header.
+const panelBodySelector = ".side-panel > header + div";
+
+function entranceAnimation(container: HTMLElement) {
+  return getComputedStyle(container.querySelector(".side-panel")!)
+    .animationName;
+}
+
+function renderWithSession(node: ReactNode) {
+  root!.render(
+    <ReviewSessionProvider session={session}>{node}</ReviewSessionProvider>,
+  );
+}
+
+beforeEach(() => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => new Response(JSON.stringify({}))),
+  );
+  Object.defineProperty(HTMLElement.prototype, "scrollTo", {
+    configurable: true,
+    value: vi.fn<(options?: ScrollToOptions | number, y?: number) => void>(),
+  });
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    callback(0);
+
+    return 1;
+  });
+  vi.stubGlobal("cancelAnimationFrame", vi.fn<(handle: number) => void>());
+});
+
+afterEach(async () => {
+  await act(async () => root?.unmount());
+  root = undefined;
+  document.body.replaceChildren();
+  Reflect.deleteProperty(HTMLElement.prototype, "scrollTo");
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+describe("Review panel host", () => {
+  it("replaces the active panel when a document peek opens", async () => {
+    const addEventListener = vi.spyOn(document, "addEventListener");
+    const container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      renderWithSession(
+        <ReviewDebugSettingsProvider>
+          <ReviewProvider>
+            <ReviewPanelProvider>
+              <OpenReplacingPanel />
+              <ReviewPanelHost />
+            </ReviewPanelProvider>
+          </ReviewProvider>
+        </ReviewDebugSettingsProvider>,
+      );
+      await Promise.resolve();
+    });
+
+    expect(container.querySelectorAll(".side-panel")).toHaveLength(1);
+    expect(container.querySelectorAll(panelBodySelector)).toHaveLength(1);
+    expect(container.querySelectorAll('[role="separator"]')).toHaveLength(1);
+    expect(container.textContent).not.toContain("Earlier detail");
+    expect(container.textContent).toContain("Startup detail");
+    expect(
+      addEventListener.mock.calls.filter(([type]) => type === "keydown"),
+    ).toHaveLength(1);
+
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>('[aria-label="Close side peek"]')!
+        .click();
+    });
+
+    expect(container.querySelectorAll(".side-panel")).toHaveLength(0);
+    expect(container.querySelectorAll(panelBodySelector)).toHaveLength(0);
+  });
+
+  it("marks a restored panel so its entrance motion can be suppressed", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      renderWithSession(
+        <ReviewDebugSettingsProvider>
+          <ReviewProvider>
+            <ReviewPanelProvider>
+              <RestorePeekPanel />
+              <ReviewPanelHost />
+            </ReviewPanelProvider>
+          </ReviewProvider>
+        </ReviewDebugSettingsProvider>,
+      );
+      await Promise.resolve();
+    });
+
+    expect(entranceAnimation(container)).toBe("none");
+  });
+
+  it("suppresses panel motion when the cached canvas resumes", async () => {
+    const canvas = document.createElement("div");
+    canvas.className = "review-canvas-root";
+    const container = document.createElement("div");
+    canvas.append(container);
+    document.body.append(canvas);
+    root = createRoot(container);
+
+    await act(async () => {
+      renderWithSession(
+        <ReviewDebugSettingsProvider>
+          <ReviewProvider>
+            <ReviewPanelProvider>
+              <OpenPeekPanel />
+              <ResumeMotionListener />
+              <ReviewPanelHost />
+            </ReviewPanelProvider>
+          </ReviewProvider>
+        </ReviewDebugSettingsProvider>,
+      );
+      await Promise.resolve();
+    });
+
+    expect(entranceAnimation(container)).not.toBe("none");
+
+    await act(async () => {
+      canvas.dispatchEvent(new Event(REVIEW_CANVAS_RESUME_EVENT));
+    });
+
+    expect(entranceAnimation(container)).toBe("none");
+  });
+});
+
+describe("Guided tour panel", () => {
+  it("activates the tour stop that crosses the panel reading line", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      renderWithSession(
+        <ReviewDebugSettingsProvider>
+          <ReviewProvider>
+            <ReviewPanelProvider>
+              <TourPanel />
+            </ReviewPanelProvider>
+          </ReviewProvider>
+        </ReviewDebugSettingsProvider>,
+      );
+      await Promise.resolve();
+    });
+
+    const scrollTo = vi.mocked(HTMLElement.prototype.scrollTo);
+    scrollTo.mockClear();
+    const body = container.querySelector<HTMLElement>(panelBodySelector)!;
+
+    const [firstStop, secondStop] = [
+      ...container.querySelectorAll<HTMLElement>(
+        "section[data-review-anchor-id]",
+      ),
+    ];
+
+    vi.spyOn(body, "getBoundingClientRect").mockReturnValue(
+      domRect({ top: 100, bottom: 600, height: 500 }),
+    );
+    vi.spyOn(firstStop!, "getBoundingClientRect").mockReturnValue(
+      domRect({ top: -160, bottom: 80, height: 240 }),
+    );
+    vi.spyOn(secondStop!, "getBoundingClientRect").mockReturnValue(
+      domRect({ top: 112, bottom: 352, height: 240 }),
+    );
+
+    await act(async () => {
+      body.dispatchEvent(new WheelEvent("wheel", { bubbles: true }));
+      body.dispatchEvent(new Event("scroll", { bubbles: true }));
+    });
+
+    expect(
+      container.querySelector("[data-active-tour-anchor]")?.textContent,
+    ).toBe("second");
+    expect(scrollTo).not.toHaveBeenCalled();
+  });
+
+  it("keeps tour navigation outside the scroller and reveals selected stops", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      renderWithSession(
+        <ReviewDebugSettingsProvider>
+          <ReviewProvider>
+            <ReviewPanelProvider>
+              <TourPanel />
+            </ReviewPanelProvider>
+          </ReviewProvider>
+        </ReviewDebugSettingsProvider>,
+      );
+      await Promise.resolve();
+    });
+
+    const body = container.querySelector<HTMLElement>(panelBodySelector)!;
+
+    const floatingFooter = container.querySelector<HTMLElement>(
+      ".side-panel > :last-child",
+    )!;
+
+    expect(body.contains(floatingFooter)).toBe(false);
+    expect(floatingFooter.textContent).toContain("1 more steps");
+
+    await act(async () => {
+      floatingFooter.querySelector<HTMLButtonElement>("button")!.click();
+    });
+
+    expect(
+      container.querySelector("[data-active-tour-anchor]")?.textContent,
+    ).toBe("second");
+    expect(floatingFooter.querySelector(".tour-pill-count")?.textContent).toBe(
+      "2/2",
+    );
+    expect(
+      floatingFooter.querySelector<HTMLButtonElement>(
+        '[aria-label="Next step"]',
+      )?.disabled,
+    ).toBe(true);
+
+    await act(async () => {
+      floatingFooter
+        .querySelector<HTMLButtonElement>('[aria-label="Previous step"]')!
+        .click();
+    });
+
+    expect(
+      container.querySelector("[data-active-tour-anchor]")?.textContent,
+    ).toBe("first");
+    expect(floatingFooter.querySelector(".tour-pill-count")?.textContent).toBe(
+      "1/2",
+    );
+    expect(
+      floatingFooter.querySelector<HTMLButtonElement>(
+        '[aria-label="Previous step"]',
+      )?.disabled,
+    ).toBe(true);
+    expect(HTMLElement.prototype.scrollTo).toHaveBeenCalled();
+  });
+
+  it.each(["wheel", "touchstart", "pointerdown", "keydown"])(
+    "keeps a requested heading aligned while earlier peeks resize, until %s hands control to the reader",
+    async (input) => {
+      const resized: (() => void)[] = [];
+      vi.stubGlobal(
+        "ResizeObserver",
+        class {
+          observing = true;
+          constructor(callback: () => void) {
+            resized.push(() => {
+              if (this.observing) callback();
+            });
+          }
+          observe() {}
+          disconnect() {
+            this.observing = false;
+          }
+        },
+      );
+      const container = document.createElement("div");
+      document.body.append(container);
+      root = createRoot(container);
+
+      await act(async () => {
+        renderWithSession(
+          <ReviewDebugSettingsProvider>
+            <ReviewProvider>
+              <ReviewPanelProvider>
+                <TourPanel />
+              </ReviewPanelProvider>
+            </ReviewProvider>
+          </ReviewDebugSettingsProvider>,
+        );
+      });
+
+      const body = container.querySelector<HTMLElement>(panelBodySelector)!;
+
+      const [first, second] = container.querySelectorAll<HTMLElement>(
+        "section[data-review-anchor-id]",
+      );
+
+      let scrollTop = 0;
+      let secondTop = 1600;
+      Object.defineProperty(body, "scrollTop", {
+        configurable: true,
+        get: () => scrollTop,
+      });
+      vi.spyOn(body, "getBoundingClientRect").mockImplementation(() =>
+        domRect({ top: 100, bottom: 600, height: 500 }),
+      );
+      vi.spyOn(first!, "getBoundingClientRect").mockImplementation(() =>
+        domRect({ top: 100 - scrollTop, height: secondTop }),
+      );
+      vi.spyOn(second!, "getBoundingClientRect").mockImplementation(() =>
+        domRect({ top: 100 + secondTop - scrollTop, height: 400 }),
+      );
+
+      const scrollTo = vi.fn<(options: ScrollToOptions) => void>((options) => {
+        scrollTop = options.top ?? scrollTop;
+      });
+
+      Object.defineProperty(body, "scrollTo", { value: scrollTo });
+
+      await act(async () => {
+        container
+          .querySelector<HTMLButtonElement>('[data-tour-target="tour-next"]')!
+          .click();
+      });
+
+      expect(second!.getBoundingClientRect().top).toBe(118);
+
+      // A native editor first reports a placeholder height, then its loaded diff.
+      for (const height of [360, 1176]) {
+        secondTop = height;
+        await act(async () => {
+          for (const resize of resized) resize();
+          body.dispatchEvent(new Event("scroll"));
+        });
+        expect(second!.getBoundingClientRect().top).toBe(118);
+        expect(
+          container.querySelector("[data-active-tour-anchor]")?.textContent,
+        ).toBe("second");
+      }
+
+      scrollTo.mockClear();
+      await act(async () => {
+        // Scrollbar input arrives beside the scroll body, on its parent panel.
+        const inputTarget =
+          input === "pointerdown" ? body.parentElement! : body;
+
+        inputTarget.dispatchEvent(new Event(input, { bubbles: true }));
+        scrollTop = 0;
+        body.dispatchEvent(new Event("scroll"));
+      });
+      secondTop = 900;
+      await act(async () => {
+        for (const resize of resized) resize();
+      });
+
+      expect(scrollTo).not.toHaveBeenCalled();
+      expect(
+        container.querySelector("[data-active-tour-anchor]")?.textContent,
+      ).toBe("first");
+    },
+  );
+});
+
+describe("Side panel scrollbar", () => {
+  it("overlays the scrollbar so tour content runs to the column's right edge", async () => {
+    const container = document.createElement("div");
+    container.style.cssText = "display: flex; width: 360px; height: 160px";
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      renderWithSession(
+        <ReviewDebugSettingsProvider>
+          <ReviewProvider>
+            <ReviewPanelProvider>
+              <TourPanel />
+            </ReviewPanelProvider>
+          </ReviewProvider>
+        </ReviewDebugSettingsProvider>,
+      );
+      await Promise.resolve();
+    });
+
+    const panel = container.querySelector<HTMLElement>(".side-panel")!;
+    const body = container.querySelector<HTMLElement>(panelBodySelector)!;
+
+    const stopContent = container.querySelector<HTMLElement>(
+      "section[data-review-anchor-id] > :last-child > :last-child",
+    )!;
+
+    // Headless Chromium hides native scrollbars, so a gutter would not show
+    // in the widths here; check the scroller opts out of the native bar.
+    expect(body.scrollHeight).toBeGreaterThan(body.clientHeight);
+    expect(getComputedStyle(body).scrollbarWidth).toBe("none");
+    expect(body.offsetWidth - body.clientWidth).toBe(0);
+    expect(stopContent.getBoundingClientRect().right).toBe(
+      panel.getBoundingClientRect().right,
+    );
+  });
+});
+
+function OpenReplacingPanel() {
+  const openPeek = useReviewPanel((state) => state.openPeek);
+  useEffect(() => {
+    openPeek({
+      kind: "peek",
+      anchor: { id: "earlier", title: "Earlier detail" } as PeekAnchor,
+      content: { kind: "inline-code", text: "earlier();" },
+    });
+    openPeek({
+      kind: "peek",
+      anchor: { id: "startup", title: "Startup detail" } as PeekAnchor,
+      content: { kind: "inline-code", text: "start();" },
+    });
+  }, [openPeek]);
+
+  return null;
+}
+
+const peekFixture = {
+  kind: "peek",
+  anchor: { id: "startup", title: "Startup detail" } as PeekAnchor,
+  content: { kind: "inline-code", text: "start();" },
+} as const;
+
+function OpenPeekPanel() {
+  const openPeek = useReviewPanel((state) => state.openPeek);
+  useEffect(() => openPeek(peekFixture), [openPeek]);
+
+  return null;
+}
+
+function RestorePeekPanel() {
+  const openPeek = useReviewPanel((state) => state.openPeek);
+  const suppressMotion = useReviewPanel((state) => state.suppressMotion);
+  useEffect(() => {
+    openPeek(peekFixture);
+    suppressMotion();
+  }, [openPeek, suppressMotion]);
+
+  return null;
+}
+
+function tourFixture(): GuidedTour {
+  const first = { id: "first", title: "First" } as PeekAnchor;
+  const second = { id: "second", title: "Second" } as PeekAnchor;
+
+  return {
+    id: "tour",
+    stops: [
+      {
+        anchor: first,
+        label: "First",
+        content: { kind: "inline-code", text: "first();" },
+      },
+      {
+        anchor: second,
+        label: "Second",
+        content: { kind: "inline-code", text: "second();" },
+      },
+    ],
+  };
+}
+
+function ResumeMotionListener() {
+  const appRef = useRef<HTMLDivElement | null>(null);
+  useSuppressPanelMotionOnCanvasResume(appRef);
+
+  return <div ref={appRef} />;
+}
+
+function TourPanel() {
+  const [tour, setTour] = useState({ anchor: "first", revealRequest: 1 });
+
+  return (
+    <>
+      <GuidedTourPanel
+        tour={tourFixture()}
+        activeAnchor={tour.anchor}
+        revealRequest={tour.revealRequest}
+        onActiveAnchorChange={(anchor, { reveal }) =>
+          setTour((previous) => ({
+            anchor,
+            revealRequest: previous.revealRequest + Number(reveal),
+          }))
+        }
+        onClose={() => {}}
+      />
+      <output data-active-tour-anchor>{tour.anchor}</output>
+    </>
+  );
+}
+
+function domRect(overrides: Partial<DOMRect> = {}): DOMRect {
+  return {
+    x: 0,
+    y: 0,
+    width: 320,
+    height: 0,
+    top: 0,
+    right: 320,
+    bottom: 0,
+    left: 0,
+    toJSON: () => ({}),
+    ...overrides,
+  };
+}

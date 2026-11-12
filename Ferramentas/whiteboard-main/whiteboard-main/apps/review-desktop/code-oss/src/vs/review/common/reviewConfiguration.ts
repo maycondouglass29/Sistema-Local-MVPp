@@ -1,0 +1,172 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) dev.fast. All rights reserved.
+ *  Licensed under the MIT License. See LICENSE in the repository root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/**
+ * Registers Review's configuration with the workbench.
+ *
+ * Importing this module pulls in the configuration registry, which constructs
+ * itself — and localizes — at module scope. That makes it unsafe anywhere the
+ * Electron main process can reach before `bootstrapESM()`; see the header of
+ * `reviewConfigurationDefaults.ts`. Renderer code reaches it through the bare
+ * side-effect import in `review.common.main.ts`.
+ *
+ * The setting keys and default values live in `reviewConfigurationDefaults.ts`
+ * and are deliberately *not* re-exported from here: a re-export would let a
+ * main-process consumer import data through this module and put the registry
+ * back on its import path.
+ */
+import { localize } from '../../nls.js';
+import { Registry } from '../../platform/registry/common/platform.js';
+import { ConfigurationScope, Extensions, type IConfigurationRegistry } from '../../platform/configuration/common/configurationRegistry.js';
+import { REVIEW_DIAGRAM_FULLSCREEN_ON_CLICK_SETTING, REVIEW_DIFF_COLOR_THEME_SETTING, REVIEW_INLINE_LINE_NUMBERS_SETTING, DIFF_EDITOR_FONT_SIZE_SETTING, REVIEW_DOCUMENT_FONT_SIZE_BASE, REVIEW_DOCUMENT_FONT_SIZE_SETTING, REVIEW_DOCUMENT_WIDTH_CHOICES, REVIEW_DOCUMENT_WIDTH_SETTING, REVIEW_KEYMAPS, REVIEW_KEYMAP_SETTING, REVIEW_OPEN_FILES_IN_APPLICATION_SETTING, REVIEW_OPEN_FILES_IN_CHOICES, REVIEW_OPEN_FILES_IN_SETTING, REVIEW_PEEK_SIDE_BY_SIDE_SETTING, REVIEW_READING_FONTS, REVIEW_READING_FONT_FAMILY_SETTING, REVIEW_READING_FONT_SETTING, REVIEW_READY_NOTIFICATION_CHOICES, REVIEW_READY_NOTIFICATION_SETTING, REVIEW_REMOTE_HOSTS_SETTING, REVIEW_REMOTE_INSTALL_MODES, REVIEW_REMOTE_INSTALL_SETTING, REVIEW_SOFTWARE_MAP_SETTING, REVIEW_TELEMETRY_SETTING, REVIEW_UPDATE_PILL_SETTING, curatedExtensionConfigurationDefaults, reviewConfigurationDefaults } from './reviewConfigurationDefaults.js';
+
+const configurationRegistry = Registry.as<IConfigurationRegistry>(Extensions.Configuration);
+
+configurationRegistry.registerConfiguration({
+	id: 'review',
+	title: localize('reviewConfigurationTitle', "Whiteboard"),
+	type: 'object',
+	scope: ConfigurationScope.APPLICATION,
+	properties: {
+		[REVIEW_KEYMAP_SETTING]: {
+			type: 'string',
+			enum: [...REVIEW_KEYMAPS],
+			default: 'none',
+			description: localize('review.keymap', "Select the curated keymap extension Whiteboard enables."),
+		},
+		[REVIEW_OPEN_FILES_IN_SETTING]: {
+			type: 'string',
+			enum: [...REVIEW_OPEN_FILES_IN_CHOICES],
+			enumDescriptions: [
+				localize('review.openFilesIn.whiteboard', "Open files in Whiteboard's source window."),
+				localize('review.openFilesIn.vscode', "Open files in Visual Studio Code."),
+				localize('review.openFilesIn.cursor', "Open files in Cursor."),
+				localize('review.openFilesIn.zed', "Open files in Zed."),
+				localize('review.openFilesIn.intellij', "Open files in IntelliJ IDEA."),
+				localize('review.openFilesIn.application', "Open files in the application set in `#review.openFilesInApplication#`, without a line."),
+			],
+			default: 'whiteboard',
+			description: localize('review.openFilesIn', "Where Open file sends a file. A file at a pinned revision opens from the copy Whiteboard keeps for the review. Diffs always open in Whiteboard."),
+		},
+		[REVIEW_OPEN_FILES_IN_APPLICATION_SETTING]: {
+			type: 'string',
+			default: '',
+			// Names a program to run, as `workbench.externalBrowser` does.
+			restricted: true,
+			description: localize('review.openFilesInApplication', "The application Open file uses when `#review.openFilesIn#` is `application`: an `.app` on macOS, or a program elsewhere."),
+		},
+		[REVIEW_DIAGRAM_FULLSCREEN_ON_CLICK_SETTING]: {
+			type: 'boolean',
+			default: false,
+			description: localize('review.diagrams.fullscreenOnClick', "Open inline diagrams fullscreen when selecting a node. When off, select the node and open its sidebar."),
+		},
+		[REVIEW_DOCUMENT_WIDTH_SETTING]: {
+			type: 'string',
+			enum: [...REVIEW_DOCUMENT_WIDTH_CHOICES],
+			enumDescriptions: [
+				localize('review.documentWidth.standard', "A reading-width column."),
+				localize('review.documentWidth.wide', "More room for diagrams and code."),
+				localize('review.documentWidth.full', "Diagrams and code use the full width; text keeps a reading measure."),
+			],
+			default: 'standard',
+			description: localize('review.documentWidth', "Width of the whiteboard document."),
+		},
+		[REVIEW_DIFF_COLOR_THEME_SETTING]: {
+			type: 'string',
+			default: '',
+			description: localize('review.diffColorTheme', "The color theme for backgrounds and change colors in the Diff tab. Empty, or a theme not as light or dark as `#workbench.colorTheme#`, follows that theme; syntax colors always do."),
+		},
+		[REVIEW_DOCUMENT_FONT_SIZE_SETTING]: {
+			type: 'number',
+			minimum: 10,
+			maximum: 32,
+			default: REVIEW_DOCUMENT_FONT_SIZE_BASE,
+			description: localize('review.document.fontSize', "Paragraph size on whiteboards, in pixels. Headings scale with it."),
+		},
+		[REVIEW_READING_FONT_SETTING]: {
+			type: 'string',
+			enum: [...REVIEW_READING_FONTS],
+			enumDescriptions: [
+				localize('review.readingFont.serif', "Newsreader."),
+				localize('review.readingFont.sans', "Inter, the interface face."),
+			],
+			default: 'serif',
+			description: localize('review.readingFont', "The face for whiteboard prose, Ask answers and trace notes."),
+		},
+		[REVIEW_READING_FONT_FAMILY_SETTING]: {
+			type: 'string',
+			default: '',
+			description: localize('review.readingFontFamily', "A font family for whiteboard prose, Ask answers and trace notes. When set, it replaces the reading typeface."),
+		},
+		// Diffs merge `diffEditor.*` over `editor.*`.
+		[DIFF_EDITOR_FONT_SIZE_SETTING]: {
+			type: 'number',
+			minimum: 6,
+			maximum: 100,
+			default: 12,
+			description: localize('diffEditor.fontSize', "Font size in the Diff tab, diff blocks and code peeks, in pixels."),
+		},
+		[REVIEW_INLINE_LINE_NUMBERS_SETTING]: {
+            type: 'boolean',
+            default: false,
+            description: localize('review.inlineDiffs.showLineNumbers', "Show line numbers in Whiteboard document diffs and code peeks. The Diff view keeps its own line numbers."),
+        },
+		[REVIEW_PEEK_SIDE_BY_SIDE_SETTING]: {
+			type: 'boolean',
+			default: false,
+			description: localize('review.peeks.renderSideBySide', "Show code peeks side by side. When off, code peeks show a unified diff."),
+		},
+		[REVIEW_READY_NOTIFICATION_SETTING]: {
+			type: 'string',
+			enum: [...REVIEW_READY_NOTIFICATION_CHOICES],
+			enumDescriptions: [
+				localize('review.notifications.reviewReady.notificationAndBadge', "Show a notification and badge the Dock icon."),
+				localize('review.notifications.reviewReady.notification', "Show a notification only."),
+				localize('review.notifications.reviewReady.off', "Don't notify."),
+			],
+			default: 'off',
+			description: localize('review.notifications.reviewReady', "How Whiteboard tells you an agent finished a review."),
+		},
+		[REVIEW_UPDATE_PILL_SETTING]: {
+			type: 'boolean',
+			default: true,
+			description: localize('review.update.showPill', "Show a pill at the canvas's bottom left while an update waits for a relaunch."),
+		},
+		[REVIEW_TELEMETRY_SETTING]: {
+			type: 'boolean',
+			default: true,
+			description: localize('review.telemetry.enabled', "Send anonymous Whiteboard usage data."),
+		},
+		[REVIEW_SOFTWARE_MAP_SETTING]: {
+			type: 'boolean',
+			default: false,
+			description: localize('review.experimental.softwareMap.enabled', "Show the experimental Software Map view in sessions."),
+		},
+		[REVIEW_REMOTE_HOSTS_SETTING]: {
+			type: 'array',
+			items: { type: 'string' },
+			default: [],
+			scope: ConfigurationScope.APPLICATION,
+			description: localize('review.remote.hosts', "SSH host aliases, from your SSH configuration, whose Whiteboard reviews to show."),
+		},
+		[REVIEW_REMOTE_INSTALL_SETTING]: {
+			type: 'string',
+			enum: [...REVIEW_REMOTE_INSTALL_MODES],
+			enumDescriptions: [
+				localize('review.remote.install.ask', "Ask once per host before installing."),
+				localize('review.remote.install.always', "Install without asking."),
+				localize('review.remote.install.never', "Never install; use the Whiteboard you installed on the host."),
+			],
+			default: 'ask',
+			scope: ConfigurationScope.APPLICATION,
+			description: localize('review.remote.install', "Whether Whiteboard installs its own version on a remote host, under ~/.dev/whiteboard-remote, when the host does not have it."),
+		},
+	},
+});
+
+configurationRegistry.registerDefaultConfigurations([
+	{ overrides: reviewConfigurationDefaults },
+	{ overrides: curatedExtensionConfigurationDefaults }
+]);

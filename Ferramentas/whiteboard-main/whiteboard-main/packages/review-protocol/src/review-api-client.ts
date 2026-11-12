@@ -1,0 +1,444 @@
+import type { JsonObject } from "@dev.fast/json";
+
+import type { ReviewGatewayHostState } from "./contracts.js";
+import type { PullRequestState } from "./contracts.js";
+
+/** List metadata for the authenticated local catalog; document contents stay in snapshots. */
+export interface ReviewApiSummary {
+  reviewId: string;
+  version: number;
+  title: string;
+  /** Absent for a document whose references all carry their own pins. */
+  pins?: {
+    repositoryId: string;
+    base: string;
+    head: string;
+    worktreeRevision?: string;
+  };
+  target?:
+    | { kind: "project"; repositoryId: string }
+    | { kind: "worktree"; repositoryId: string; base?: string }
+    | { kind: "commits"; repositoryId: string; head: string; base?: string };
+  createdAt: string;
+  /** Timestamp of the earliest retained review version, when known. */
+  firstCreatedAt?: string;
+  /** The branch and PR the review is of; see SnapshotOrigin. */
+  origin?: {
+    branch?: string;
+    baseRef?: string;
+    baseBranch?: string;
+    pullRequestNumber?: number;
+    pullRequestUrl?: string;
+    pullRequestTitle?: string;
+    pullRequestBaseBranch?: string;
+    revision?: string;
+  };
+  /** The PR's state on GitHub, when the host has read it. */
+  pullRequestState?: PullRequestState;
+  /** Shared imports have separate local checkouts but retain their remote identity. */
+  shared?: { cloneUrl?: string };
+  /** The project the board belongs to; absent for a share with no
+   * repository here. */
+  project?: { id: string; name: string };
+  repositoryName: string;
+  repositoryPath?: string;
+  diffStats?: {
+    fileCount: number;
+    additions: number;
+    deletions: number;
+  } | null;
+  viewedAt: string | null;
+  trashedAt: string | null;
+  /** A version was saved after viewedAt, or the board was never viewed. */
+  changed?: boolean;
+  /** An agent holds a live lease; absent on shared reviews. */
+  working?: boolean;
+  host?: string;
+  hostState?: Exclude<ReviewGatewayHostState["state"], "duplicate">;
+  available?: {
+    sourceWindows: boolean;
+    /** Why they are off: the host's sentence, or its language features detail. */
+    reason?: string;
+    pending?: true;
+  };
+  /** The board this one is nested under; absent at top level. */
+  parentId?: string;
+  /** The boards nested under this one, in sibling order. */
+  children?: string[];
+  /** The boards in its project this one builds on. */
+  dependsOn?: string[];
+}
+
+export type ReviewStreamSnapshot<Snapshot extends object = JsonObject> =
+  Snapshot & {
+    activity: { workingCount: number; expiresAt: number | null };
+    coverageRevision: number;
+    /** Bumped when a board the review links to changes. */
+    linksRevision?: number;
+    /** Bumped when the review's parent or siblings change. */
+    placeRevision?: number;
+  };
+
+export type ReviewStreamLine<Snapshot extends object = JsonObject> =
+  | {
+      kind: "list";
+      // Older clients match list lines by it.
+      mode: "structural";
+      reviews: ReviewApiSummary[];
+    }
+  | { kind: "review"; reviewId: string; value: ReviewStreamSnapshot<Snapshot> }
+  | { kind: "review"; reviewId: string; error: string };
+
+export interface ReviewSourceEntry {
+  path: string;
+  kind: "file" | "directory";
+}
+
+type Subscription = {
+  reviewId: string | null;
+};
+
+type Request = (url: string, init?: RequestInit) => Promise<Response>;
+
+const defaultRequest: Request = (url, init) => fetch(url, init);
+
+/** A non-2xx reply; the status tells a caller whether retrying can help. */
+export class ReviewApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "ReviewApiError";
+  }
+}
+
+// One live connection per transport/server, shared by mounted canvases.
+const liveConnections = new WeakMap<Request, Map<string, LiveConnection>>();
+
+/** Shared by the canvas and thin agent clients; no filesystem or SQL access. */
+export class ReviewApiClient {
+  constructor(
+    readonly connection: { serverUrl: string; token: string },
+    private readonly request: Request = defaultRequest,
+  ) {}
+  async response(route: string, init?: RequestInit) {
+    const headers = new Headers(init?.headers);
+    headers.set("x-review-token", this.connection.token);
+
+    if (init?.body) headers.set("content-type", "application/json");
+
+    const response = await this.request(
+      `${this.connection.serverUrl}/reviews-api${route}`,
+      { ...init, headers },
+    );
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      throw new ReviewApiError(
+        body?.error ?? `Review request failed (${response.status}).`,
+        response.status,
+      );
+    }
+
+    return response;
+  }
+  async read<T>(route: string, signal?: AbortSignal): Promise<T> {
+    return (await this.response(route, { signal })).json();
+  }
+  async post<T>(
+    route: string,
+    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- JSON transport boundary; the selected host route parses its input schema.
+    input: unknown,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    return (
+      await this.response(route, {
+        method: "POST",
+        body: JSON.stringify(input),
+        signal,
+      })
+    ).json();
+  }
+  /** A command the person gave from the app, not an agent: its version is
+   * credited to them, and a block they hold never stops it. The header is
+   * the one request-origin.ts names. */
+  async personCommand<T>(
+    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- JSON transport boundary; /commands parses its input schema.
+    operation: unknown,
+  ): Promise<T> {
+    return (
+      await this.response("/commands", {
+        method: "POST",
+        headers: { "x-review-person": "1" },
+        body: JSON.stringify({ operation }),
+      })
+    ).json();
+  }
+  async *watch(
+    subscriptions: Subscription[],
+    signal: AbortSignal,
+  ): AsyncGenerator<ReviewStreamLine> {
+    const response = await this.response(
+      `/watch?subscriptions=${encodeURIComponent(JSON.stringify(subscriptions))}`,
+      { signal },
+    );
+
+    const reader = response
+      .body!.pipeThrough(new TextDecoderStream())
+      .getReader();
+
+    const cancel = () => {
+      void reader.cancel().catch(() => {});
+    };
+
+    signal.addEventListener("abort", cancel, { once: true });
+
+    if (signal.aborted) cancel();
+    let pending = "";
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+
+        if (done) return;
+        pending += value;
+        let end: number;
+
+        while ((end = pending.indexOf("\n")) !== -1) {
+          // SAFETY: the authenticated host writes ReviewStreamLine values.
+          yield JSON.parse(pending.slice(0, end)) as ReviewStreamLine;
+          pending = pending.slice(end + 1);
+        }
+      }
+    } finally {
+      signal.removeEventListener("abort", cancel);
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+  }
+  async follow<T>(
+    reviewId: string | null,
+    signal: AbortSignal,
+    accept: (snapshot: T) => void | Promise<void>,
+    disconnected: (cause: unknown) => void,
+  ) {
+    if (signal.aborted) return;
+    let connections = liveConnections.get(this.request);
+
+    if (!connections)
+      liveConnections.set(this.request, (connections = new Map()));
+
+    const key = this.liveKey();
+    let live = connections.get(key);
+
+    if (!live) {
+      live = new LiveConnection(this, () => connections.delete(key));
+      connections.set(key, live);
+    }
+
+    const subscription: Subscription = { reviewId };
+
+    return live.add(
+      subscription,
+      signal,
+      // SAFETY: this listener requests the review whose snapshot type is T.
+      (value) => accept(value as T),
+      disconnected,
+    );
+  }
+  /** Reopen the shared stream now rather than after its backoff. */
+  reconnect() {
+    liveConnections.get(this.request)?.get(this.liveKey())?.reconnect();
+  }
+  private liveKey() {
+    return JSON.stringify([this.connection.serverUrl, this.connection.token]);
+  }
+}
+
+type Result =
+  | { value: ReviewStreamSnapshot | ReviewApiSummary[] }
+  | { error: string };
+
+type Listener = {
+  subscription: Subscription;
+  signal: AbortSignal;
+  accept(
+    value: ReviewStreamSnapshot | ReviewApiSummary[],
+  ): void | Promise<void>;
+  disconnected(cause: unknown): void;
+  /** The newest undelivered result; replaced rather than queued while a render runs. */
+  queued?: Result;
+  draining?: boolean;
+};
+
+// Tabs mounting in separate frames share one replacement stream.
+const restartDelayMs = 20;
+
+const retryDelayMs = 1000;
+
+function sleep(ms: number, signal: AbortSignal) {
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
+
+function concerns(line: ReviewStreamLine, subscription: Subscription) {
+  return line.kind === "list"
+    ? subscription.reviewId === null
+    : subscription.reviewId === line.reviewId;
+}
+
+function report(listener: Listener, cause: unknown) {
+  if (listener.signal.aborted) return;
+
+  try {
+    listener.disconnected(cause);
+  } catch {
+    // One tab's handler must not take the shared stream down for the others.
+  }
+}
+
+class LiveConnection {
+  private readonly listeners = new Set<Listener>();
+  private abort = new AbortController();
+  private active = false;
+  private scheduled: ReturnType<typeof setTimeout> | undefined;
+  constructor(
+    private readonly client: ReviewApiClient,
+    private readonly empty: () => void,
+  ) {}
+
+  add(
+    subscription: Subscription,
+    signal: AbortSignal,
+    accept: Listener["accept"],
+    disconnected: Listener["disconnected"],
+  ) {
+    const listener: Listener = { subscription, signal, accept, disconnected };
+    this.listeners.add(listener);
+    this.restart();
+
+    return new Promise<void>((resolve) => {
+      const stop = () => {
+        signal.removeEventListener("abort", stop);
+        this.listeners.delete(listener);
+
+        if (this.listeners.size) this.restart();
+        else {
+          clearTimeout(this.scheduled);
+          this.scheduled = undefined;
+          this.abort.abort();
+          this.active = false;
+          this.empty();
+        }
+
+        resolve();
+      };
+
+      signal.addEventListener("abort", stop, { once: true });
+
+      if (signal.aborted) stop();
+    });
+  }
+
+  /** The first tab connects at once; later tabs share one replacement stream. */
+  private restart() {
+    if (this.scheduled) return;
+
+    if (!this.active) {
+      this.reconnect();
+
+      return;
+    }
+
+    this.scheduled = setTimeout(() => {
+      this.scheduled = undefined;
+      this.reconnect();
+    }, restartDelayMs);
+  }
+
+  reconnect() {
+    this.abort.abort();
+    this.abort = new AbortController();
+    const listeners = [...this.listeners];
+    this.active = listeners.length > 0;
+
+    if (this.active) void this.run(listeners, this.abort.signal);
+  }
+
+  private async run(listeners: Listener[], signal: AbortSignal) {
+    const disconnected = (cause: unknown) =>
+      listeners.forEach((listener) => report(listener, cause));
+
+    let delay = 1000;
+
+    while (!signal.aborted) {
+      try {
+        for await (const line of this.client.watch(
+          listeners.map((item) => item.subscription),
+          signal,
+        )) {
+          if (signal.aborted) break;
+          delay = 1000;
+          const result = line.kind === "list" ? { value: line.reviews } : line;
+
+          for (const listener of listeners)
+            if (concerns(line, listener.subscription))
+              this.deliver(listener, result);
+        }
+
+        if (!signal.aborted) disconnected(new Error("Connection closed."));
+      } catch (error) {
+        if (!signal.aborted) disconnected(error);
+
+        if (
+          error instanceof ReviewApiError &&
+          [401, 403, 404].includes(error.status)
+        )
+          return;
+      }
+
+      if (!signal.aborted) await sleep(delay, signal);
+      delay = Math.min(delay * 2, 30_000);
+    }
+  }
+
+  /** Renders never block the stream: a slow tab only delays its own newest state. */
+  private deliver(listener: Listener, result: Result) {
+    listener.queued = result;
+
+    if (listener.draining) return;
+    listener.draining = true;
+
+    void (async () => {
+      while (listener.queued && !listener.signal.aborted) {
+        const next = listener.queued;
+        listener.queued = undefined;
+
+        if ("error" in next) {
+          report(listener, new Error(next.error));
+          continue;
+        }
+
+        try {
+          await listener.accept(next.value);
+        } catch (error) {
+          report(listener, error);
+          // Retry the same snapshot after the delay unless a newer one arrived.
+          await sleep(retryDelayMs, listener.signal);
+          listener.queued ??= next;
+        }
+      }
+
+      listener.draining = false;
+    })();
+  }
+}

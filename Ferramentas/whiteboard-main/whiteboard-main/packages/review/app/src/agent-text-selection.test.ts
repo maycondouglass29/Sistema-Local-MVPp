@@ -1,0 +1,178 @@
+// @vitest-environment jsdom
+import { expect, it, vi } from "vitest";
+
+import { observeAgentTextSelection } from "./agent-text-selection";
+
+it("captures exact prose and its anchor, clears collapsed selections, and ignores native editors", () => {
+  const article = document.createElement("article");
+  article.innerHTML =
+    '<p data-review-copy-prose>before <strong>selected words</strong> after</p><div class="monaco-editor">code</div>';
+  document.body.append(article);
+  const select = vi.fn<Parameters<typeof observeAgentTextSelection>[1]>();
+  const stop = observeAgentTextSelection(article, select);
+  const selection = document.getSelection()!;
+  const range = document.createRange();
+  article.getBoundingClientRect = () => new DOMRect(0, 0, 800, 800);
+  range.selectNodeContents(article.querySelector("strong")!);
+  Object.defineProperty(range, "getClientRects", {
+    value: () => [{ left: 20, right: 120, top: 50, bottom: 70 }],
+  });
+
+  try {
+    selection.removeAllRanges();
+    selection.addRange(range);
+    document.dispatchEvent(new Event("selectionchange"));
+    expect(select).toHaveBeenLastCalledWith({
+      target: { kind: "text", quote: "selected words" },
+      title: "selected words",
+      anchor: { x: 120, y: 108 },
+      anchorElement: article.querySelector("strong"),
+      range: expect.any(Range),
+    });
+    const selected = select.mock.lastCall?.[0]?.range;
+    selection.removeAllRanges();
+    document.dispatchEvent(new Event("selectionchange"));
+    expect(select).toHaveBeenLastCalledWith(null);
+    select.mockClear();
+    range.selectNodeContents(article.querySelector(".monaco-editor")!);
+    selection.addRange(range);
+    document.dispatchEvent(new Event("selectionchange"));
+    expect(select).not.toHaveBeenCalled();
+    // A copy, so asking later reads the words that were selected.
+    expect(selected?.toString()).toBe("selected words");
+    stop();
+    range.selectNodeContents(article.querySelector("strong")!);
+    document.dispatchEvent(new Event("selectionchange"));
+    expect(select).not.toHaveBeenCalled();
+  } finally {
+    stop();
+    selection.removeAllRanges();
+    article.remove();
+  }
+});
+
+it.each([
+  '<figure class="sequence-diagram"><span>sequence actor</span></figure>',
+  '<figure class="database-lens"><span>Orders</span></figure>',
+  '<figure class="software-map"><span>Service</span></figure>',
+  '<figure class="review-image"><figcaption>Image caption</figcaption></figure>',
+  "<div data-review-copy-prose><pre>unmarked preformatted text</pre></div>",
+  '<div data-review-copy-prose><pre><span aria-hidden="true">1</span><code data-review-copy-prose>const value = 1;</code></pre></div>',
+  "<div data-review-copy-prose><div data-review-copy-ignore>PR metadata</div></div>",
+])("ignores non-prose content: %s", (html) => {
+  const article = document.createElement("article");
+  article.innerHTML = html;
+  document.body.append(article);
+  const select = vi.fn<Parameters<typeof observeAgentTextSelection>[1]>();
+  const stop = observeAgentTextSelection(article, select);
+  const selection = document.getSelection()!;
+  const range = document.createRange();
+  const walker = document.createTreeWalker(article, NodeFilter.SHOW_TEXT);
+  range.selectNodeContents(walker.nextNode()!);
+
+  try {
+    selection.removeAllRanges();
+    selection.addRange(range);
+    document.dispatchEvent(new Event("selectionchange"));
+    expect(select).not.toHaveBeenCalled();
+  } finally {
+    stop();
+    selection.removeAllRanges();
+    article.remove();
+  }
+});
+
+it("rejects selections crossing a diagram, but permits consecutive prose blocks", () => {
+  const article = document.createElement("article");
+  article.innerHTML =
+    "<p data-review-copy-prose>First</p><figure>Diagram label</figure><p data-review-copy-prose>Last</p>";
+  document.body.append(article);
+  const select = vi.fn<Parameters<typeof observeAgentTextSelection>[1]>();
+  const stop = observeAgentTextSelection(article, select);
+  const selection = document.getSelection()!;
+  const range = document.createRange();
+  range.setStart(article.firstElementChild!.firstChild!, 0);
+  range.setEnd(article.lastElementChild!.firstChild!, 4);
+  Object.defineProperty(range, "getClientRects", {
+    value: () => [{ left: 0, right: 10, top: 0, bottom: 0 }],
+  });
+
+  try {
+    selection.removeAllRanges();
+    selection.addRange(range);
+    document.dispatchEvent(new Event("selectionchange"));
+    expect(select).not.toHaveBeenCalled();
+    article.querySelector("figure")!.remove();
+    document.dispatchEvent(new Event("selectionchange"));
+    expect(select).toHaveBeenLastCalledWith(
+      expect.objectContaining({ target: { kind: "text", quote: "FirstLast" } }),
+    );
+  } finally {
+    stop();
+    selection.removeAllRanges();
+    article.remove();
+  }
+});
+
+it("waits for the pointer to release before reporting a dragged selection", () => {
+  const article = document.createElement("article");
+  article.innerHTML = "<p data-review-copy-prose>dragged words</p>";
+  document.body.append(article);
+  const select = vi.fn<Parameters<typeof observeAgentTextSelection>[1]>();
+  const stop = observeAgentTextSelection(article, select);
+  const selection = document.getSelection()!;
+  const range = document.createRange();
+  range.selectNodeContents(article.querySelector("p")!);
+  Object.defineProperty(range, "getClientRects", {
+    value: () => [{ left: 0, right: 0, top: 0, bottom: 0 }],
+  });
+
+  try {
+    document.dispatchEvent(new MouseEvent("pointerdown"));
+    selection.removeAllRanges();
+    selection.addRange(range);
+    document.dispatchEvent(new Event("selectionchange"));
+    expect(select).not.toHaveBeenCalled();
+    document.dispatchEvent(new Event("pointerup"));
+    expect(select).toHaveBeenCalledOnce();
+    expect(select.mock.lastCall?.[0]?.target).toEqual({
+      kind: "text",
+      quote: "dragged words",
+    });
+    document.dispatchEvent(new MouseEvent("pointerdown"));
+    document.dispatchEvent(new Event("pointerup"));
+    expect(select).toHaveBeenCalledOnce();
+  } finally {
+    stop();
+    selection.removeAllRanges();
+    article.remove();
+  }
+});
+
+it("anchors a backward selection at the end it was dragged to", () => {
+  const article = document.createElement("article");
+  article.innerHTML = "<p data-review-copy-prose>dragged back</p>";
+  document.body.append(article);
+  const select = vi.fn<Parameters<typeof observeAgentTextSelection>[1]>();
+  const stop = observeAgentTextSelection(article, select);
+  const selection = document.getSelection()!;
+  const text = article.querySelector("p")!.firstChild!;
+  selection.setBaseAndExtent(text, 12, text, 3);
+  Object.defineProperty(selection.getRangeAt(0), "getClientRects", {
+    value: () => [
+      { left: 10, right: 90, top: 100, bottom: 120 },
+      { left: 10, right: 60, top: 300, bottom: 320 },
+    ],
+  });
+
+  try {
+    document.dispatchEvent(new Event("selectionchange"));
+    expect(select).toHaveBeenLastCalledWith(
+      expect.objectContaining({ anchor: { x: 10, y: 100 } }),
+    );
+  } finally {
+    stop();
+    selection.removeAllRanges();
+    article.remove();
+  }
+});

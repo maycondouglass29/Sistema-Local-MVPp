@@ -1,0 +1,745 @@
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { readFile, rm } from "node:fs/promises";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
+import { git, gitCommonDir } from "@dev.fast/local-vcs";
+import {
+  errorMessage,
+  pidReused,
+  processIsAlive,
+  processStartIdentity,
+} from "@dev.fast/trace-core";
+import { type Pins, ReviewInputError } from "@dev.fast/whiteboard-document";
+import { reviewManagedCheckoutRoot } from "@review/review-checkout-paths.js";
+import {
+  ensureReviewPinnedCheckout,
+  removeReviewManagedCheckouts,
+} from "@review/review-head-checkout.js";
+import {
+  markerMatches,
+  prepareReviewPinnedCheckout,
+  removeReviewPrepareArtifacts,
+  reviewPrepareCommandsHash,
+  reviewPrepareLogPath,
+  reviewPrepareMarkerPath,
+} from "@review/review-prepare.js";
+
+import type { ReviewStore } from "./store.js";
+
+export interface WorkspaceStatus {
+  id: string;
+  commit: string;
+  rootPath: string | null;
+  generation: string;
+  state:
+    | "pending"
+    | "preparing"
+    | "ready"
+    | "unconfigured"
+    | "failed"
+    | "cleanup-failed";
+  log: string;
+  /** Acquisition failed; this can be transient. Optional setup failures are not issues. */
+  issue?: string;
+}
+
+interface Environment extends WorkspaceStatus {
+  reviewId: string;
+  repositoryId: string;
+  repository: string;
+  commandsHash: string;
+  /** Legacy rows only; collected on startup. */
+  role?: "base" | "head";
+}
+
+const legacyBase = (environment: Environment) => environment.role === "base";
+
+/** Local lifecycle only: source and authored history never depend on preparation.
+ * Status/queue/process lifecycle follows #334, retaining the legacy prepare config
+ * and per-review managed checkout layout instead of a new settings system.
+ */
+export class ReviewWorkspaces {
+  private readonly db: DatabaseSync;
+  private readonly requests = new Map<string, Promise<WorkspaceStatus>>();
+  private readonly jobs = new Map<
+    string,
+    { done: Promise<void>; abort: AbortController }
+  >();
+  private readonly stop: () => void;
+  private cleanup: Promise<void> = Promise.resolve();
+  private closed = false;
+  private readonly ownerId = randomUUID();
+
+  constructor(
+    databasePath: string,
+    private readonly store: ReviewStore,
+  ) {
+    this.db = new DatabaseSync(databasePath, { timeout: 5000 });
+    this.db.exec(
+      "PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS pinned_environments(id TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    );
+
+    // Desktops sharing a profile each own the reviews they prepare; the
+    // lease stops a second process from preparing or collecting them. The
+    // profile-wide lock it replaces only ever shipped in preview builds.
+    // Older leases have no start identity and may name a reused pid.
+    if (
+      !this.db
+        .prepare(
+          "SELECT 1 FROM pragma_table_info('workspace_leases') WHERE name='started'",
+        )
+        .get()
+    )
+      this.db.exec("DROP TABLE IF EXISTS workspace_leases");
+    this.db.exec(
+      "DROP TABLE IF EXISTS workspace_owner; CREATE TABLE IF NOT EXISTS workspace_leases(review_id TEXT PRIMARY KEY,owner TEXT NOT NULL,pid INTEGER NOT NULL,started TEXT)",
+    );
+    this.db.exec("BEGIN IMMEDIATE");
+
+    try {
+      // Only the owning Desktop can invalidate generations or recover interrupted preparation.
+      for (const environment of this.all()) {
+        if (this.leasedElsewhere(environment.reviewId)) continue;
+
+        if (environment.state === "preparing") environment.state = "pending";
+        environment.generation = randomUUID();
+        this.save(environment);
+      }
+
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      this.db.close();
+      throw error;
+    }
+
+    const stopCatalog = store.subscribeCatalog(() => {
+      this.collect();
+      this.releaseTrashed();
+    });
+
+    const stopDeleted = store.subscribe(({ reviewId, deleted }) => {
+      if (!deleted) return;
+      const repositories = this.repositoryDirs();
+      repositories.catch(() => undefined);
+      this.release(reviewId, repositories, () => !this.hasReview(reviewId));
+    });
+
+    this.stop = () => {
+      stopCatalog();
+      stopDeleted();
+    };
+
+    this.collect();
+    this.releaseTrashed();
+  }
+
+  // Unset until the first scan, so startup also frees reviews trashed
+  // while no Desktop was running.
+  private trashed?: Set<string>;
+  private readonly releasing = new Map<string, Promise<void>>();
+
+  /**
+   * Frees a newly trashed review's checkouts to save disk. The review itself
+   * stays; reopening it rebuilds them. Checkouts rebuilt by peeking at a
+   * trashed review are kept until the next startup or move to Trash, since
+   * the Desktop's canvas tabs and source windows may still show them.
+   */
+  private releaseTrashed() {
+    const trashed = new Set(this.store.trashedIds());
+    const released = [...trashed].filter((id) => !this.trashed?.has(id));
+    this.trashed = trashed;
+
+    if (!released.length) return;
+
+    const repositories = this.repositoryDirs();
+    // Each release awaits this only after earlier cleanup and logs its failure.
+    repositories.catch(() => undefined);
+
+    for (const reviewId of released)
+      this.release(reviewId, repositories, () => this.stillTrashed(reviewId));
+  }
+
+  /** Restored since the move to Trash: its checkouts may be in use. */
+  private stillTrashed(reviewId: string) {
+    return this.store.trashedIds().includes(reviewId);
+  }
+
+  private async repositoryDirs(): Promise<string[]> {
+    const dirs = new Set(this.all().map((item) => item.repository));
+
+    for (const { path: root } of this.store.repositories()) {
+      const common = await gitCommonDir(root).catch(() => null);
+
+      if (common) dirs.add(common);
+    }
+
+    return [...dirs].filter(Boolean);
+  }
+
+  /** Resolves once no release of the review is pending, so an ensure cannot race it. */
+  released(reviewId: string): Promise<void> {
+    return this.releasing.get(reviewId) ?? Promise.resolve();
+  }
+
+  private release(
+    reviewId: string,
+    repositories: Promise<string[]>,
+    stillReleased: () => boolean,
+  ) {
+    // Requests started later wait for this release; earlier ones finish first.
+    const requests = [...this.requests.values()];
+
+    const done = this.cleanup
+      .then(async () => {
+        await Promise.allSettled(requests);
+        await this.releaseCheckouts(
+          reviewId,
+          await repositories,
+          stillReleased,
+        );
+      })
+      .catch((error) => {
+        console.error(
+          `Could not free the pinned checkouts of review ${reviewId}:`,
+          error,
+        );
+      })
+      .finally(() => {
+        if (this.releasing.get(reviewId) === done)
+          this.releasing.delete(reviewId);
+      });
+
+    this.releasing.set(reviewId, done);
+    this.cleanup = done;
+  }
+
+  private async releaseCheckouts(
+    reviewId: string,
+    repositories: string[],
+    stillReleased: () => boolean,
+  ) {
+    if (!stillReleased()) return;
+
+    const environments = this.all().filter(
+      (item) => item.reviewId === reviewId,
+    );
+
+    const checkouts = repositories.filter((repository) =>
+      existsSync(reviewManagedCheckoutRoot(repository, reviewId)),
+    );
+
+    if ((!environments.length && !checkouts.length) || !this.claim(reviewId))
+      return;
+
+    for (const environment of environments) {
+      const job = this.jobs.get(environment.id);
+      job?.abort.abort();
+      await job?.done;
+    }
+
+    const errors: string[] = [];
+
+    for (const repository of checkouts)
+      await removeReviewManagedCheckouts(repository, reviewId).catch((error) =>
+        errors.push(errorMessage(error)),
+      );
+
+    // Only a checkout still on disk failed; the others are gone.
+    for (const environment of environments)
+      if (
+        errors.length &&
+        environment.rootPath &&
+        existsSync(environment.rootPath)
+      ) {
+        environment.state = "cleanup-failed";
+        environment.log = errors.join("\n");
+        this.save(environment);
+      } else
+        this.db
+          .prepare("DELETE FROM pinned_environments WHERE id=?")
+          .run(environment.id);
+    this.db
+      .prepare(
+        "DELETE FROM workspace_leases WHERE review_id=? AND owner=? AND NOT EXISTS(SELECT 1 FROM pinned_environments WHERE value->>'reviewId'=?)",
+      )
+      .run(reviewId, this.ownerId, reviewId);
+
+    if (errors.length) throw new Error(errors.join("\n"));
+  }
+
+  private hasReview(id: string): boolean {
+    return this.store.has(id);
+  }
+
+  private assertReview(id: string) {
+    if (!this.hasReview(id)) this.store.assertExists(id);
+  }
+
+  async remove(reviewId: string) {
+    if (!this.claim(reviewId))
+      throw new ReviewInputError(this.ownedElsewhere(reviewId), 409);
+    await Promise.all(this.requests.values());
+    this.collect(undefined, reviewId);
+    await this.cleanup;
+
+    if (this.all().some((item) => item.reviewId === reviewId))
+      throw new ReviewInputError(
+        "Could not remove the managed workspace. Retry deletion.",
+        409,
+      );
+  }
+
+  private lease(reviewId: string) {
+    const row = this.db
+      .prepare(
+        "SELECT owner,pid,started FROM workspace_leases WHERE review_id=?",
+      )
+      .get(reviewId);
+
+    return (
+      row && {
+        owner: String(row.owner),
+        pid: Number(row.pid),
+        started: String(row.started ?? ""),
+      }
+    );
+  }
+
+  private leasedElsewhere(reviewId: string): boolean {
+    const lease = this.lease(reviewId);
+
+    return Boolean(
+      lease &&
+      lease.owner !== this.ownerId &&
+      processIsAlive(lease.pid) &&
+      !pidReused(lease.pid, lease.started),
+    );
+  }
+
+  /** The holder may release its lease after `claim` fails. */
+  private ownedElsewhere(reviewId: string) {
+    const pid = this.lease(reviewId)?.pid;
+
+    return pid
+      ? `Whiteboard process ${pid} is managing this review's language workspaces. Quit that Whiteboard Desktop or run \`whiteboard server stop\`, then retry.`
+      : "Another Whiteboard process was managing this review's language workspaces. Retry.";
+  }
+
+  /** Takes the review's lease unless another live Desktop holds it. */
+  private claim(reviewId: string): boolean {
+    // Status reads claim on every poll; holding the lease needs no write lock.
+    if (this.lease(reviewId)?.owner === this.ownerId) return true;
+    this.db.exec("BEGIN IMMEDIATE");
+
+    try {
+      const free = !this.leasedElsewhere(reviewId);
+
+      if (free)
+        this.db
+          .prepare("INSERT OR REPLACE INTO workspace_leases VALUES(?,?,?,?)")
+          .run(
+            reviewId,
+            this.ownerId,
+            process.pid,
+            processStartIdentity(process.pid),
+          );
+      this.db.exec("COMMIT");
+
+      return free;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private all(): Environment[] {
+    return this.db
+      .prepare("SELECT value FROM pinned_environments")
+      .all()
+      .map((row) => JSON.parse(String(row.value)));
+  }
+
+  private get(id: string): Environment | undefined {
+    const row = this.db
+      .prepare("SELECT value FROM pinned_environments WHERE id=?")
+      .get(id);
+
+    return row ? JSON.parse(String(row.value)) : undefined;
+  }
+
+  private save(environment: Environment) {
+    this.db
+      .prepare(
+        "INSERT INTO pinned_environments VALUES(?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value",
+      )
+      .run(environment.id, JSON.stringify(environment));
+  }
+
+  private status(environment: Environment): WorkspaceStatus {
+    const { id, commit, rootPath, generation, state, log } = environment;
+
+    const status: WorkspaceStatus = {
+      id,
+      commit,
+      rootPath,
+      generation,
+      state,
+      log,
+    };
+
+    if (state === "failed" && !rootPath) status.issue = log;
+
+    return status;
+  }
+
+  list(reviewId: string): WorkspaceStatus[] {
+    return this.all()
+      .filter((item) => item.reviewId === reviewId)
+      .map((item) => this.status(item));
+  }
+
+  failures(): WorkspaceStatus[] {
+    return this.all()
+      .filter((item) => item.state === "cleanup-failed")
+      .map((item) => this.status(item));
+  }
+
+  async retryCleanup(id: string) {
+    const environment = this.get(id);
+
+    if (!environment || environment.state !== "cleanup-failed")
+      throw new ReviewInputError("Cleanup failure not found.", 404);
+
+    // A trashed review keeps its record, so collection would skip it.
+    if (this.store.has(environment.reviewId))
+      this.release(environment.reviewId, this.repositoryDirs(), () =>
+        this.stillTrashed(environment.reviewId),
+      );
+    else this.collect(id);
+    await this.cleanup;
+  }
+
+  source(
+    reviewId: string,
+    pins: Pins,
+    retryFailed = false,
+  ): Promise<WorkspaceStatus> {
+    if (this.closed)
+      return Promise.reject(new Error("Language environments are closed."));
+    this.assertReview(reviewId);
+
+    const id = createHash("sha256")
+      .update(JSON.stringify([reviewId, pins.repositoryId, pins.head]))
+      .digest("hex");
+
+    const current = this.requests.get(id);
+
+    if (current) return current;
+
+    if (!this.claim(reviewId)) {
+      const environment = this.get(id);
+
+      return Promise.resolve(
+        environment
+          ? this.status(environment)
+          : {
+              id,
+              commit: pins.head,
+              rootPath: null,
+              generation: "",
+              state: "pending",
+              log: this.ownedElsewhere(reviewId),
+            },
+      );
+    }
+
+    const request = this.acquire(id, reviewId, pins, retryFailed).finally(() =>
+      this.requests.delete(id),
+    );
+
+    this.requests.set(id, request);
+
+    return request;
+  }
+
+  private async acquire(
+    id: string,
+    reviewId: string,
+    pins: Pins,
+    retryFailed: boolean,
+  ): Promise<WorkspaceStatus> {
+    await this.released(reviewId);
+    let environment = this.get(id);
+
+    if (this.jobs.has(id)) return this.status(environment!);
+    environment ??= {
+      id,
+      reviewId,
+      repositoryId: pins.repositoryId,
+      repository: "",
+      commit: pins.head,
+      rootPath: null,
+      generation: randomUUID(),
+      commandsHash: "",
+      state: "pending",
+      log: "",
+    };
+    this.save(environment);
+
+    try {
+      const root = this.store.repositoryPath(pins.repositoryId);
+
+      const repository =
+        environment.repository || (await gitCommonDir(root).catch(() => null));
+
+      if (!repository)
+        throw new Error(
+          "Repository Git directory is unavailable. Restore the registered checkout and retry preparation.",
+        );
+      environment.repository = repository;
+
+      const result = await git(
+        repository,
+        ["config", "--null", "--get-all", "devfast.prepare"],
+        { allowFailure: true },
+      );
+
+      const commands = result.stdout.trim()
+        ? result.stdout.split("\0").filter((command) => command.trim())
+        : [];
+
+      const commandsHash = reviewPrepareCommandsHash(commands);
+
+      const existed =
+        environment.rootPath &&
+        existsSync(path.join(environment.rootPath, ".git"));
+
+      const checkout = await ensureReviewPinnedCheckout({
+        rootPath: existsSync(root) ? root : repository,
+        reviewUuid: reviewId,
+        ref: pins.head,
+      });
+
+      if (!checkout) throw new Error("Pinned checkout is unavailable.");
+
+      if (!this.hasReview(reviewId)) {
+        environment.rootPath = checkout;
+        this.save(environment);
+        this.collect();
+
+        return this.status(environment);
+      }
+
+      const changed =
+        !existed ||
+        environment.rootPath !== checkout ||
+        environment.commandsHash !== commandsHash;
+
+      environment.rootPath = checkout;
+      environment.commandsHash = commandsHash;
+
+      if (!commands.length) {
+        environment.state = "unconfigured";
+        environment.log =
+          "Configure dependencies with git config devfast.prepare '<command>'.";
+      } else if (
+        await markerMatches(reviewPrepareMarkerPath(checkout), commandsHash)
+      ) {
+        environment.state = "ready";
+        environment.log = "";
+      } else if (environment.state !== "failed" || changed || retryFailed) {
+        environment.state = "preparing";
+        environment.generation = randomUUID();
+        environment.log = "Preparing pinned checkout…";
+        this.save(environment);
+        this.prepare(environment, commands);
+
+        return this.status(environment);
+      }
+
+      if (changed) environment.generation = randomUUID();
+    } catch (error) {
+      environment.state = "failed";
+      environment.rootPath = null;
+      environment.log = errorMessage(error);
+    }
+
+    this.save(environment);
+
+    return this.status(environment);
+  }
+
+  private prepare(environment: Environment, commands: string[]) {
+    const abort = new AbortController();
+
+    const done = prepareReviewPinnedCheckout({
+      checkoutPath: environment.rootPath!,
+      commit: environment.commit,
+      commands,
+      signal: abort.signal,
+      progress: (log) => {
+        environment.log = log;
+        this.save(environment);
+      },
+      warning: (log) => {
+        environment.log = log;
+      },
+    })
+      .then(async (result) => {
+        environment.state = result.prepared ? "ready" : "failed";
+
+        if (!result.prepared)
+          environment.log = await readFile(
+            reviewPrepareLogPath(environment.rootPath!),
+            "utf8",
+          ).catch(() => environment.log);
+      })
+      .catch((error) => {
+        environment.state = "failed";
+        environment.log = errorMessage(error);
+      })
+      .finally(() => {
+        environment.generation = randomUUID();
+        this.save(environment);
+        this.jobs.delete(environment.id);
+      });
+
+    this.jobs.set(environment.id, { done, abort });
+  }
+
+  async retry(reviewId: string, id: string): Promise<WorkspaceStatus> {
+    const environment = this.get(id);
+
+    if (!environment || environment.reviewId !== reviewId)
+      throw new ReviewInputError("Language environment not found.", 404);
+
+    if (this.jobs.has(id)) return this.status(environment);
+
+    if (!this.claim(reviewId))
+      throw new ReviewInputError(this.ownedElsewhere(reviewId), 409);
+
+    if (environment.state === "cleanup-failed") {
+      this.collect();
+
+      return this.status(environment);
+    }
+
+    this.assertReview(reviewId);
+
+    if (environment.rootPath)
+      await rm(reviewPrepareMarkerPath(environment.rootPath), { force: true });
+    environment.state = "pending";
+    environment.generation = randomUUID();
+    this.save(environment);
+
+    return this.source(reviewId, {
+      repositoryId: environment.repositoryId,
+      base: environment.commit,
+      head: environment.commit,
+    });
+  }
+
+  private collect(retryId?: string, removedReviewId?: string) {
+    // Capture ownership before awaiting, so shutdown never reads a closed store.
+    const deleted = this.all().filter(
+      (environment) =>
+        (environment.reviewId === removedReviewId ||
+          legacyBase(environment) ||
+          !this.hasReview(environment.reviewId)) &&
+        (environment.state !== "cleanup-failed" ||
+          environment.id === retryId ||
+          environment.reviewId === removedReviewId) &&
+        this.claim(environment.reviewId),
+    );
+
+    this.cleanup = this.cleanup.then(async () => {
+      for (const environment of deleted) {
+        const job = this.jobs.get(environment.id);
+        job?.abort.abort();
+        await job?.done;
+
+        try {
+          if (environment.rootPath && existsSync(environment.rootPath)) {
+            const managed = reviewManagedCheckoutRoot(
+              environment.repository,
+              environment.reviewId,
+            );
+
+            const relative = path.relative(managed, environment.rootPath);
+
+            if (
+              !relative ||
+              relative.startsWith("..") ||
+              path.isAbsolute(relative)
+            )
+              throw new Error("Refusing to remove a non-managed checkout.");
+            await git(environment.repository, [
+              "worktree",
+              "remove",
+              "--force",
+              environment.rootPath,
+            ]);
+          }
+
+          if (environment.rootPath)
+            await removeReviewPrepareArtifacts(environment.rootPath);
+
+          if (
+            environment.repository &&
+            !this.all().some(
+              (other) =>
+                other.id !== environment.id &&
+                other.reviewId === environment.reviewId &&
+                other.repository === environment.repository,
+            )
+          )
+            await removeReviewManagedCheckouts(
+              environment.repository,
+              environment.reviewId,
+            );
+
+          this.db
+            .prepare("DELETE FROM pinned_environments WHERE id=?")
+            .run(environment.id);
+          this.db
+            .prepare(
+              "DELETE FROM workspace_leases WHERE review_id=? AND owner=? AND NOT EXISTS(SELECT 1 FROM pinned_environments WHERE value->>'reviewId'=?)",
+            )
+            .run(environment.reviewId, this.ownerId, environment.reviewId);
+        } catch (error) {
+          environment.state = "cleanup-failed";
+          environment.log = errorMessage(error);
+          this.save(environment);
+        }
+      }
+    });
+  }
+
+  async idle() {
+    await Promise.all(this.requests.values());
+    await Promise.all([...this.jobs.values()].map((job) => job.done));
+    await this.cleanup;
+  }
+
+  private closing?: Promise<void>;
+
+  close(): Promise<void> {
+    return (this.closing ??= this.closeAll());
+  }
+
+  private async closeAll() {
+    this.closed = true;
+    this.stop();
+    await Promise.all(this.requests.values());
+
+    for (const job of this.jobs.values()) job.abort.abort();
+    await this.idle();
+    this.db
+      .prepare("DELETE FROM workspace_leases WHERE owner=?")
+      .run(this.ownerId);
+    this.db.close();
+  }
+}

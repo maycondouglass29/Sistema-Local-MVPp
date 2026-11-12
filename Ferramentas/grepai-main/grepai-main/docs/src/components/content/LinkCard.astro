@@ -1,0 +1,14 @@
+---
+interface Props {
+  title: string;
+  description?: string;
+  href: string;
+}
+
+const { title, description, href } = Astro.props;
+---
+
+<a href={href} class="group block p-5 rounded-md border border-rule bg-paper-raised hover:border-ink-muted transition-colors no-underline">
+  <span class="block font-semibold text-ink group-hover:underline group-hover:decoration-gold group-hover:underline-offset-4">{title}</span>
+  {description && <span class="block mt-1 text-sm text-ink-muted">{description}</span>}
+</a>

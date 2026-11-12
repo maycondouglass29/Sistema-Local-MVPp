@@ -1,0 +1,2395 @@
+import { existsSync, statSync } from "node:fs";
+import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import path from "node:path";
+
+import {
+  type BlobBatchReader,
+  type LocalVcs,
+  type LocalVcsCommitSummary,
+  type LocalVcsDiffFileSummary,
+  type LocalVcsKind,
+  LocalVcsToolsMissingError,
+  type VcsArg,
+  createBlobBatchReader,
+  detectLocalVcs,
+  diffFileSummariesTrees,
+  diffFileSummariesWorkingTree,
+  diffTrees,
+  diffWorkingTree,
+  gitAt,
+  gitCommonDir,
+  listCommitRange,
+  listTrackedFilesAtCommit,
+  parseGitRemote,
+  readFileAtCommit,
+  resolveRepoContext,
+  runVcs,
+  splitGitPatchFiles,
+} from "@dev.fast/local-vcs";
+import { boardTitle, structuralChangeCounts } from "@dev.fast/review-protocol";
+import type {
+  PullRequestState,
+  ReviewLanguageEnvironment,
+  ReviewSourceEntry,
+  StructuralDiffEvent,
+} from "@dev.fast/review-protocol";
+import { writePrivateJsonAtomic } from "@dev.fast/trace-core";
+import {
+  type Block,
+  type FileLineRange,
+  type Pins,
+  ReviewInputError,
+  type ReviewTarget,
+  type SourcePins,
+  SourceRangeError,
+  anchorPins,
+  boardRepositoryId,
+  checkSourcePath,
+  elements,
+  fileLineRangeSchema,
+  pinnedRepositoryIds,
+  pinsSchema,
+  requireVisibleSource,
+  resourceReference,
+  sliceSourceRange,
+  sourceReferences,
+} from "@dev.fast/whiteboard-document";
+import type {
+  AsyncSubscription,
+  Event as WatcherEvent,
+  subscribe,
+} from "@parcel/watcher";
+import { textIncludesQuote } from "@review/evidence.js";
+import { isMissingFileError } from "@review/fs-utils.js";
+import {
+  type GitHubPullRequest,
+  readGitHubPullRequests,
+} from "@review/github-pr-graph.js";
+import { reviewManagedCheckoutRoot } from "@review/review-checkout-paths.js";
+import { ensureReviewPinnedCheckout } from "@review/review-head-checkout.js";
+import { StructuralComparisons } from "@review/server/structural-comparisons.js";
+import { resolveSoftwareMapDiffCounts } from "@review/software-map-diff-counts.js";
+import {
+  type NormalizedSoftwareModel,
+  SoftwareModelValidationError,
+  defineSoftwareMap,
+} from "@review/software-map-model.js";
+import { z } from "zod";
+
+import { checkoutFs } from "./checkout-fs.js";
+import {
+  type ComparisonCoverage,
+  comparisonCoverage,
+} from "./comparison-coverage.js";
+import { decodeImage } from "./image-decode.js";
+import { mapInputSchema } from "./map-input.js";
+import { pullRequestKey, sourceBranchName } from "./origin.js";
+import {
+  type PullRequestAddress,
+  type PullRequestProvider,
+  resolvePullRequest,
+} from "./provider.js";
+import {
+  GitHubRefusedRead,
+  type PullRequestDeps,
+  defaultPullRequestDeps,
+  fetchPullRequest,
+  remoteUrls,
+} from "./pull-request.js";
+import {
+  type ResolvedPullRequest,
+  ReviewStore,
+  type Snapshot,
+} from "./store.js";
+import { traceSchema } from "./trace-schema.js";
+import { VersionCache } from "./version-cache.js";
+import { ReviewWorkspaces } from "./workspaces.js";
+import {
+  INERT_GIT_PATHS,
+  atTrackedEdge,
+  gitDirectoryPrefix,
+  gitEventMatters,
+  ignoredDirectories,
+  rootEventMatters,
+  trackedDirectories,
+} from "./worktree-events.js";
+import {
+  EMPTY_SOURCE,
+  inspectWorktree,
+  localSourcePath,
+  readWorkingFile,
+  untrackedFileCount,
+  workingFiles,
+} from "./worktree-source.js";
+
+export const uploadSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    id: z.uuid(),
+    repositoryId: z.string(),
+    kind: z.literal("image"),
+    base64: z.string(),
+  }),
+  z.strictObject({
+    id: z.uuid(),
+    repositoryId: z.string(),
+    kind: z.literal("trace"),
+    trace: traceSchema,
+  }),
+  z.strictObject({
+    id: z.uuid(),
+    repositoryId: z.string(),
+    kind: z.literal("map"),
+    pins: pinsSchema,
+    side: z.enum(["base", "head"]),
+    model: mapInputSchema,
+  }),
+]);
+
+const unavailableCheckout = () =>
+  new ReviewInputError("The selected local checkout is unavailable.", 404);
+
+/** File reads cannot name the root or a directory; tree reads can. */
+function checkRelativePath(file: string) {
+  inputError(() => checkSourcePath(file));
+
+  if (file === "" || file.endsWith("/"))
+    throw new ReviewInputError(
+      "Source file must be a repository-relative path.",
+    );
+}
+
+function sliceRange(
+  file: { commit: string; text: string },
+  source: FileLineRange,
+) {
+  return {
+    ...source,
+    commit: file.commit,
+    text: inputError(() => sliceSourceRange(file.text, source)),
+  };
+}
+
+interface RepositoryVcs {
+  detection: Promise<LocalVcs | null>;
+  vcs?: LocalVcs;
+}
+
+/** How long a PR's state is shown before it is read again. */
+const PULL_REQUEST_STATE_TTL_MS = 5 * 60_000;
+
+/** How many PR states are read from GitHub at once. */
+const PULL_REQUEST_STATE_READS = 2;
+
+/** Local source/resource boundary, including Desktop-only local language context. */
+
+export class LocalReviewData {
+  private readonly workspaceManager?: ReviewWorkspaces;
+
+  get workspaces(): ReviewWorkspaces {
+    if (!this.workspaceManager)
+      throw new ReviewInputError(
+        "Open this review in Desktop to prepare language workspaces.",
+        409,
+      );
+
+    return this.workspaceManager;
+  }
+
+  currentEnvironmentIssues(snapshot: Snapshot) {
+    if (snapshot.target?.kind !== "commits" || !snapshot.pins) return [];
+    const pins = snapshot.pins;
+
+    return this.workspaces
+      .list(snapshot.reviewId)
+      .flatMap((environment) =>
+        environment.commit === pins.head && environment.issue
+          ? [{ message: environment.issue }]
+          : [],
+      );
+  }
+
+  async environmentIssues(
+    snapshot: Snapshot,
+    retryFailed = false,
+  ): Promise<{ message: string }[]> {
+    if (!snapshot.pins) return [];
+
+    const context = await this.languageEnvironment(
+      snapshot,
+      undefined,
+      retryFailed,
+    );
+
+    return context.issue ? [{ message: context.issue }] : [];
+  }
+
+  private readonly untrackedCounts = new Map<
+    string,
+    Promise<number | undefined>
+  >();
+
+  /**
+   * Untracked files a live worktree review leaves out; undefined otherwise.
+   * Counted once per worktree revision, never by the revision poll, so a
+   * checkout with many untracked files pays for the walk only when read.
+   */
+  untrackedFiles(pins: Pins): Promise<number | undefined> {
+    if (!pins.worktreeRevision) return Promise.resolve(undefined);
+    const key = `${pins.repositoryId}\0${pins.worktreeRevision}`;
+    let count = this.untrackedCounts.get(key);
+
+    if (!count) {
+      count = this.vcs(pins.repositoryId).then((vcs) =>
+        vcs ? untrackedFileCount(vcs) : undefined,
+      );
+      this.untrackedCounts.set(key, count);
+
+      for (const cached of this.untrackedCounts.keys()) {
+        if (this.untrackedCounts.size <= 32) break;
+        this.untrackedCounts.delete(cached);
+      }
+    }
+
+    return count;
+  }
+
+  /** Local checkout context for live worktree targets only. */
+  /** Desktop language services borrow the registered checkout, never create one. */
+  async liveFile(repositoryId: string, file: string, text: string) {
+    try {
+      const rootPath = await realpath(this.store.repositoryPath(repositoryId));
+      const localPath = await localSourcePath(rootPath, file);
+
+      if ((await checkoutFs.readFile(localPath, "utf8")) === text)
+        return { localPath, localRoot: rootPath };
+    } catch {
+      /* A moved or changed file can still be displayed without native LSP. */
+    }
+
+    return undefined;
+  }
+  /** Source bytes and the language workspace have independent lifetimes. */
+  async languageEnvironment(
+    snapshot: Snapshot,
+    commit?: string,
+    retryFailed = false,
+    anchor?: SourcePins,
+  ): Promise<ReviewLanguageEnvironment> {
+    // A reference with its own pins borrows that repository's registered
+    // checkout, as live worktree targets do; no pinned checkout is prepared.
+    if (!anchor && snapshot.target?.kind === "commits" && snapshot.pins) {
+      const pins = await this.comparison(snapshot.pins, commit);
+
+      const environment = await this.workspaces.source(
+        snapshot.reviewId,
+        pins,
+        retryFailed,
+      );
+
+      return {
+        rootPath:
+          environment.state === "preparing" || environment.state === "pending"
+            ? null
+            : environment.rootPath,
+        identity: environment.generation,
+        issue: environment.issue,
+      };
+    }
+
+    // Validate selected commits for both target kinds, but never prepare a live checkout.
+    if (commit && !anchor)
+      await this.comparison(await this.documentPins(snapshot), commit);
+
+    const repositoryId =
+      anchor?.repositoryId ??
+      snapshot.pins?.repositoryId ??
+      (snapshot.target?.kind === "project"
+        ? snapshot.target.repositoryId
+        : undefined);
+
+    if (!repositoryId)
+      throw new ReviewInputError(
+        "This document has no source pins of its own.",
+        409,
+      );
+
+    const unavailable: ReviewLanguageEnvironment = {
+      rootPath: null,
+      identity: `${repositoryId}:unavailable`,
+      issue:
+        "Could not access the registered language checkout. Check the repository path and permissions, then retry.",
+    };
+
+    let rootPath: string;
+
+    try {
+      rootPath = await realpath(this.store.repositoryPath(repositoryId));
+    } catch (error) {
+      if (error instanceof ReviewInputError && error.status !== 404)
+        throw error;
+
+      return unavailable;
+    }
+
+    if (!rootPath || !(await this.vcs(repositoryId))) return unavailable;
+    const info = await stat(rootPath, { bigint: true }).catch(() => null);
+
+    return info
+      ? {
+          rootPath,
+          identity: `${repositoryId}:${rootPath}:${info.dev}:${info.ino}:${info.birthtimeNs}`,
+        }
+      : unavailable;
+  }
+
+  /** Resolve source coordinates after selecting a local or imported snapshot.
+   * `anchor` reads at a reference's own pins instead of the document's;
+   * `commit` narrows the document comparison to one of its commits. */
+  async resolveSource(
+    snapshot: Snapshot,
+    commit?: string,
+    anchor?: SourcePins,
+  ) {
+    const pins = anchor
+      ? await this.anchorSourcePins(anchor)
+      : await this.comparison(await this.documentPins(snapshot), commit);
+
+    return { snapshot, pins };
+  }
+
+  /** Where an Ask agent reads source: the Review's own head checkout, or the
+   * registered checkout for a live worktree target, as the navigator does. */
+  async agentCheckout(snapshot: Snapshot) {
+    const { pins } = await this.resolveSource(snapshot);
+
+    const rootPath = pins.worktreeRevision
+      ? await realpath(this.store.repositoryPath(pins.repositoryId))
+      : (await this.workspaces.source(snapshot.reviewId, pins)).rootPath;
+
+    if (!rootPath)
+      throw new ReviewInputError(
+        "The head checkout for this review is not ready yet.",
+        409,
+      );
+
+    return { rootPath, head: pins.head, live: !!pins.worktreeRevision };
+  }
+
+  /** Resolve a native workspace without replacing the selected source with today's HEAD. */
+  async navigatorWorkspace(
+    snapshot: Snapshot,
+    source: {
+      file?: string;
+      empty?: boolean;
+      commit?: string;
+      anchor?: SourcePins;
+    } = {},
+  ): Promise<{ workspacePath: string; filePath?: string; rootPath: string }> {
+    const { pins } = await this.resolveSource(
+      snapshot,
+      source.commit,
+      source.anchor,
+    );
+
+    const repository = this.store.repositoryPath(pins.repositoryId);
+    const live = !!pins.worktreeRevision;
+
+    if (source.file) checkRelativePath(source.file);
+
+    // Browse the Review's own head checkout. The window opens while
+    // preparation may still be installing dependencies beside the source.
+    const rootPath = live
+      ? await realpath(repository)
+      : (await this.workspaces.source(snapshot.reviewId, pins)).rootPath;
+
+    const context = await resolveRepoContext(repository);
+
+    if (!rootPath || !context)
+      throw new ReviewInputError(
+        "Could not open the selected source checkout.",
+        409,
+      );
+
+    if (!live) {
+      const { stdout } = await runVcs("git", [
+        "-C",
+        rootPath,
+        "status",
+        "--porcelain",
+        "--untracked-files=no",
+      ]);
+
+      if (stdout.trim())
+        throw new ReviewInputError(
+          "The pinned checkout has local changes, possibly from devfast.prepare. Restore those files before browsing this pinned revision.",
+          409,
+        );
+    }
+
+    // Name the workspace after the repository, not the registered checkout:
+    // a linked worktree's directory is an arbitrary branch slug. This matches
+    // the repository label on Home.
+    const name =
+      context.githubSlug?.split("/").at(-1) ??
+      path.basename(path.dirname(context.commonDir));
+
+    const workspaceDirectory = path.join(
+      reviewManagedCheckoutRoot(context.commonDir, snapshot.reviewId),
+      "navigator",
+      "workspaces",
+      live ? "worktree" : pins.head,
+    );
+
+    // VS Code labels a saved workspace by its file name and identifies its
+    // window by the file's path, so the file name is the repository name.
+    const workspacePath = path.join(
+      workspaceDirectory,
+      `${name}.code-workspace`,
+    );
+
+    // A native workspace gives VS Code stable restoration, search scope and
+    // editor read-only behavior without changing files in the source checkout.
+    // Keep the preferences VS Code and the user add, carrying them over from a
+    // workspace previously named after the checkout directory. That file stays
+    // in place for any window still open on it.
+    const current = await readWorkspace(workspacePath);
+
+    if (current !== null) {
+      const previous =
+        current ??
+        (await readWorkspace(
+          path.join(
+            workspaceDirectory,
+            `${path.basename(repository)}.code-workspace`,
+          ),
+        ));
+
+      const title = `${boardTitle(snapshot.title)} — ${live ? "Live source" : "Source"} — Whiteboard`;
+
+      const workspace = previous ?? {
+        folders: [],
+        settings: { "files.readonlyInclude": { "**/*": true } },
+      };
+
+      const next = {
+        ...workspace,
+        folders: [{ path: rootPath, name }, ...workspace.folders.slice(1)],
+        settings: { ...workspace.settings, "window.title": title },
+      };
+
+      if (JSON.stringify(next) !== JSON.stringify(current))
+        await writePrivateJsonAtomic(workspacePath, next);
+    }
+
+    let filePath: string | undefined;
+
+    if (source.file) {
+      if (source.empty) {
+        // Native diffs need a real empty file for an added/deleted side.
+        filePath = path.join(
+          path.dirname(workspacePath),
+          "empty",
+          path.basename(source.file),
+        );
+        await mkdir(path.dirname(filePath), { recursive: true });
+        await writeFile(filePath, "", { mode: 0o600 });
+      } else {
+        try {
+          filePath = await localSourcePath(rootPath, source.file);
+        } catch (error) {
+          if (isMissingFileError(error))
+            throw new ReviewInputError(
+              "File is unavailable at the selected revision.",
+              404,
+            );
+          throw error;
+        }
+      }
+    }
+
+    // External editors open the checkout as their workspace beside the file.
+    return { workspacePath, filePath, rootPath };
+  }
+
+  /** A document read that needs default pins: its own, or for a plan its
+   * repository's live checkout with base at head; 409 when it has neither. */
+  async documentPins(snapshot: Snapshot): Promise<Pins> {
+    const pins =
+      (await this.sourcePins(snapshot)) ??
+      (snapshot.target?.kind === "project"
+        ? await this.livePins(snapshot.target.repositoryId)
+        : undefined);
+
+    if (!pins)
+      throw new ReviewInputError(
+        "This document has no source pins of its own.",
+        409,
+      );
+
+    return pins;
+  }
+
+  /** A checkout's current state, base at head: what a plan reads. */
+  private async livePins(repositoryId: string): Promise<Pins> {
+    const vcs = await this.vcs(repositoryId);
+
+    if (!vcs) throw unavailableCheckout();
+    const { revision, commit } = await this.worktreeState(repositoryId, vcs);
+
+    return {
+      repositoryId,
+      base: commit,
+      head: commit,
+      worktreeRevision: revision,
+    };
+  }
+
+  /** Pins a reference names itself, checked against the registered checkout. */
+  async anchorSourcePins(anchor: SourcePins): Promise<Pins> {
+    if (!existsSync(this.store.repositoryPath(anchor.repositoryId)))
+      throw unavailableCheckout();
+
+    return anchorPins({ pins: anchor }, undefined);
+  }
+
+  /** References whose own repository is unregistered or gone from disk.
+   * `snapshot` is a stored version. */
+  async unavailableAnchors(snapshot: Snapshot): Promise<string[]> {
+    const missing = new Set<string>();
+
+    // Only Markdown needs parsing, so check the repositories first. Its
+    // commit links read from the board's repository.
+    const repositoryIds = pinnedRepositoryIds(snapshot.document);
+    const boardRepository = boardRepositoryId(snapshot);
+
+    if (boardRepository) repositoryIds.add(boardRepository);
+
+    for (const repositoryId of repositoryIds)
+      try {
+        if (!existsSync(this.store.repositoryPath(repositoryId)))
+          missing.add(repositoryId);
+      } catch (error) {
+        if (!(error instanceof ReviewInputError)) throw error;
+        missing.add(repositoryId);
+      }
+
+    if (!missing.size) return [];
+
+    return this.storedReferences
+      .get(snapshot)
+      .filter(
+        (ref) => ref.source.pins && missing.has(ref.source.pins.repositoryId),
+      )
+      .map((ref) => ref.id);
+  }
+
+  private readonly storedReferences = new VersionCache(
+    (snapshot: Snapshot) =>
+      sourceReferences(snapshot.document, {
+        tolerant: true,
+        repositoryId: boardRepositoryId(snapshot),
+      }),
+    { capacity: 512 },
+  );
+
+  // A commit's tree never changes, so one listing serves every folder expansion.
+  private readonly trackedFiles = new Map<string, Promise<string[]>>();
+
+  private readonly repositories = new Map<string, RepositoryVcs>();
+
+  private readonly readers = new Map<string, BlobBatchReader>();
+
+  private readonly commitRanges = new Map<
+    string,
+    Promise<LocalVcsCommitSummary[]>
+  >();
+
+  constructor(
+    private readonly store: ReviewStore,
+    private readonly options: {
+      blobReaderIdleTimeoutMs?: number;
+      workspaceDatabase?: string;
+      manageWorkspaces?: boolean;
+      subscribe?: typeof subscribe;
+      /** gh, git and GitHub API access for pull request targets. */
+      pullRequests?: PullRequestDeps;
+      /** Read PR states from GitHub for the catalog. */
+      pullRequestStates?: boolean;
+    } = {},
+  ) {
+    if (options.manageWorkspaces !== false)
+      this.workspaceManager = new ReviewWorkspaces(
+        options.workspaceDatabase ?? ":memory:",
+        store,
+      );
+  }
+
+  async *structuralChanges({
+    reviewId,
+    pins,
+    signal,
+    file,
+  }: {
+    reviewId: string;
+    pins: Pins;
+    signal: AbortSignal;
+    file?: string;
+  }): AsyncGenerator<StructuralDiffEvent> {
+    if (file !== undefined) checkRelativePath(file);
+
+    if (pins.worktreeRevision) {
+      const { rootPath, baseRef } = await this.worktreeInput(pins);
+      yield* this.structuralComparisons.stream({
+        repositoryPath: rootPath,
+        comparison: {
+          kind: "worktree",
+          // An unborn checkout compares with Git's empty tree.
+          base: baseRef ?? "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+          revision: pins.worktreeRevision,
+        },
+        paths: file === undefined ? undefined : [file],
+        signal,
+      });
+
+      return;
+    }
+
+    // Waiting covers a release already queued. One that starts mid-stream
+    // fails this stream, and the reader's next request rebuilds the checkout.
+    await this.workspaceManager?.released(reviewId);
+
+    const rootPath = await ensureReviewPinnedCheckout({
+      rootPath: this.store.repositoryPath(pins.repositoryId),
+      ref: pins.head,
+      reviewUuid: reviewId,
+    });
+
+    if (!rootPath)
+      throw new ReviewInputError(
+        "Cannot prepare the pinned repository for structural diffing.",
+      );
+    yield* this.structuralComparisons.stream({
+      repositoryPath: rootPath,
+      comparison: { kind: "trees", base: pins.base, head: pins.head },
+      paths: file === undefined ? undefined : [file],
+      signal,
+    });
+  }
+
+  private readonly structuralComparisons = new StructuralComparisons();
+  private closed = false;
+  private readonly worktrees = new Map<
+    string,
+    {
+      epoch: number;
+      inspectedEpoch: number;
+      subscriptions: Map<string, AsyncSubscription>;
+      healthy: boolean;
+      inspection?: Omit<Awaited<ReturnType<typeof inspectWorktree>>, "files">;
+      tracked?: Set<string>;
+      /** Rereads ignored directories after one may have appeared. */
+      ignoring?: NodeJS.Timeout;
+      /** Fork points by base ref, valid for the inspected epoch. */
+      forks: Map<string, Promise<{ ref: string; commit: string }>>;
+    }
+  >();
+
+  private forgetWorktree(repositoryId: string) {
+    const entry = this.worktrees.get(repositoryId);
+
+    if (entry) void unwatch(entry);
+    this.worktrees.delete(repositoryId);
+  }
+
+  private async worktreeState(repositoryId: string, vcs: LocalVcs) {
+    let entry = this.worktrees.get(repositoryId);
+
+    if (!entry) {
+      entry = {
+        epoch: 0,
+        inspectedEpoch: -1,
+        subscriptions: new Map(),
+        healthy: true,
+        forks: new Map(),
+      };
+      this.worktrees.set(repositoryId, entry);
+      const state = entry;
+      const current = () => this.worktrees.get(repositoryId) === state;
+      const common = await gitCommonDir(vcs.rootPath);
+
+      // jj snapshots untracked files, so every event can matter there.
+      const prefix =
+        vcs.kind === "git" && common
+          ? await gitDirectoryPrefix(vcs.rootPath, common)
+          : null;
+
+      // Linux watches each directory, so skip what cannot matter.
+      const watch = async (
+        root: string,
+        ignore: string[],
+        matters: (name: string, event: WatcherEvent) => boolean,
+      ) => {
+        try {
+          const subscription = await (
+            this.options.subscribe ??
+            (await import("@parcel/watcher")).subscribe
+          )(
+            root,
+            (error, events) => {
+              if (error) {
+                state.healthy = false;
+                const failed = state.subscriptions.get(root);
+
+                if (failed) void release(failed);
+                state.subscriptions.delete(root);
+              } else if (
+                // Every event, since matters also notices new ignored directories.
+                events
+                  .map((event) =>
+                    matters(path.relative(root, event.path), event),
+                  )
+                  .includes(true)
+              )
+                state.epoch++;
+            },
+            { ignore },
+          );
+
+          if (!current()) return void release(subscription);
+          const previous = state.subscriptions.get(root);
+
+          state.subscriptions.set(root, subscription);
+
+          if (previous) void release(previous);
+        } catch {
+          state.healthy = false;
+        }
+      };
+
+      const rootIgnore = async () =>
+        [
+          ...(common ? [".git"] : []),
+          ...(await ignoredDirectories(
+            vcs.rootPath,
+            vcs.kind === "jj" ? (common ?? undefined) : undefined,
+          )),
+        ].map((directory) => path.join(vcs.rootPath, directory));
+
+      let ignored = await rootIgnore();
+
+      const refreshIgnored = () => {
+        clearTimeout(state.ignoring);
+        state.ignoring = setTimeout(async () => {
+          const next = await rootIgnore();
+
+          if (!current() || next.join("\0") === ignored.join("\0")) return;
+          ignored = next;
+
+          // Parcel keeps watches an overlapping subscription shares, so
+          // unsubscribe first and treat the gap as a change.
+          const previous = state.subscriptions.get(vcs.rootPath);
+
+          state.subscriptions.delete(vcs.rootPath);
+
+          if (previous) await release(previous);
+          await watch(vcs.rootPath, ignored, rootMatters);
+          state.epoch++;
+        }, 1000);
+        state.ignoring.unref();
+      };
+
+      const rootMatters = (name: string, event: WatcherEvent) => {
+        if (
+          path.basename(name) === ".gitignore" ||
+          (event.type === "create" &&
+            atTrackedEdge(name, state.tracked) &&
+            statSync(event.path, { throwIfNoEntry: false })?.isDirectory())
+        )
+          refreshIgnored();
+
+        return prefix === null || rootEventMatters(name, state.tracked);
+      };
+
+      await Promise.all([
+        watch(vcs.rootPath, ignored, rootMatters),
+        common &&
+          watch(
+            common,
+            INERT_GIT_PATHS.map((directory) => path.join(common, directory)),
+            (name) => {
+              if (name === path.join("info", "exclude")) refreshIgnored();
+
+              return prefix === null || gitEventMatters(name, prefix);
+            },
+          ),
+      ]);
+    }
+
+    if (
+      entry.inspection &&
+      entry.inspectedEpoch === entry.epoch &&
+      entry.healthy &&
+      entry.subscriptions.size
+    )
+      return { ...entry.inspection, forks: entry.forks };
+
+    const epoch = entry.epoch;
+    const { files, ...inspected } = await inspectWorktree(repositoryId, vcs);
+    entry.inspection = inspected;
+    entry.tracked = trackedDirectories(files);
+    entry.inspectedEpoch = epoch;
+    entry.forks = new Map();
+
+    return { ...inspected, forks: entry.forks };
+  }
+
+  async close(): Promise<void> {
+    this.coverageAbort.abort();
+    clearTimeout(this.coverageNotification);
+    this.coverageListeners.clear();
+    this.coverageCache.clear();
+    this.coverageReaders.clear();
+    this.structuralComparisons.close();
+    this.closed = true;
+    await this.workspaceManager?.close();
+
+    await Promise.all([...this.worktrees.values()].map(unwatch));
+    this.worktrees.clear();
+    const readers = [...this.readers.values()];
+
+    this.readers.clear();
+
+    await Promise.all(readers.map((reader) => reader.close()));
+  }
+
+  /** Detected once; dropped when the root vanishes or detection found nothing. */
+  private vcs(repositoryId: string): Promise<LocalVcs | null> {
+    const cached = this.repositories.get(repositoryId);
+
+    if (cached && (!cached.vcs || existsSync(cached.vcs.rootPath)))
+      return cached.detection;
+
+    this.closeReader(repositoryId);
+    this.forgetWorktree(repositoryId);
+    const rootPath = this.store.repositoryPath(repositoryId);
+
+    // Detection in a missing directory spawns and fails as "tools missing".
+    if (!existsSync(rootPath)) {
+      this.repositories.delete(repositoryId);
+
+      return Promise.resolve(null);
+    }
+
+    const forget = () => {
+      this.repositories.delete(repositoryId);
+      this.closeReader(repositoryId);
+    };
+
+    const entry: RepositoryVcs = {
+      detection: detectLocalVcs(rootPath).then(
+        (vcs) => {
+          if (vcs) entry.vcs = vcs;
+          else forget();
+
+          return vcs;
+        },
+        (cause: unknown) => {
+          forget();
+
+          throw cause;
+        },
+      ),
+    };
+
+    this.repositories.set(repositoryId, entry);
+
+    return entry.detection;
+  }
+
+  /** None once closed: a read suspended across close() gets its own process. */
+  private reader(
+    repositoryId: string,
+    vcs: LocalVcs,
+  ): BlobBatchReader | undefined {
+    if (this.closed) return undefined;
+    const existing = this.readers.get(repositoryId);
+
+    if (existing) return existing;
+
+    const reader = createBlobBatchReader({
+      rootPath: vcs.rootPath,
+      kind: vcs.kind,
+      idleTimeoutMs: this.options.blobReaderIdleTimeoutMs,
+    });
+
+    this.readers.set(repositoryId, reader);
+
+    return reader;
+  }
+
+  private closeReader(repositoryId: string): Promise<void> | undefined {
+    const reader = this.readers.get(repositoryId);
+
+    if (!reader) return;
+    this.readers.delete(repositoryId);
+
+    return reader.close();
+  }
+
+  async forgetRepository(repositoryId: string) {
+    await this.closeReader(repositoryId);
+    this.forgetWorktree(repositoryId);
+    this.repositories.delete(repositoryId);
+
+    for (const key of this.trackedFiles.keys())
+      if (key.startsWith(repositoryId + "\0")) this.trackedFiles.delete(key);
+
+    for (const key of this.commitRanges.keys())
+      if (key.startsWith(repositoryId + ":")) this.commitRanges.delete(key);
+  }
+
+  private async vcsTarget(
+    repositoryId: string,
+  ): Promise<{ rootPath: string; kind?: LocalVcsKind }> {
+    const vcs = await this.vcs(repositoryId);
+
+    if (vcs) return { rootPath: vcs.rootPath, kind: vcs.kind };
+    const rootPath = this.store.repositoryPath(repositoryId);
+
+    // local-vcs would report a missing root as a path-bearing 500.
+    if (!existsSync(rootPath)) throw unavailableCheckout();
+
+    return { rootPath };
+  }
+
+  async register(root: string) {
+    const resolved = await realpath(root).catch(() => {
+      throw new ReviewInputError(
+        "Repository path does not exist or is not readable.",
+      );
+    });
+
+    const vcs = await detectLocalVcs(resolved).catch((cause: unknown) => {
+      if (cause instanceof LocalVcsToolsMissingError)
+        throw new ReviewInputError(cause.message);
+
+      throw cause;
+    });
+
+    if (!vcs) throw new ReviewInputError(await notACheckout(resolved));
+
+    const repository = this.store.registerRepository(
+      await realpath(vcs.rootPath),
+    );
+
+    // Registration may follow replacement of a repository at the same path.
+    // Reopen its Git reader too.
+    await this.closeReader(repository.id);
+    this.repositories.delete(repository.id);
+
+    return repository;
+  }
+  async projectSource(snapshot: Snapshot, pins: Pins): Promise<Snapshot> {
+    const projected: Snapshot = { ...snapshot, pins, staleSources: [] };
+    delete projected.sourceUnavailable;
+
+    // Live references retain their authored coordinates. Only diagnose ranges
+    // that no longer exist; the author decides how to update changed source.
+    for (const reference of sourceReferences(snapshot.document, {
+      tolerant: true,
+      repositoryId: boardRepositoryId(snapshot),
+    })) {
+      try {
+        await this.quote(anchorPins(reference.source, pins), reference.source);
+      } catch (error) {
+        if (!(error instanceof ReviewInputError)) throw error;
+        projected.staleSources!.push(reference.id);
+      }
+    }
+
+    return projected;
+  }
+  /** Throws 404 when the checkout behind the snapshot is gone. Undefined
+   * for a document without default pins. */
+  async sourcePins(snapshot: Snapshot): Promise<Pins | undefined> {
+    if (snapshot.target?.kind === "worktree")
+      return (await this.resolveTarget(snapshot.target, snapshot.pins)).pins;
+
+    // A plan has no pins of its own, but its checkout must exist.
+    if (
+      snapshot.target?.kind === "project" &&
+      !existsSync(this.store.repositoryPath(snapshot.target.repositoryId))
+    )
+      throw unavailableCheckout();
+
+    if (!snapshot.pins) return undefined;
+
+    if (!existsSync(this.store.repositoryPath(snapshot.pins.repositoryId)))
+      throw unavailableCheckout();
+
+    return snapshot.pins;
+  }
+  /** Optional forge context; never changes the comparison's pins. */
+  private readonly readGitHubApi = (host: string, endpoint: string) =>
+    (this.options.pullRequests ?? defaultPullRequestDeps).run(
+      "gh",
+      ["api", "--hostname", { value: host }, { value: endpoint }],
+      { timeoutMs: 10_000 },
+    );
+
+  async findPullRequest(
+    pins: Pins,
+    branch: string,
+  ): Promise<GitHubPullRequest | undefined> {
+    const context = await resolveRepoContext(
+      this.store.repositoryPath(pins.repositoryId),
+    );
+
+    if (!context?.githubSlug || !context.originUrl) return undefined;
+    const remote = parseGitRemote(context.originUrl);
+
+    if (!remote) return undefined;
+    const name = sourceBranchName(branch);
+
+    const matches = (
+      await readGitHubPullRequests(
+        remote.host,
+        context.githubSlug,
+        this.readGitHubApi,
+      )
+    ).filter((pr) => pr.headBranch === name);
+
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+
+  /** Enrich current display metadata without repinning or rewriting history. */
+  async discoverPullRequest(snapshot: Snapshot): Promise<Snapshot> {
+    const { origin, pins } = snapshot;
+
+    if (!pins || !origin?.branch) return snapshot;
+
+    const found = await this.findPullRequest(pins, origin.branch).catch(
+      () => undefined,
+    );
+
+    if (!found) return snapshot;
+
+    // A manually selected PR must not be replaced by a branch-name match.
+    if (
+      origin.pullRequestUrl &&
+      pullRequestKey(origin.pullRequestUrl) !== pullRequestKey(found.url)
+    )
+      return snapshot;
+
+    return {
+      ...snapshot,
+      origin: {
+        ...origin,
+        pullRequestUrl: found.url,
+        pullRequestNumber: found.number,
+        pullRequestTitle: found.title,
+        pullRequestBaseBranch: found.baseBranch,
+      },
+    };
+  }
+
+  /** Capture a label only when its ref still resolves to these exact pins. */
+  async headBranch(pins: Pins, headRef?: string): Promise<string | undefined> {
+    const context = await resolveRepoContext(
+      this.store.repositoryPath(pins.repositoryId),
+    );
+
+    if (!context) return undefined;
+
+    const vcs = await this.vcs(pins.repositoryId);
+
+    const symbolicRef =
+      headRef &&
+      headRef !== "HEAD" &&
+      headRef !== "@" &&
+      !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(headRef)
+        ? headRef
+        : undefined;
+
+    let location: VcsArg[];
+
+    if (symbolicRef) location = ["--git-dir", context.commonDir];
+    else if (vcs?.kind === "git") location = ["-C", vcs.rootPath];
+    else return undefined;
+
+    try {
+      const { stdout } = await runVcs("git", [
+        ...location,
+        "rev-parse",
+        "--symbolic-full-name",
+        "--verify",
+        symbolicRef ? { rev: symbolicRef } : "HEAD",
+      ]);
+
+      const ref = stdout.trim();
+
+      if (!ref.startsWith("refs/heads/") && !ref.startsWith("refs/remotes/"))
+        return undefined;
+
+      const { stdout: commit } = await runVcs("git", [
+        ...location,
+        "rev-parse",
+        { rev: ref },
+      ]);
+
+      if (commit.trim() !== pins.head) return undefined;
+
+      return ref
+        .replace(/^refs\/remotes\/origin\//, "")
+        .replace(/^refs\/(heads|remotes)\//, "");
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** `pinned` refreshes a stored target: a worktree base ref resolves to its
+   * current fork point, and keeps the pinned one if the ref is gone. */
+  async resolveTarget(
+    target: ReviewTarget,
+    pinned?: Pins,
+  ): Promise<{ target: ReviewTarget; pins: Pins }> {
+    if (target.kind === "project")
+      throw new ReviewInputError("A project target has no commits.");
+
+    const vcs = await this.vcs(target.repositoryId);
+
+    if (!vcs) throw unavailableCheckout();
+
+    if (target.kind === "commits") {
+      const head = await vcs.resolveRevision(target.head);
+
+      if (!head) throw new ReviewInputError("Head revision does not exist.");
+
+      const base =
+        target.base === undefined
+          ? head
+          : await vcs.resolveRevision(target.base);
+
+      if (!base) throw new ReviewInputError("Base revision does not exist.");
+
+      const resolved = { ...target, head: head.commit };
+
+      if (target.base !== undefined) resolved.base = base.commit;
+
+      return {
+        target: resolved,
+        pins: {
+          repositoryId: target.repositoryId,
+          base: base.commit,
+          head: head.commit,
+        },
+      };
+    }
+
+    const { revision, commit, forks } = await this.worktreeState(
+      target.repositoryId,
+      vcs,
+    );
+
+    const resolved = { ...target };
+
+    const fork = () => {
+      const key = `${target.base ?? ""}\0${commit}`;
+      let found = forks.get(key);
+
+      if (!found) {
+        found = this.worktreeBase(vcs, target.base, commit);
+        forks.set(key, found);
+        // Missing refs stay cached until the next epoch; retry other errors.
+        found.catch((error) => {
+          if (!(error instanceof ReviewInputError)) forks.delete(key);
+        });
+      }
+
+      return found;
+    };
+
+    // Stored targets without a base predate default-branch bases and compare
+    // against the current HEAD, or with nothing when created unborn.
+    const base =
+      pinned && target.base === undefined
+        ? pinned.base === EMPTY_SOURCE
+          ? EMPTY_SOURCE
+          : commit
+        : commit === EMPTY_SOURCE && target.base === undefined
+          ? EMPTY_SOURCE
+          : await fork().then(
+              (found) => {
+                resolved.base = found.ref;
+
+                return found.commit;
+              },
+              (error) => {
+                if (pinned && error instanceof ReviewInputError)
+                  return pinned.base;
+                throw error;
+              },
+            );
+
+    return {
+      target: resolved,
+      pins: {
+        repositoryId: target.repositoryId,
+        base,
+        head: commit,
+        worktreeRevision: revision,
+      },
+    };
+  }
+  /** The fork point from `ref`, by default the repository's default branch. */
+  private async worktreeBase(
+    vcs: LocalVcs,
+    ref: string | undefined,
+    head: string,
+  ) {
+    const branch = ref ?? (await vcs.defaultBranch())?.ref;
+
+    if (!branch)
+      throw new ReviewInputError(
+        "No default branch found (tried origin/HEAD, origin/main, origin/master, main and master). Supply target.base.",
+      );
+
+    if (!(await vcs.resolveRevision(branch)))
+      throw new ReviewInputError("Base revision does not exist.");
+
+    const fork =
+      head === EMPTY_SOURCE ? null : await vcs.mergeBase(branch, head);
+
+    if (!fork)
+      throw new ReviewInputError(
+        `${branch} shares no history with the checkout's HEAD.`,
+      );
+
+    return { ref: branch, commit: fork.commit };
+  }
+  /** Each PR's state, by URL, as last read. */
+  private readonly pullRequestStates = new Map<
+    string,
+    {
+      state?: PullRequestState;
+      /** The branch it merges into, and its own. */
+      baseBranch?: string;
+      headBranch?: string;
+      readAt: number;
+      /** When a board last showed it; a deleted board's PR is forgotten. */
+      seenAt: number;
+      reading: boolean;
+    }
+  >();
+
+  private readonly pullRequestStateListeners = new Set<() => void>();
+  private pullRequestStateTimer: ReturnType<typeof setInterval> | undefined;
+  private readonly pullRequestStateQueue: string[] = [];
+  private pullRequestStateReads = 0;
+
+  /** While GitHub rate-limits, no state is read. */
+  private pullRequestStatesPausedUntil = 0;
+
+  /** Calls back when a PR's state changes. While anyone listens, every PR
+   * still shown is read again once its state is a few minutes old. */
+  subscribePullRequestStates(listener: () => void): () => void {
+    this.pullRequestStateListeners.add(listener);
+    this.pullRequestStateTimer ??= setInterval(() => {
+      for (const [url, entry] of this.pullRequestStates)
+        if (Date.now() - entry.seenAt > 2 * PULL_REQUEST_STATE_TTL_MS)
+          this.pullRequestStates.delete(url);
+        else this.pullRequestState(url, { seen: false });
+      this.readPullRequestStates();
+    }, PULL_REQUEST_STATE_TTL_MS / 5);
+    this.pullRequestStateTimer.unref?.();
+
+    return () => {
+      this.pullRequestStateListeners.delete(listener);
+
+      if (!this.pullRequestStateListeners.size) {
+        clearInterval(this.pullRequestStateTimer);
+        this.pullRequestStateTimer = undefined;
+      }
+    };
+  }
+
+  /** A PR's state as last read from GitHub; a read older than a few minutes
+   * queues another in the background. Undefined until the first read lands,
+   * and a failed read keeps the last state. A merged or closed PR is not
+   * read again. */
+  pullRequestState(
+    url: string | undefined,
+    { seen = true }: { seen?: boolean } = {},
+  ): PullRequestState | undefined {
+    if (!url || !this.options.pullRequestStates) return undefined;
+
+    const entry = this.pullRequestStates.get(url) ?? {
+      readAt: 0,
+      seenAt: 0,
+      reading: false,
+    };
+
+    this.pullRequestStates.set(url, entry);
+
+    if (seen) entry.seenAt = Date.now();
+
+    if (
+      !entry.reading &&
+      entry.state !== "merged" &&
+      entry.state !== "closed" &&
+      Date.now() - entry.readAt > PULL_REQUEST_STATE_TTL_MS
+    ) {
+      entry.reading = true;
+      this.pullRequestStateQueue.push(url);
+      this.readPullRequestStates();
+    }
+
+    return entry.state;
+  }
+
+  /** Reads queued PR states a few at a time. */
+  private readPullRequestStates() {
+    while (
+      this.pullRequestStateReads < PULL_REQUEST_STATE_READS &&
+      this.pullRequestStateQueue.length &&
+      Date.now() >= this.pullRequestStatesPausedUntil
+    ) {
+      const url = this.pullRequestStateQueue.shift()!;
+      const entry = this.pullRequestStates.get(url);
+
+      if (!entry) continue;
+      this.pullRequestStateReads++;
+      void Promise.resolve()
+        .then(() => {
+          const { provider, address } = resolvePullRequest(url);
+
+          return provider.readPullRequest(
+            address,
+            this.options.pullRequests ?? defaultPullRequestDeps,
+          );
+        })
+        .then((pullRequest) => {
+          if (
+            (!pullRequest.state || pullRequest.state === entry.state) &&
+            pullRequest.baseRefName === entry.baseBranch &&
+            pullRequest.headBranch === entry.headBranch
+          )
+            return;
+          entry.state = pullRequest.state ?? entry.state;
+          entry.baseBranch = pullRequest.baseRefName;
+          entry.headBranch = pullRequest.headBranch;
+
+          for (const listener of this.pullRequestStateListeners) listener();
+        })
+        .catch((error) => {
+          if (error instanceof GitHubRefusedRead)
+            this.pullRequestStatesPausedUntil = error.retryAt;
+        })
+        .finally(() => {
+          entry.readAt = Date.now();
+          entry.reading = false;
+          this.pullRequestStateReads--;
+          this.readPullRequestStates();
+        });
+    }
+  }
+
+  /** The branch a PR merges into, as last read with its state. */
+  pullRequestBaseBranch(url: string): string | undefined {
+    return this.pullRequestStates.get(url)?.baseBranch;
+  }
+
+  /** A PR's own branch, as last read with its state. */
+  pullRequestHeadBranch(url: string): string | undefined {
+    return this.pullRequestStates.get(url)?.headBranch;
+  }
+
+  /** The PR's current comparison, fetched into a registered checkout of its repository. */
+  async resolvePullRequest(
+    url: string,
+    repository: { id: string },
+  ): Promise<ResolvedPullRequest> {
+    const deps = this.options.pullRequests ?? defaultPullRequestDeps;
+    const { provider, address } = resolvePullRequest(url);
+
+    // Only a host a registered checkout already fetches from is contacted.
+    const checkout = await this.pullRequestCheckout(
+      provider,
+      address,
+      repository,
+      deps,
+    );
+
+    const pullRequest = await provider.readPullRequest(address, deps);
+
+    const { head, base } = await fetchPullRequest(
+      { ...checkout, provider: provider.id, pullRequest },
+      deps,
+    );
+
+    const repositoryId = checkout.repositoryId;
+
+    return {
+      target: { kind: "commits", repositoryId, head, base },
+      pins: { repositoryId, base, head },
+      title: pullRequest.title.trim(),
+      branch: pullRequest.headBranch,
+      baseBranch: pullRequest.baseRefName,
+    };
+  }
+  async pullRequestTitle(url: string) {
+    const { provider, address } = resolvePullRequest(url);
+
+    try {
+      const { title } = await provider.readPullRequest(
+        address,
+        this.options.pullRequests ?? defaultPullRequestDeps,
+      );
+
+      return title.trim() || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  /** A registered checkout with a remote for host/owner/repo, and that remote. */
+  private async pullRequestCheckout(
+    provider: PullRequestProvider,
+    address: PullRequestAddress,
+    repository: { id: string },
+    deps: PullRequestDeps,
+  ) {
+    const candidates = this.store
+      .repositories()
+      .filter((entry) => entry.id === repository.id);
+
+    if (candidates.length === 0)
+      throw new ReviewInputError("Repository is not registered.", 404);
+
+    for (const { id } of candidates) {
+      if (!existsSync(this.store.repositoryPath(id))) continue;
+      const vcs = await this.vcs(id);
+      const gitDir = vcs && (await gitCommonDir(vcs.rootPath));
+
+      if (!vcs || !gitDir) continue;
+
+      const remote = (await remoteUrls(gitDir, deps)).find((entry) =>
+        provider.matchesRemote(entry.url, address),
+      );
+
+      if (remote)
+        return {
+          repositoryId: id,
+          rootPath: vcs.rootPath,
+          gitDir,
+          kind: vcs.kind,
+          remote: remote.name,
+        };
+    }
+
+    const { host, slug } = address;
+    const name = host === "github.com" ? slug : `${host}/${slug}`;
+
+    throw new ReviewInputError(
+      `That checkout has no remote for ${name}. Name a checkout of ${name} as the target's repositoryPath.`,
+      404,
+    );
+  }
+  async resolvePins(
+    repositoryId: string,
+    base: string,
+    head: string,
+  ): Promise<Pins> {
+    const vcs = await this.vcs(repositoryId);
+
+    const [left, right] = vcs
+      ? await Promise.all([
+          vcs.resolveRevision(base),
+          vcs.resolveRevision(head),
+        ])
+      : [null, null];
+
+    if (!left || !right)
+      throw new ReviewInputError(
+        `Base or head revision does not exist in the local checkout (${!left ? `base: ${base}` : `head: ${head}`}). Fetch the requested commits before authoring; in CI, configure checkout depth to include both revisions.`,
+      );
+
+    return { repositoryId, base: left.commit, head: right.commit };
+  }
+  /** Files each side's commit changed from one set of pins to another, under
+   * both names for a rename. A worktree has no commit to diff from. */
+  async filesChangedBetween(from: Pins, to: Pins) {
+    if (
+      from.repositoryId !== to.repositoryId ||
+      from.worktreeRevision ||
+      to.worktreeRevision
+    )
+      return undefined;
+
+    const target = await this.vcsTarget(to.repositoryId);
+
+    const changed = async (side: "base" | "head") => {
+      if (from[side] === to[side]) return new Set<string>();
+
+      const files = await diffFileSummariesTrees({
+        ...target,
+        baseRef: from[side],
+        headRef: to[side],
+      });
+
+      return new Set(
+        files.flatMap((file) =>
+          file.previousPath ? [file.previousPath, file.path] : [file.path],
+        ),
+      );
+    };
+
+    const [base, head] = await Promise.all([changed("base"), changed("head")]);
+
+    return { base, head };
+  }
+  /** What a commit is, for a quote read at it: its subject, author and
+   * date, and how far behind the default branch's tip it is when both are
+   * known. */
+  async commitInfo(
+    repositoryId: string,
+    commit: string,
+  ): Promise<{
+    commit: string;
+    subject: string;
+    author: string;
+    authoredAt: string;
+    behind?: { count: number; branch: string };
+  }> {
+    const vcs = await this.vcs(repositoryId);
+
+    if (!vcs) throw unavailableCheckout();
+
+    const git = async (...args: VcsArg[]) =>
+      (await runVcs("git", ["-C", vcs.rootPath, ...args])).stdout.trim();
+
+    let line: string;
+
+    try {
+      line = await git("log", "-1", "--format=%H%x00%s%x00%an%x00%aI", {
+        rev: commit,
+      });
+    } catch {
+      throw new ReviewInputError("That commit is not in the repository.", 404);
+    }
+
+    const [full = commit, subject = "", author = "", authoredAt = ""] =
+      line.split("\0");
+
+    const branch = await vcs.defaultBranch().catch(() => null);
+
+    const behind = branch
+      ? await git("rev-list", "--count", { rev: `${full}..${branch.commit}` })
+          .then((count) => ({
+            count: Number(count),
+            branch: branch.ref.replace(/^origin\//, ""),
+          }))
+          .catch(() => undefined)
+      : undefined;
+
+    return {
+      commit: full,
+      subject,
+      author,
+      authoredAt,
+      ...(behind && { behind }),
+    };
+  }
+  /** The full commit a commit ID or its prefix names in the repository,
+   * or undefined when it names none. */
+  async resolveCommit(
+    repositoryId: string,
+    commit: string,
+  ): Promise<string | undefined> {
+    const vcs = await this.vcs(repositoryId);
+
+    if (!vcs) throw unavailableCheckout();
+    const resolved = await vcs.resolveRevision(commit);
+
+    // A branch or tag spelled in hex is not the commit it seems.
+    return resolved?.commit.startsWith(commit.toLowerCase())
+      ? resolved.commit
+      : undefined;
+  }
+  async validatePins(pins: Pins) {
+    if (pins.worktreeRevision) {
+      if (!(await this.vcs(pins.repositoryId))) throw unavailableCheckout();
+
+      return;
+    }
+
+    const resolved = await this.resolvePins(
+      pins.repositoryId,
+      pins.base,
+      pins.head,
+    );
+
+    if (resolved.base !== pins.base || resolved.head !== pins.head)
+      throw new ReviewInputError(
+        "Use resolved commit IDs, not moving branch names.",
+      );
+  }
+  async file(
+    pins: Pins,
+    side: "base" | "head",
+    file: string,
+    allowBinary = false,
+  ) {
+    checkRelativePath(file);
+    const commit = pins[side];
+    const vcs = await this.vcs(pins.repositoryId);
+
+    const text =
+      pins.worktreeRevision && side === "head"
+        ? vcs
+          ? await readWorkingFile(vcs.rootPath, file)
+          : null
+        : commit === EMPTY_SOURCE
+          ? null
+          : vcs
+            ? await readFileAtCommit({
+                rootPath: vcs.rootPath,
+                kind: vcs.kind,
+                commit,
+                relativePath: file,
+                reader: this.reader(pins.repositoryId, vcs),
+              })
+            : null;
+
+    if (text === null)
+      throw new ReviewInputError(
+        "File is unavailable at the pinned commit.",
+        404,
+      );
+
+    if (!allowBinary && text.includes("\0"))
+      throw new ReviewInputError(
+        "Binary files cannot be used as code references.",
+      );
+
+    return { file, side, commit, text };
+  }
+
+  async tree(
+    pins: Pins,
+    side: "base" | "head",
+    directory: string,
+  ): Promise<ReviewSourceEntry[]> {
+    inputError(() => checkSourcePath(directory));
+    const prefix = directory ? directory.replace(/\/$/, "") + "/" : "";
+    const entries = new Map<string, ReviewSourceEntry>();
+
+    const vcs = pins.worktreeRevision
+      ? await this.vcs(pins.repositoryId)
+      : undefined;
+
+    if (pins.worktreeRevision && !vcs) throw unavailableCheckout();
+
+    const files =
+      vcs && side === "head"
+        ? await workingFiles(vcs)
+        : pins[side] === EMPTY_SOURCE
+          ? []
+          : await this.trackedFilesAt(pins.repositoryId, pins[side]);
+
+    for (const file of files) {
+      if (!file.startsWith(prefix)) continue;
+      const relative = file.slice(prefix.length);
+      const name = relative.split("/", 1)[0]!;
+      entries.set(name, {
+        path: prefix + name,
+        kind: relative.includes("/") ? "directory" : "file",
+      });
+    }
+
+    if (directory && entries.size === 0)
+      throw new ReviewInputError(
+        "Directory is unavailable at the pinned commit.",
+        404,
+      );
+
+    return [...entries.values()];
+  }
+  private trackedFilesAt(repositoryId: string, ref: string) {
+    const key = `${repositoryId}\0${ref}`;
+    let files = this.trackedFiles.get(key);
+
+    if (!files) {
+      files = this.vcs(repositoryId).then((vcs) => {
+        // Do not keep the empty listing of a missing repository.
+        if (!vcs) {
+          this.trackedFiles.delete(key);
+
+          return [];
+        }
+
+        return listTrackedFilesAtCommit({
+          rootPath: vcs.rootPath,
+          kind: vcs.kind,
+          commit: ref,
+        });
+      });
+      this.trackedFiles.set(key, files);
+      files.catch(() => this.trackedFiles.delete(key));
+    }
+
+    return files;
+  }
+  async validateSources(pins: Pins, sources: FileLineRange[]) {
+    const files = new Map<string, FileLineRange[]>();
+
+    for (const input of sources) {
+      const source = fileLineRangeSchema.parse(input);
+
+      const key = JSON.stringify([
+        pins[source.side],
+        pins.worktreeRevision ? source.side : null,
+        source.file,
+      ]);
+
+      const ranges = files.get(key);
+
+      if (ranges) ranges.push(source);
+      else files.set(key, [source]);
+    }
+
+    for (const ranges of files.values()) {
+      const first = ranges[0]!;
+      const file = await this.file(pins, first.side, first.file);
+
+      for (const source of ranges) sliceRange(file, source);
+    }
+  }
+  async quote(pins: Pins, source: FileLineRange) {
+    source = fileLineRangeSchema.parse(source);
+
+    return sliceRange(await this.file(pins, source.side, source.file), source);
+  }
+  /** Every source reference must exist at the pins; only code peeks must also
+   * show something. */
+  async validateSource(
+    pins: Pins,
+    source: FileLineRange,
+    options: { peek: boolean },
+  ) {
+    const quote = await this.quote(pins, source);
+
+    if (options.peek)
+      inputError(() => requireVisibleSource(quote.text, source));
+  }
+  private readonly coverageCache = new Map<
+    string,
+    {
+      promise: ReturnType<typeof comparisonCoverage>;
+      state: "pending" | "ready" | "error";
+      error?: unknown;
+      partial?: ComparisonCoverage;
+      abort: AbortController;
+      worktree?: string;
+    }
+  >();
+  private readonly coverageAbort = new AbortController();
+  private readonly coverageListeners = new Set<
+    (reviews: ReadonlySet<string>) => void
+  >();
+
+  /** The reviews that read each comparison, so its updates reach only them. */
+  private readonly coverageReaders = new Map<string, Set<string>>();
+  private readonly coverageRevisions = new Map<string, number>();
+  private readonly changedCoverage = new Set<string>();
+
+  coverageRevision(reviewId: string) {
+    return this.coverageRevisions.get(reviewId) ?? 0;
+  }
+
+  private forgetCoverage(key: string) {
+    this.coverageCache.delete(key);
+    this.coverageReaders.delete(key);
+  }
+
+  subscribeCoverage(listener: (reviews: ReadonlySet<string>) => void) {
+    this.coverageListeners.add(listener);
+
+    return () => {
+      this.coverageListeners.delete(listener);
+    };
+  }
+
+  /** Start shared coverage work without occupying an HTTP request until it completes. */
+  coveragePending(reviewId: string, pins: Pins): boolean {
+    const key = JSON.stringify(pins);
+    const existing = this.coverageCache.get(key);
+
+    if (existing?.state === "error") {
+      this.forgetCoverage(key);
+      throw existing.error;
+    }
+
+    void this.coverage(reviewId, pins).catch(() => {});
+
+    return this.coverageCache.get(key)!.state === "pending";
+  }
+
+  coverageSnapshot(reviewId: string, pins: Pins) {
+    const pending = this.coveragePending(reviewId, pins);
+    const entry = this.coverageCache.get(JSON.stringify(pins))!;
+
+    return {
+      pending,
+      comparison: entry.partial ?? {
+        counted: false,
+        files: [],
+        fileSources: new Map(),
+        alignments: new Map(),
+      },
+    };
+  }
+
+  private coverageNotification: ReturnType<typeof setTimeout> | undefined;
+  private notifyCoverage(key: string) {
+    if (this.closed) return;
+    this.changedCoverage.add(key);
+
+    this.coverageNotification ??= setTimeout(() => {
+      this.coverageNotification = undefined;
+      const reviews = new Set<string>();
+
+      for (const changed of this.changedCoverage)
+        for (const reviewId of this.coverageReaders.get(changed) ?? []) {
+          reviews.add(reviewId);
+          this.coverageRevisions.set(
+            reviewId,
+            this.coverageRevision(reviewId) + 1,
+          );
+        }
+
+      this.changedCoverage.clear();
+
+      for (const listener of this.coverageListeners) listener(reviews);
+    }, 50);
+  }
+
+  coverage(reviewId: string, pins: Pins) {
+    const key = JSON.stringify(pins);
+    let entry = this.coverageCache.get(key);
+    const readers = this.coverageReaders.get(key) ?? new Set();
+
+    readers.add(reviewId);
+    this.coverageReaders.set(key, readers);
+
+    if (!entry || entry.state === "error") {
+      const worktree = pins.worktreeRevision
+        ? JSON.stringify({ ...pins, worktreeRevision: undefined })
+        : undefined;
+
+      // A newer worktree revision cancels older ones.
+      for (const [cachedKey, cached] of this.coverageCache)
+        if (worktree && cached.worktree === worktree) {
+          cached.abort.abort();
+          this.forgetCoverage(cachedKey);
+        }
+
+      const abort = new AbortController();
+
+      const promise = comparisonCoverage(
+        this,
+        reviewId,
+        pins,
+        AbortSignal.any([this.coverageAbort.signal, abort.signal]),
+        (partial) => {
+          const current = this.coverageCache.get(key);
+
+          if (current) current.partial = partial;
+          this.notifyCoverage(key);
+        },
+      );
+
+      entry = { promise, state: "pending", abort, worktree };
+      this.coverageCache.set(key, entry);
+      const current = entry;
+
+      const settled = (state: "ready" | "error", error?: Error) => {
+        current.state = state;
+        current.error = error;
+        this.notifyCoverage(key);
+
+        // Never evict shared in-flight work. Trim only settled comparisons.
+        for (const [cachedKey, cached] of this.coverageCache) {
+          if (this.coverageCache.size <= 32) break;
+
+          if (cached.state !== "pending" && cachedKey !== key)
+            this.forgetCoverage(cachedKey);
+        }
+      };
+
+      void promise.then(
+        (value) => {
+          current.partial ??= value;
+
+          if (!this.closed)
+            this.store.setDiffStats(pins, {
+              fileCount: value.files.length,
+              additions: value.files.reduce(
+                (sum, file) => sum + structuralChangeCounts(file.changed).added,
+                0,
+              ),
+              deletions: value.files.reduce(
+                (sum, file) =>
+                  sum + structuralChangeCounts(file.changed).removed,
+                0,
+              ),
+            });
+          settled("ready");
+        },
+        (error) => settled("error", error),
+      );
+    }
+
+    return entry.state === "ready" && entry.partial
+      ? Promise.resolve(entry.partial)
+      : entry.promise;
+  }
+
+  /** Every changed file's patch from one diff, by path. */
+  async patches(pins: Pins): Promise<Map<string, string>> {
+    return new Map(
+      splitGitPatchFiles(await this.rawPatch(pins, {})).map(
+        ({ file, patch }) => [
+          file.path,
+          patch.endsWith("\n") ? patch : `${patch}\n`,
+        ],
+      ),
+    );
+  }
+
+  changes(pins: Pins): Promise<LocalVcsDiffFileSummary[]>;
+  changes(pins: Pins, file: string, previousPath?: string): Promise<string>;
+  changes(
+    pins: Pins,
+    file?: string,
+    previousPath?: string,
+  ): Promise<LocalVcsDiffFileSummary[] | string>;
+  async changes(pins: Pins, file?: string, previousPath?: string) {
+    if (file === undefined) return this.summaries(pins);
+    checkRelativePath(file);
+
+    if (previousPath) checkRelativePath(previousPath);
+
+    return this.rawPatch(pins, {
+      paths: previousPath ? [previousPath, file] : [file],
+    });
+  }
+  private async summaries(pins: Pins) {
+    if (pins.worktreeRevision) {
+      return diffFileSummariesWorkingTree(await this.worktreeInput(pins));
+    }
+
+    return diffFileSummariesTrees({
+      ...(await this.vcsTarget(pins.repositoryId)),
+      baseRef: pins.base,
+      headRef: pins.head,
+    });
+  }
+  /** Raw Git patch text for exact filenames, or every change. */
+  private async rawPatch(
+    pins: Pins,
+    options: { paths?: string[]; contextLines?: number },
+  ) {
+    if (pins.worktreeRevision)
+      return diffWorkingTree({
+        ...(await this.worktreeInput(pins)),
+        ...options,
+      });
+
+    return diffTrees({
+      ...(await this.vcsTarget(pins.repositoryId)),
+      baseRef: pins.base,
+      headRef: pins.head,
+      ...options,
+      literalPaths: options.paths !== undefined,
+    });
+  }
+  private async worktreeInput(pins: Pins) {
+    const vcs = await this.vcs(pins.repositoryId);
+
+    if (!vcs) throw unavailableCheckout();
+
+    return {
+      rootPath: vcs.rootPath,
+      kind: vcs.kind,
+      baseRef: pins.base === EMPTY_SOURCE ? undefined : pins.base,
+      headRef: pins.head === EMPTY_SOURCE ? undefined : pins.head,
+    };
+  }
+  commits(pins: Pins) {
+    if (
+      pins.base === pins.head ||
+      pins.base === EMPTY_SOURCE ||
+      pins.head === EMPTY_SOURCE
+    )
+      return Promise.resolve([]);
+    const key = `${pins.repositoryId}:${pins.base}:${pins.head}`;
+    const cached = this.commitRanges.get(key);
+
+    if (cached) return cached;
+
+    // Immutable pins: one list per key; a rejection is evicted.
+    const pending = this.readCommitRange(pins).catch((cause: unknown) => {
+      this.commitRanges.delete(key);
+
+      throw cause;
+    });
+
+    this.commitRanges.set(key, pending);
+
+    return pending;
+  }
+  private async readCommitRange(pins: Pins) {
+    return listCommitRange({
+      ...(await this.vcsTarget(pins.repositoryId)),
+      baseRef: pins.base,
+      headRef: pins.head,
+    });
+  }
+  async comparison(pins: Pins, commit?: string): Promise<Pins> {
+    if (!commit) return pins;
+
+    const selected = (await this.commits(pins)).find(
+      (item) => item.commit === commit,
+    );
+
+    if (!selected)
+      throw new ReviewInputError(
+        "The selected commit is not part of this review version.",
+        404,
+      );
+
+    return {
+      repositoryId: pins.repositoryId,
+      base: selected.parentCommit,
+      head: selected.commit,
+    };
+  }
+  async map(documentPins: Pins | undefined, resourceId: string) {
+    await this.validateResource(documentPins, {
+      type: "software_map",
+      mapVersionId: resourceId,
+    });
+
+    const resource = this.store.resource(resourceId);
+
+    // SAFETY: map resources are normalized and validated by upload before storage.
+    const saved = JSON.parse(Buffer.from(resource.data).toString()) as Pick<
+      NormalizedSoftwareModel,
+      "elements" | "relationships"
+    > & {
+      side: "base" | "head";
+      commit: string;
+    };
+
+    // Without document pins the map is read at the commit it was built from.
+    const pins: Pins = documentPins ?? {
+      repositoryId: resource.repositoryId,
+      base: saved.commit,
+      head: saved.commit,
+    };
+
+    const target = await this.vcsTarget(pins.repositoryId);
+
+    const patch = pins.worktreeRevision
+      ? await diffWorkingTree({
+          ...target,
+          kind: target.kind ?? "git",
+          baseRef: pins.base === EMPTY_SOURCE ? undefined : pins.base,
+          headRef: pins.head === EMPTY_SOURCE ? undefined : pins.head,
+        })
+      : undefined;
+
+    const resolved = await resolveSoftwareMapDiffCounts({
+      patch,
+      sourceRootPath: target.rootPath,
+      sourceVcsKind: target.kind,
+      baseRef: pins.base,
+      headRef: pins.head,
+      side: saved.side,
+      codeElements: saved.elements.filter(
+        (element) => element.type === "codeElement",
+      ),
+      coverageClaims: saved.elements.flatMap((element) =>
+        element.coverage ? [{ path: element.path, ...element.coverage }] : [],
+      ),
+    });
+
+    return {
+      ...saved,
+      countsByElementPath: resolved.countsByElementPath,
+      unmappedByElementPath: resolved.unmappedByElementPath,
+    };
+  }
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Upload boundary: uploadSchema.parse below validates incoming JSON.
+  async upload(value: unknown) {
+    const input = uploadSchema.parse(value);
+    this.store.repositoryPath(input.repositoryId);
+
+    let mimeType = "application/json",
+      data: Uint8Array;
+
+    switch (input.kind) {
+      case "image":
+        data = await decodeImage(Buffer.from(input.base64, "base64"));
+        mimeType = "image/png";
+        break;
+
+      case "trace":
+        if (
+          new Set(input.trace.events.map((event) => event.id)).size !==
+          input.trace.events.length
+        )
+          throw new ReviewInputError("Trace event IDs must be unique.");
+        data = Buffer.from(
+          JSON.stringify({ ...input.trace, provenance: "client_supplied" }),
+        );
+        break;
+      case "map": {
+        if (input.pins.repositoryId !== input.repositoryId)
+          throw new ReviewInputError("Map belongs to a different repository.");
+        await this.validatePins(input.pins);
+        let model;
+
+        try {
+          model = defineSoftwareMap(input.model);
+        } catch (error) {
+          if (error instanceof SoftwareModelValidationError)
+            throw new ReviewInputError(error.message);
+          throw error;
+        }
+
+        // Read each pinned file once, then check every range against it concurrently.
+        const files = new Map<string, ReturnType<LocalReviewData["file"]>>();
+
+        await Promise.all(
+          model.elements.flatMap((element) =>
+            (element.sourceRanges ?? []).map(async (source) => {
+              const range = fileLineRangeSchema.parse({
+                ...source,
+                side: input.side,
+              });
+
+              let read = files.get(range.file);
+
+              if (!read)
+                files.set(
+                  range.file,
+                  (read = this.file(input.pins, range.side, range.file)),
+                );
+              sliceRange(await read, range);
+            }),
+          ),
+        );
+        data = Buffer.from(
+          JSON.stringify({
+            commit: input.pins[input.side],
+            side: input.side,
+            elements: model.elements,
+            relationships: model.relationships,
+          }),
+        );
+        break;
+      }
+    }
+
+    return this.store.putResource(
+      input.id,
+      input.repositoryId,
+      input.kind,
+      mimeType,
+      data,
+    );
+  }
+  /** A resource must belong to the document's repository when it has one;
+   * a document without pins may use any registered repository's resources. */
+  async validateResource(pins: Pins | undefined, block: Block) {
+    const reference = resourceReference(block);
+
+    if (!reference) return;
+    const { id, kind } = reference;
+    const resource = this.store.resource(id);
+
+    if (
+      (pins && resource.repositoryId !== pins.repositoryId) ||
+      resource.kind !== kind
+    )
+      throw new ReviewInputError(
+        "Resource belongs to a different repository or component type.",
+      );
+
+    if (!pins) this.store.repositoryPath(resource.repositoryId);
+
+    if (block.type === "trace_quote") {
+      const trace = traceSchema.parse(
+        JSON.parse(Buffer.from(resource.data).toString()),
+      );
+
+      const event = trace.events.find((event) => event.id === block.eventId);
+
+      if (!event || !textIncludesQuote(event.text, block.text))
+        throw new ReviewInputError(
+          "Quote does not match the retained trace event.",
+        );
+    }
+
+    if (block.type === "software_map") {
+      // SAFETY: map resources are normalized and validated by upload before storage.
+      const map = JSON.parse(Buffer.from(resource.data).toString()) as {
+        commit: string;
+        side: "base" | "head";
+        elements: { id: string; path: string }[];
+      };
+
+      if (pins && map.commit !== pins[map.side])
+        throw new ReviewInputError(
+          "Map does not match this review's source pins.",
+        );
+
+      if (
+        block.focusElementId &&
+        !map.elements.some(
+          (element) =>
+            element.id === block.focusElementId ||
+            element.path === block.focusElementId,
+        )
+      )
+        throw new ReviewInputError("Map focus element does not exist.");
+    }
+  }
+}
+
+async function notACheckout(folder: string) {
+  const bare = await gitAt(folder, ["rev-parse", "--is-bare-repository"], {
+    allowFailure: true,
+  });
+
+  if (bare.stdout.trim() !== "true") return "Choose a Git or jj repository.";
+
+  const listed = await gitAt(folder, ["worktree", "list", "--porcelain"], {
+    allowFailure: true,
+  });
+
+  const worktrees = listed.stdout
+    .split("\n\n")
+    .filter((entry) => !/^bare$/m.test(entry))
+    .flatMap((entry) => entry.match(/^worktree (.+)$/m)?.[1] ?? []);
+
+  return worktrees.length
+    ? `${folder} is a bare repository. Choose one of its worktrees: ${worktrees.join(", ")}.`
+    : `${folder} is a bare repository with no worktrees. Add one with git worktree add.`;
+}
+
+/** The pure source checks throw their own error; API clients see it as input. */
+function inputError<T>(run: () => T): T {
+  try {
+    return run();
+  } catch (error) {
+    if (error instanceof SourceRangeError)
+      throw new ReviewInputError(error.message);
+    throw error;
+  }
+}
+
+async function unwatch(entry: {
+  subscriptions: Map<string, AsyncSubscription>;
+  ignoring?: NodeJS.Timeout;
+}) {
+  clearTimeout(entry.ignoring);
+  const subscriptions = [...entry.subscriptions.values()];
+
+  entry.subscriptions.clear();
+  await Promise.all(subscriptions.map(release));
+}
+
+/** Linux fails to unwatch a directory that is already gone. */
+const release = (subscription: AsyncSubscription) =>
+  subscription.unsubscribe().catch(() => {});
+
+export function openLocalReviewStore(
+  databasePath: string,
+  options: {
+    blobReaderIdleTimeoutMs?: number;
+    manageWorkspaces?: boolean;
+    subscribe?: typeof subscribe;
+    pullRequests?: PullRequestDeps;
+    pullRequestStates?: boolean;
+    /** From `groupCheckoutsAhead`. */
+    checkoutOwners?: ReadonlyMap<string, string>;
+  } = {},
+) {
+  const { checkoutOwners, ...dataOptions } = options;
+
+  const store: ReviewStore = new ReviewStore(
+    databasePath,
+    {
+      projectSource: (snapshot, pins) => data.projectSource(snapshot, pins),
+      resolveTarget: (target, pinned) => data.resolveTarget(target, pinned),
+      resolvePullRequest: (url, repository) =>
+        data.resolvePullRequest(url, repository),
+      pullRequestTitle: (url) => data.pullRequestTitle(url),
+      findPullRequest: (pins, branch) => data.findPullRequest(pins, branch),
+      headBranch: (pins, headRef) => data.headBranch(pins, headRef),
+      sourcePins: (snapshot) => data.sourcePins(snapshot),
+      unavailableAnchors: (snapshot) => data.unavailableAnchors(snapshot),
+      validatePins: (pins) => data.validatePins(pins),
+      resolveCommit: (repositoryId, commit) =>
+        data.resolveCommit(repositoryId, commit),
+      filesChangedBetween: (from, to) => data.filesChangedBetween(from, to),
+      validateSource: (pins, source, options) =>
+        data.validateSource(pins, source, options),
+      validateResource: (pins, block) => data.validateResource(pins, block),
+      pullRequestBaseBranch: (url) => data.pullRequestBaseBranch(url),
+    },
+    checkoutOwners,
+  );
+
+  let data: LocalReviewData;
+
+  try {
+    data = new LocalReviewData(store, {
+      ...dataOptions,
+      workspaceDatabase: `${databasePath}.workspaces`,
+    });
+  } catch (error) {
+    void store.close();
+    throw error;
+  }
+
+  return { store, data };
+}
+
+/** The parts of a VS Code workspace file the navigator owns; everything else
+ * VS Code or the user adds is kept as is. */
+const codeWorkspaceSchema = z.looseObject({
+  folders: z.array(z.json()).default([]),
+  settings: z.record(z.string(), z.json()).default({}),
+});
+
+/** A workspace file's contents, undefined when it does not exist, or null when
+ * it is not plain JSON (VS Code accepts comments), which is left untouched. */
+async function readWorkspace(
+  file: string,
+): Promise<z.infer<typeof codeWorkspaceSchema> | null | undefined> {
+  const text = await readFile(file, "utf8").catch((error) => {
+    if (isMissingFileError(error)) return undefined;
+    throw error;
+  });
+
+  if (text === undefined) return undefined;
+
+  try {
+    return codeWorkspaceSchema.safeParse(JSON.parse(text)).data ?? null;
+  } catch {
+    return null;
+  }
+}

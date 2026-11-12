@@ -1,0 +1,343 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) dev.fast. All rights reserved.
+ *  Licensed under the MIT License. See LICENSE in the repository root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import { readdir, rm } from "node:fs/promises";
+import { createServer, type AddressInfo } from "node:net";
+import { join } from "node:path";
+import type { ReviewGatewayHost, ReviewGatewayHostState, ReviewRemoteAgent, ReviewRemoteAgentResult } from "../../common/reviewProtocol.js";
+import {
+	REVIEW_REMOTE_TIMEOUTS,
+	ReviewRemoteHost,
+	runSsh,
+	systemClock,
+	type ReviewRemoteClock,
+	type ReviewRemoteHostOptions,
+	type ReviewRemoteInstallFlow,
+	type SpawnSsh,
+} from "./reviewRemoteHost.js";
+import type { ReviewSshAskpass, SshPromptRequest } from "./reviewSshAskpass.js";
+import { reviewRemoteAuthority } from "../../services/remote/reviewRemoteAuthority.js";
+import { uninstallRemote } from "./reviewRemoteUninstall.js";
+import {
+	prepareSshControlDirectory,
+	reviewSshInstancePrefix,
+	reviewSshDirectSession,
+	reviewSshSession,
+	sshCloseArgs,
+	type ReviewSshSession,
+} from "./reviewSshCommand.js";
+import { validateSshAlias } from "../../common/reviewSshAlias.js";
+
+
+export interface ReviewRemoteHostsOptions {
+	readonly spawn: SpawnSsh;
+	/** Absent: the connections are direct, and nothing prompts. */
+	readonly controlDirectory?: string;
+	readonly instance: string;
+	environment(): Promise<NodeJS.ProcessEnv>;
+	createAskpass(input: {
+		directory: string;
+		prompt(request: SshPromptRequest): Promise<string | undefined>;
+		log(message: string): void;
+	}): Promise<ReviewSshAskpass>;
+	prompt(request: SshPromptRequest): Promise<string | undefined>;
+	desktopVersion(): Promise<string>;
+	readonly desktopCommit?: string;
+	groups?(): Promise<readonly string[]>;
+	freePort?(): Promise<number>;
+	send(hosts: ReviewGatewayHost[]): void;
+	capture?: ReviewRemoteHostOptions["capture"];
+	log(message: string): void;
+	readonly clock?: ReviewRemoteClock;
+	readonly timeouts?: ReviewRemoteHostOptions["timeouts"];
+	readonly install?: ReviewRemoteInstallFlow;
+	/** No host in the setting serves this machine any more. */
+	removed?(serverId: string): void;
+}
+
+/** The gateway's state of the machine `serverId`; `configured` is the alias that served it. */
+export function remoteHostState(
+	serverId: string,
+	states: readonly ReviewGatewayHostState[],
+	configured?: string,
+): ({ alias?: string } & Pick<ReviewGatewayHostState, "state" | "detail">) | undefined {
+	const own = states.filter((state) => state.serverId === serverId);
+	const best = own.find((state) => state.state === "online") ?? own.find((state) => state.state === "connecting") ?? own[0];
+	if (best) return best;
+	if (configured) return states.find((state) => state.alias === configured) ?? { alias: configured, state: "connecting" };
+	return states.some((state) => state.serverId === undefined && state.state === "connecting") ? { state: "connecting" } : undefined;
+}
+
+export function closeRemoteHostWindows(windows: { getWindows(): readonly { readonly remoteAuthority?: string; close(): void }[] }, serverId: string): void {
+	const authority = reviewRemoteAuthority(serverId);
+	if (authority) for (const window of windows.getWindows()) if (window.remoteAuthority === authority) window.close();
+}
+
+export function freeLoopbackPort(): Promise<number> {
+	return new Promise((resolve, reject) => {
+		const server = createServer();
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", () => {
+			const { port } = server.address() as AddressInfo;
+			server.close(() => resolve(port));
+		});
+	});
+}
+
+export class ReviewRemoteHosts {
+	private readonly clock: ReviewRemoteClock;
+	private readonly hosts = new Map<string, ReviewRemoteHost>();
+	private readonly closing = new Map<ReviewRemoteHost, Promise<void>>();
+	private readonly uninstalling = new Map<string, Promise<void>>();
+	private readonly removed = new Set<string>();
+	private readonly refused = new Map<string, ReviewGatewayHost>();
+	private order: string[] = [];
+	private prepared: Promise<ReviewSshAskpass> | undefined;
+	private sentAny = false;
+	private disposed = false;
+	private disposing: Promise<void> | undefined;
+	private readonly agentsRead = new Set<string>();
+
+	private readonly flow: ReviewRemoteInstallFlow | undefined;
+
+	constructor(private readonly options: ReviewRemoteHostsOptions) {
+		this.clock = options.clock ?? systemClock;
+		const flow = options.install;
+		let asking: Promise<unknown> = Promise.resolve();
+		const questions = new Map<string, { answer: Promise<boolean | undefined>; abort: AbortController }>();
+		this.flow = flow && {
+			...flow,
+			confirm: (request) => {
+				const open = questions.get(request.alias);
+				if (open) return open.answer;
+				const abort = new AbortController();
+				const answer = asking
+					.then(() => (abort.signal.aborted ? undefined : flow.confirm({ ...request, signal: abort.signal })))
+					.finally(() => questions.get(request.alias)?.abort === abort && questions.delete(request.alias));
+				asking = answer.catch(() => undefined);
+				questions.set(request.alias, { answer, abort });
+				return answer;
+			},
+			cancel: (alias) => {
+				questions.get(alias)?.abort.abort();
+				questions.delete(alias);
+			},
+		};
+	}
+
+	update(aliases: readonly string[]): void {
+		if (this.disposed) return;
+		const wanted = [...new Set(aliases)];
+		for (const [alias, host] of this.hosts) {
+			if (wanted.includes(alias)) continue;
+			this.hosts.delete(alias);
+			this.options.log(`${alias}: removed from the setting; closing its connection.`);
+			this.closing.set(host, host.dispose().finally(() => this.closing.delete(host)));
+			this.forget(host);
+		}
+		this.order = wanted;
+		this.refused.clear();
+		for (const alias of this.removed) if (!wanted.includes(alias)) this.removed.delete(alias);
+		for (const alias of wanted) {
+			if (this.removed.has(alias)) continue;
+			const valid = validateSshAlias(alias);
+			if (!valid.ok) {
+				this.refused.set(alias, { alias, problem: { state: "unreachable", detail: `The SSH alias ${JSON.stringify(alias)} ${valid.reason}.` } });
+				continue;
+			}
+			const existing = this.hosts.get(alias);
+			if (existing) {
+				if (existing.quiesced) {
+					if (!this.uninstalling.has(alias)) existing.unquiesce();
+				} else if (existing.state.problem && existing.state.problem.state !== "unreachable") existing.retry();
+				continue;
+			}
+			const host = this.createHost(alias);
+			this.hosts.set(alias, host);
+			// The same alias still closing uses the same socket path, which the new host would unlink under it.
+			const previous = [...this.closing].filter(([old]) => old.state.alias === alias).map(([, closed]) => closed);
+			if (previous.length) void Promise.all(previous).then(() => this.hosts.get(alias) === host && host.start());
+			else host.start();
+		}
+		this.publish();
+	}
+
+	async retry(alias: string): Promise<void> {
+		const host = this.hosts.get(alias);
+		if (host?.quiesced && !this.uninstalling.has(alias)) host.unquiesce();
+		else if (host?.state.endpoint) await host.recheck();
+		else host?.retry();
+	}
+
+	async install(alias: string): Promise<void> {
+		await this.options.install?.consent.set(alias, "allow");
+		this.hosts.get(alias)?.retry();
+	}
+
+	detectAgents(alias: string, refresh?: boolean): Promise<ReviewRemoteAgent[] | undefined> {
+		return this.hosts.get(alias)?.detectAgents(refresh) ?? Promise.resolve(undefined);
+	}
+
+	connectAgents(alias: string, ids: readonly unknown[]): Promise<ReviewRemoteAgentResult[]> {
+		const host = this.hosts.get(alias);
+		if (!host) return Promise.reject(new Error(`${alias} is not a remote host in Settings.`));
+		return host.connectAgents(ids);
+	}
+
+	uninstall(alias: string): Promise<void> {
+		const running = this.uninstalling.get(alias);
+		if (running) return running;
+		const done = this.uninstallOnce(alias).finally(() => this.uninstalling.delete(alias));
+		this.uninstalling.set(alias, done);
+		return done;
+	}
+
+	private async uninstallOnce(alias: string): Promise<void> {
+		const valid = validateSshAlias(alias);
+		if (!valid.ok) throw new Error(`The SSH alias ${JSON.stringify(alias)} ${valid.reason}.`);
+		const host = this.hosts.get(alias);
+		host?.quiesce();
+		try {
+			if (!this.options.install) throw new Error("This Desktop cannot install or remove Whiteboard on hosts.");
+			const env = { ...(await this.options.environment()), ...(await this.askpass()).env(alias) };
+			const script = await this.options.install.script();
+			await uninstallRemote({ session: this.session(alias), spawn: this.options.spawn, env, script });
+		} catch (error) {
+			this.options.log(`${alias}: Whiteboard was not removed; the host waits for the setting.`);
+			throw error;
+		}
+		await this.options.install?.consent.forget(alias);
+		if (host && this.hosts.get(alias) === host) {
+			this.hosts.delete(alias);
+			this.removed.add(alias);
+			this.forget(host);
+			this.publish();
+		}
+		if (!host) return;
+		let closed = this.closing.get(host);
+		if (!closed) {
+			closed = host.dispose().finally(() => this.closing.delete(host));
+			this.closing.set(host, closed);
+		}
+		await closed;
+	}
+
+	reattach(alias: string): void {
+		void this.hosts.get(alias)?.reattach();
+	}
+
+	async languageEndpoint(serverId: string, states: readonly ReviewGatewayHostState[]): ReturnType<ReviewRemoteHost["languageEndpoint"]> {
+		const online = states.find((state) => state.serverId === serverId && state.state === "online");
+		return online && this.hosts.get(online.alias)?.languageEndpoint(serverId);
+	}
+
+	/** The state of machine `serverId`, through the alias that served it, or `last` until that alias attaches. */
+	hostState(serverId: string, states: readonly ReviewGatewayHostState[], last?: string): ReturnType<typeof remoteHostState> {
+		const configured = [...this.hosts.values()].find((host) => host.serverId === serverId)?.state.alias
+			?? (last !== undefined && this.hosts.has(last) && this.hosts.get(last)?.serverId === undefined ? last : undefined);
+		return remoteHostState(serverId, states, configured);
+	}
+
+	resume(): void {
+		for (const host of this.hosts.values()) void host.resume();
+	}
+
+	dispose(): Promise<void> {
+		return (this.disposing ??= (async () => {
+			this.disposed = true;
+			const hosts = [...this.hosts.values()];
+			this.hosts.clear();
+			await Promise.all([...hosts.map((host) => host.dispose()), ...this.closing.values()]);
+			(await this.prepared?.catch(() => undefined))?.dispose();
+		})());
+	}
+
+	killNow(): void {
+		for (const host of [...this.hosts.values(), ...this.closing.keys()]) host.killNow();
+	}
+
+	private createHost(alias: string): ReviewRemoteHost {
+		return new ReviewRemoteHost({
+			session: this.session(alias),
+			spawn: this.options.spawn,
+			environment: async () => ({ ...(await this.options.environment()), ...(await this.askpass()).env(alias) }),
+			desktopVersion: () => this.options.desktopVersion(),
+			desktopCommit: this.options.desktopCommit,
+			groups: this.options.groups,
+			freePort: this.options.freePort ?? freeLoopbackPort,
+			report: () => this.publish(),
+			capture: this.options.capture,
+			log: this.options.log,
+			clock: this.clock,
+			timeouts: this.options.timeouts,
+			install: this.flow,
+			firstAttach: (key) => !this.agentsRead.has(key) && !!this.agentsRead.add(key),
+		});
+	}
+
+	private forget(host: ReviewRemoteHost): void {
+		const { serverId } = host;
+		if (serverId && ![...this.hosts.values()].some((other) => other.serverId === serverId)) this.options.removed?.(serverId);
+	}
+
+	private session(alias: string): ReviewSshSession {
+		const directory = this.options.controlDirectory;
+		return directory === undefined ? reviewSshDirectSession(alias) : reviewSshSession(alias, directory, this.options.instance);
+	}
+
+	private askpass(): Promise<ReviewSshAskpass> {
+		return (this.prepared ??= (async () => {
+			const directory = this.options.controlDirectory;
+			if (directory === undefined) return { env: () => ({}), dispose() {} };
+			await prepareSshControlDirectory(directory);
+			await this.sweepOrphans(directory);
+			return this.options.createAskpass({
+				directory,
+				prompt: (request) => this.prompt(request),
+				log: this.options.log,
+			});
+		})());
+	}
+
+	private async sweepOrphans(directory: string): Promise<void> {
+		const prefix = reviewSshInstancePrefix(this.options.instance);
+		try {
+			const env = await this.options.environment();
+			for (const name of await readdir(directory)) {
+				if (!name.startsWith(prefix)) continue;
+				const controlPath = join(directory, name);
+				try {
+					// -O exit works on any socket; the alias after -- is only a placeholder.
+					const closed = await runSsh(this.options.spawn, env, sshCloseArgs({ alias: "orphan", controlPath }, env), REVIEW_REMOTE_TIMEOUTS.close);
+					if (closed.code === 0) this.options.log(`closed an SSH connection left by an earlier run (${name}).`);
+					await rm(controlPath, { force: true });
+				} catch (error) {
+					this.options.log(`could not remove ${name} from the SSH control directory: ${(error as Error).message}`);
+				}
+			}
+		} catch (error) {
+			this.options.log(`could not sweep the SSH control directory: ${(error as Error).message}`);
+		}
+	}
+
+	private async prompt(request: SshPromptRequest): Promise<string | undefined> {
+		const host = this.hosts.get(request.alias);
+		host?.promptOpened();
+		let answered = true;
+		try {
+			const answer = await this.options.prompt(request);
+			answered = answer !== undefined;
+			return answer;
+		} finally {
+			host?.promptClosed(answered);
+		}
+	}
+
+	private publish(): void {
+		if (this.disposed || (!this.sentAny && !this.order.length)) return;
+		this.sentAny = true;
+		this.options.send(this.order.flatMap((alias) => this.refused.get(alias) ?? this.hosts.get(alias)?.state ?? []));
+	}
+}

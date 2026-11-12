@@ -1,0 +1,857 @@
+import {
+  fontSize,
+  fontWeight,
+  leading,
+  motion,
+  space,
+} from "@canvas/scale.stylex";
+import { Button } from "@canvas/ui/button";
+import { Spinner } from "@canvas/ui/spinner";
+import {
+  type DiffSelection,
+  type FlowDiagramBlock,
+  type FlowDiagramNode,
+  nodeSources,
+} from "@dev.fast/whiteboard-document";
+import {
+  type CoverageProgress,
+  coverageProgress,
+} from "@review/viewed-coverage";
+import * as stylex from "@stylexjs/stylex";
+import {
+  BaseEdge,
+  type CoordinateExtent,
+  type Edge,
+  type EdgeProps,
+  Handle,
+  MarkerType,
+  type Node,
+  type NodeProps,
+  Panel,
+  Position,
+  ReactFlow,
+  ReactFlowProvider,
+  useReactFlow,
+} from "@xyflow/react";
+import type { ElkNode } from "elkjs/lib/elk.bundled.js";
+import { type RefObject, useEffect, useMemo, useRef, useState } from "react";
+
+import { useReviewDebugSettings } from "./debug-settings";
+import { diagramStyles } from "./diagram-styles";
+import { useMotionPhase } from "./draw-queue-provider";
+import { drawStyles } from "./draw-styles";
+import { loadElk } from "./elk";
+import { ElementCountsText } from "./lens-counts";
+import { documentMarker, flowNodeMarker } from "./markers.stylex";
+import { MetaWheelZoom } from "./meta-wheel-zoom";
+import { useReviewLenses } from "./review-lenses";
+import { withClass } from "./stylex-props";
+import { tokens } from "./tokens.stylex";
+
+/**
+ * Every flow surface: the document block, the Diff sidebar lens and the
+ * fullscreen tour. ELK lays the graph out; React Flow draws it in a box that
+ * fits the whole drawing to itself, so a node landing at the bottom of a
+ * tall layout is still inside the box the reader is looking at. Nodes are
+ * DOM, edges are paths, so the draw queue's phases apply as they do to a
+ * sequence diagram. A decision is a dashed box, a terminal a pill.
+ */
+export function FlowGraph({
+  block,
+  direction = block.direction,
+  selectedKey,
+  onSelect,
+  requireReady = false,
+  interactive = false,
+  height = 340,
+}: {
+  block: FlowDiagramBlock;
+  direction?: "down" | "right";
+  selectedKey?: string | null;
+  requireReady?: boolean;
+  /** Pan and zoom by hand, for the fullscreen tour. */
+  interactive?: boolean;
+  height?: number | "100%";
+  onSelect(node: FlowDiagramNode): void;
+}) {
+  const { theme } = useReviewDebugSettings();
+  const [error, setError] = useState<string>();
+
+  const [computed, setLayout] = useState<{
+    block: FlowDiagramBlock;
+    direction: typeof direction;
+    layout: Layout;
+  }>();
+
+  const layout =
+    computed?.block === block && computed.direction === direction
+      ? computed.layout
+      : cachedLayouts.get(block)?.get(direction);
+
+  const frame = useRef<HTMLDivElement>(null);
+  const [frameWidth, setFrameWidth] = useState(0);
+
+  useEffect(() => {
+    const element = frame.current;
+
+    if (!element) return;
+
+    const measure = () => setFrameWidth(element.clientWidth);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+
+    return () => observer.disconnect();
+  }, [layout]);
+
+  // The layout the reader has zoomed or panned by hand. A new layout is a
+  // new drawing, so it starts from its fit again.
+  const [movedLayout, setMovedLayout] = useState<Layout>();
+  const moved = layout !== undefined && movedLayout === layout;
+
+  useEffect(() => {
+    let cancelled = false;
+    setError(undefined);
+
+    if (cachedLayouts.get(block)?.has(direction)) return;
+
+    void layoutFlow(block, direction)
+      .then((result) => {
+        const byDirection = cachedLayouts.get(block) ?? new Map();
+        cachedLayouts.set(block, byDirection.set(direction, result));
+
+        if (!cancelled) setLayout({ block, direction, layout: result });
+      })
+      .catch((error) => {
+        if (!cancelled) setError(String(error));
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [block, direction]);
+
+  const nodes = useMemo<FlowNodeType[]>(
+    () =>
+      layout
+        ? block.nodes.flatMap((node) => {
+            const position = layout.nodes.get(node.key);
+
+            if (!position) return [];
+
+            return [
+              {
+                id: node.key,
+                type: "flowNode",
+                position,
+                width: SIZE.width,
+                height: position.height,
+                draggable: false,
+                selectable: false,
+                className: stylex.props(styles.nodeWrapper).className,
+                data: {
+                  node,
+                  sources: nodeSources(node, block.pins).map(
+                    ({ source }) => source,
+                  ),
+                  requireReady,
+                  selected: selectedKey === node.key,
+                  select: () => onSelect(node),
+                },
+              },
+            ];
+          })
+        : [],
+    [block, layout, requireReady, selectedKey, onSelect],
+  );
+
+  const edges = useMemo<FlowEdgeType[]>(
+    () =>
+      layout
+        ? layout.edges.map((edge) => ({
+            id: `${edge.index}:${edge.section}`,
+            source: block.edges[edge.index]!.from,
+            target: block.edges[edge.index]!.to,
+            type: "flowEdge",
+            selectable: false,
+            markerEnd: ARROW,
+            data: {
+              unitId: block.edges[edge.index]!.id,
+              label: edge.label,
+              dashed: block.edges[edge.index]!.style === "dashed",
+              points: edge.points,
+            },
+          }))
+        : [],
+    [block, layout],
+  );
+
+  // Inline, the drawing cannot be panned out of its frame: the view stops at
+  // the drawing's padded edge, and centres it along an axis it fits within.
+  const extent = useMemo<CoordinateExtent | undefined>(
+    () =>
+      layout && !interactive
+        ? [
+            [-PADDING, -PADDING],
+            [layout.width + PADDING, layout.height + PADDING],
+          ]
+        : undefined,
+    [layout, interactive],
+  );
+
+  if (error)
+    return (
+      <p role="alert" {...stylex.props(styles.paragraph)}>
+        Could not lay out diagram: {error}
+      </p>
+    );
+
+  if (!layout)
+    return (
+      <p {...stylex.props(styles.paragraph, styles.note)}>Laying out flow…</p>
+    );
+
+  return (
+    <div
+      ref={frame}
+      {...withClass("lens-flow", styles.flow)}
+      style={{
+        height:
+          !interactive && height !== "100%" && frameWidth
+            ? Math.max(
+                height,
+                layout.height *
+                  Math.min(
+                    1,
+                    Math.max(1, frameWidth - PADDING * 2) / layout.width,
+                  ) +
+                  PADDING * 2,
+              )
+            : height,
+      }}
+      aria-label={block.title}
+    >
+      <ReactFlowProvider>
+        <ReactFlow
+          {...stylex.props(styles.canvas)}
+          colorMode={theme}
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
+          minZoom={MIN_ZOOM}
+          maxZoom={MAX_ZOOM}
+          translateExtent={extent}
+          onNodeClick={(_, node) => {
+            if (node.type === "flowNode") node.data.select();
+          }}
+          nodesDraggable={false}
+          nodesConnectable={false}
+          nodesFocusable={false}
+          edgesFocusable={false}
+          elementsSelectable={false}
+          panActivationKeyCode={null}
+          // Inline, a drag pans only a flow the reader has already zoomed.
+          panOnDrag={interactive || moved}
+          // A hand-made move carries its event; the fit's own does not.
+          onMove={(event) => {
+            if (event) setMovedLayout(layout);
+          }}
+          // Inline, a plain wheel belongs to the document: React Flow then
+          // zooms only on a pinch or Ctrl+wheel, and MetaWheelZoom adds Cmd.
+          preventScrolling={interactive}
+          zoomOnScroll
+          zoomOnPinch
+          zoomOnDoubleClick={false}
+          proOptions={{ hideAttribution: true }}
+        >
+          {moved ? (
+            <Panel position="top-right">
+              <Button
+                className="diagram-tour-button"
+                xstyle={diagramStyles.button}
+                onClick={() => setMovedLayout(undefined)}
+              >
+                Reset view
+              </Button>
+            </Panel>
+          ) : (
+            <FitToLayout
+              layout={layout}
+              frame={frame}
+              interactive={interactive}
+              selectedKey={selectedKey}
+            />
+          )}
+          {!interactive && (
+            <MetaWheelZoom
+              frame={frame}
+              onZoom={() => setMovedLayout(layout)}
+            />
+          )}
+        </ReactFlow>
+      </ReactFlowProvider>
+    </div>
+  );
+}
+
+const PADDING = 24;
+
+// The fit never enlarges past 1:1; a reader zooming by hand may.
+const MIN_ZOOM = 0.1;
+
+const MAX_ZOOM = 2;
+
+const ARROW = {
+  type: MarkerType.ArrowClosed,
+  width: 14,
+  height: 14,
+  color: tokens.inkMuted,
+};
+
+/**
+ * Fits the box to the layout: ELK reports the drawing's size, the frame
+ * reports its own, so the viewport is set outright instead of asking React
+ * Flow to measure nodes first. Refits on every layout and every resize,
+ * animated once the first fit has landed. Never enlarges past 1:1. Mounted
+ * only while the reader has not moved the view, so a zoom made by hand
+ * survives a resize and Reset view brings the fit back.
+ */
+function FitToLayout({
+  layout,
+  frame,
+  interactive,
+  selectedKey,
+}: {
+  layout: Layout;
+  frame: RefObject<HTMLDivElement | null>;
+  interactive: boolean;
+  selectedKey?: string | null;
+}) {
+  const flow = useReactFlow();
+  const selected = selectedKey ? layout.nodes.get(selectedKey) : undefined;
+
+  useEffect(() => {
+    const element = frame.current;
+
+    if (!element) return;
+
+    const fit = () => {
+      const { width, height } = element.getBoundingClientRect();
+
+      if (!width || !height) return;
+
+      const fitZoom = Math.min(
+        1,
+        (width - PADDING * 2) / Math.max(1, layout.width),
+        (height - PADDING * 2) / Math.max(1, layout.height),
+      );
+
+      // The tour can pan. Start near its selected node at a readable scale
+      // instead of shrinking three lines of text into a tiny overview.
+      const zoom = interactive ? Math.max(0.75, fitZoom) : fitZoom;
+      const focus = zoom > fitZoom && selected;
+      const centerX = focus ? focus.x + SIZE.width / 2 : layout.width / 2;
+      const centerY = focus ? focus.y + focus.height / 2 : layout.height / 2;
+
+      void flow.setViewport(
+        {
+          x: width / 2 - centerX * zoom,
+          y: height / 2 - centerY * zoom,
+          zoom,
+        },
+        { duration: 0 },
+      );
+    };
+
+    fit();
+    const observer = new ResizeObserver(fit);
+    observer.observe(element);
+
+    return () => observer.disconnect();
+  }, [flow, frame, layout, interactive, selected]);
+
+  return null;
+}
+
+interface Layout {
+  width: number;
+  height: number;
+  nodes: Map<string, { x: number; y: number; height: number }>;
+  edges: {
+    index: number;
+    section: number;
+    points: { x: number; y: number }[];
+    label?: { text: string; x: number; y: number };
+  }[];
+}
+
+const SIZE = { width: 210, height: 62 };
+
+// So the tour's fullscreen copy draws on its first render.
+const cachedLayouts = new WeakMap<
+  FlowDiagramBlock,
+  Map<"down" | "right" | undefined, Layout>
+>();
+
+// The label's 9px mono font, so ELK leaves room for it between layers.
+const LABEL = { charWidth: 5.4, height: 12, maxLength: 28 };
+
+const labelText = (label: string) =>
+  label.length > LABEL.maxLength
+    ? `${label.slice(0, LABEL.maxLength - 1)}…`
+    : label;
+
+async function layoutFlow(
+  block: FlowDiagramBlock,
+  direction: "down" | "right" | undefined,
+): Promise<Layout> {
+  const elk = await loadElk();
+  // Measure with the same font, wrapping and clamp as the rendered node.
+  // ELK needs these sizes before it can route edges around the labels.
+  const measure = document.createElement("div");
+  Object.assign(measure, stylex.props(styles.node, styles.measure));
+  const label = document.createElement("span");
+  Object.assign(label, stylex.props(styles.label));
+  measure.style.width = `${SIZE.width}px`;
+  measure.append(label);
+  (document.querySelector(".review-app") ?? document.body).append(measure);
+  const heights = new Map<string, number>();
+
+  try {
+    await document.fonts.load(getComputedStyle(label).font);
+    label.textContent = "M";
+    const singleLineHeight = label.offsetHeight;
+
+    for (const node of block.nodes) {
+      label.textContent = node.label;
+      heights.set(
+        node.key,
+        SIZE.height + Math.max(0, label.offsetHeight - singleLineHeight),
+      );
+    }
+  } finally {
+    measure.remove();
+  }
+
+  const result = await elk.layout<ElkNode>({
+    id: "flow",
+    layoutOptions: {
+      "elk.algorithm": "layered",
+      "elk.direction": direction === "right" ? "RIGHT" : "DOWN",
+      "elk.spacing.nodeNode": "28",
+      "elk.layered.spacing.nodeNodeBetweenLayers": "44",
+    },
+    children: block.nodes.map((node) => ({
+      id: node.key,
+      width: SIZE.width,
+      height: heights.get(node.key)!,
+    })),
+    edges: block.edges.map((edge, index) => {
+      const text = edge.label && labelText(edge.label);
+
+      return {
+        id: String(index),
+        sources: [edge.from],
+        targets: [edge.to],
+        labels: text
+          ? [
+              {
+                text,
+                width: text.length * LABEL.charWidth,
+                height: LABEL.height,
+                // Beside the source, so the label widens its own gap
+                // instead of getting a layer of its own.
+                layoutOptions: { "elk.edgeLabels.placement": "TAIL" },
+              },
+            ]
+          : [],
+      };
+    }),
+  });
+
+  return {
+    width: result.width ?? 240,
+    height: result.height ?? 100,
+    nodes: new Map(
+      result.children?.map((node) => [
+        node.id,
+        { x: node.x ?? 0, y: node.y ?? 0, height: node.height ?? SIZE.height },
+      ]),
+    ),
+    edges: (result.edges ?? []).flatMap((edge) =>
+      (edge.sections ?? []).map((section, index) => {
+        const label = index ? undefined : edge.labels?.[0];
+
+        return {
+          index: Number(edge.id),
+          section: index,
+          points: [
+            section.startPoint,
+            ...(section.bendPoints ?? []),
+            section.endPoint,
+          ],
+          label: label && {
+            text: label.text ?? "",
+            x: label.x ?? 0,
+            y: (label.y ?? 0) + LABEL.height - 3,
+          },
+        };
+      }),
+    ),
+  };
+}
+
+interface FlowNodeData extends Record<string, unknown> {
+  node: FlowDiagramNode;
+  sources: DiffSelection[];
+  requireReady: boolean;
+  selected: boolean;
+  select(): void;
+}
+
+type FlowNodeType = Node<FlowNodeData, "flowNode">;
+
+interface FlowEdgeData extends Record<string, unknown> {
+  unitId: string | undefined;
+  label: { text: string; x: number; y: number } | undefined;
+  dashed: boolean;
+  points: { x: number; y: number }[];
+}
+
+type FlowEdgeType = Edge<FlowEdgeData, "flowEdge">;
+
+const change = (progress: CoverageProgress) =>
+  progress.total.additions && progress.total.deletions
+    ? "modified"
+    : progress.total.additions
+      ? "added"
+      : progress.total.deletions
+        ? "removed"
+        : "unchanged";
+
+function FlowNode({ data, height = SIZE.height }: NodeProps<FlowNodeType>) {
+  const { node, sources, requireReady, selected } = data;
+  const lenses = useReviewLenses();
+  const motion = useMotionPhase(node.id);
+
+  const availability = requireReady ? lenses?.availability(sources) : "ready";
+  const unavailable = availability !== "ready";
+
+  const progress =
+    lenses?.stats(lenses.resolve(sources)) ?? coverageProgress([]);
+
+  // The flow's onNodeClick handles the mouse; the keyboard lands here.
+  const select = () => {
+    if (!unavailable) data.select();
+  };
+
+  return (
+    <div
+      // The class is a marker for tests.
+      {...withClass(
+        "lens-flow-node",
+        flowNodeMarker,
+        styles.node,
+        progress.state === "viewed" && styles.viewed,
+        motion === "queued" && drawStyles.hidden,
+      )}
+      style={{ width: SIZE.width, height }}
+      role="button"
+      tabIndex={unavailable ? -1 : 0}
+      aria-disabled={unavailable}
+      aria-pressed={selected}
+      aria-label={node.label}
+      data-review-unit-id={node.id}
+      data-motion={motion}
+      title={
+        unavailable
+          ? availability === "pending"
+            ? "Waiting for diff…"
+            : "Source unavailable at these pins"
+          : progress.total.additions + progress.total.deletions
+            ? `${node.label} · Total +${progress.total.additions} −${progress.total.deletions}`
+            : node.label
+      }
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          select();
+        }
+      }}
+    >
+      <Handle
+        type="target"
+        position={Position.Top}
+        {...stylex.props(diagramStyles.handle)}
+      />
+      <Handle
+        type="source"
+        position={Position.Bottom}
+        {...stylex.props(diagramStyles.handle)}
+      />
+      <svg
+        {...stylex.props(styles.drawing)}
+        viewBox={`0 0 ${SIZE.width} ${height}`}
+        preserveAspectRatio="none"
+        aria-hidden="true"
+      >
+        <rect
+          {...stylex.props(
+            styles.outline,
+            changeOutline[change(progress)],
+            selected && styles.outlineSelected,
+            node.kind === "decision" && !motion && styles.outlineDecision,
+            motion === "stroke" && [
+              styles.outlineTracing,
+              drawStyles.traceQuick,
+            ],
+            motion === "outline" && [styles.outlineOnly, drawStyles.traceNode],
+            motion === "fill" && drawStyles.fill,
+            motion === "relabel" && drawStyles.refill,
+            motion === "attention" && styles.outlineAttention,
+          )}
+          pathLength={1}
+          x={0.5}
+          y={0.5}
+          width={SIZE.width - 1}
+          height={height - 1}
+          rx={node.kind === "terminal" ? height / 2 : 6}
+        />
+      </svg>
+      <div
+        {...stylex.props(
+          styles.text,
+          motion === "stroke" && drawStyles.labelQuick,
+          motion === "outline" && drawStyles.hidden,
+          (motion === "fill" || motion === "relabel") && drawStyles.labelFill,
+        )}
+      >
+        <span {...stylex.props(styles.label)}>{node.label}</span>
+        <span {...stylex.props(styles.caption)}>
+          {unavailable ? (
+            availability === "pending" ? (
+              <Spinner />
+            ) : (
+              "Unavailable"
+            )
+          ) : sources.length ? (
+            <ElementCountsText progress={progress} />
+          ) : null}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function FlowEdge({ id, data, markerEnd }: EdgeProps<FlowEdgeType>) {
+  const motion = useMotionPhase(data?.unitId);
+
+  if (!data) return null;
+
+  const path = data.points
+    .map((point, index) => `${index ? "L" : "M"}${point.x},${point.y}`)
+    .join(" ");
+
+  return (
+    <>
+      <BaseEdge
+        id={id}
+        path={path}
+        className={
+          stylex.props(
+            styles.edge,
+            (motion === "outline" || motion === "stroke") && styles.edgeTracing,
+            motion === "queued" && drawStyles.hidden,
+            motion === "stroke" && drawStyles.traceQuick,
+            motion === "outline" && drawStyles.traceLine,
+          ).className
+        }
+        // The arrowhead is the last stroke.
+        markerEnd={
+          motion === "outline" || motion === "stroke" ? undefined : markerEnd
+        }
+        strokeDasharray={data.dashed ? "6 4" : undefined}
+        pathLength={1}
+        interactionWidth={0}
+        data-review-unit-id={data.unitId}
+        data-motion={motion}
+      />
+      {data.label && (
+        <text
+          {...stylex.props(
+            styles.edgeLabel,
+            motion === "queued" && drawStyles.hidden,
+            motion === "stroke" && drawStyles.labelEdgeQuick,
+            motion === "outline" && drawStyles.labelEdge,
+          )}
+          x={data.label.x}
+          y={data.label.y}
+          data-motion={motion}
+        >
+          {data.label.text}
+        </text>
+      )}
+    </>
+  );
+}
+
+const nodeTypes = { flowNode: FlowNode };
+
+const edgeTypes = { flowEdge: FlowEdge };
+
+const inDocument = () => stylex.when.ancestor(":is(*)", documentMarker);
+
+const styles = stylex.create({
+  // Read as document paragraphs inside a document.
+  paragraph: {
+    margin: { default: null, [inDocument()]: `${space.s14} 0` },
+    color: { default: null, [inDocument()]: tokens.ink },
+    fontFamily: { default: null, [inDocument()]: tokens.fontSerif },
+    fontSize: { default: null, [inDocument()]: fontSize.reading },
+    lineHeight: { default: null, [inDocument()]: leading.prose },
+    textAlign: { default: null, [inDocument()]: "left" },
+  },
+  note: {
+    padding: `${space.s8} ${space.s12}`,
+    color: { default: tokens.inkFaint, [inDocument()]: tokens.ink },
+  },
+  flow: {
+    width: "100%",
+    minHeight: "120px",
+    display: "block",
+    font: `${fontSize.body} ${tokens.fontMono}`,
+  },
+  canvas: {
+    backgroundColor: tokens.transparent,
+  },
+  nodeWrapper: {
+    cursor: "default",
+  },
+  node: {
+    position: "relative",
+    boxSizing: "border-box",
+    color: tokens.ink,
+    font: `${fontSize.body}/${leading.normal} ${tokens.fontMono}`,
+    cursor: "pointer",
+    outline: { default: null, ":focus-visible": "none" },
+  },
+  viewed: {
+    opacity: 0.42,
+  },
+  drawing: {
+    position: "absolute",
+    inset: 0,
+    width: "100%",
+    height: "100%",
+    overflow: "visible",
+  },
+  outline: {
+    fill: tokens.surface,
+    stroke: {
+      default: tokens.ruleSoft,
+      [stylex.when.ancestor(":focus-visible", flowNodeMarker)]: tokens.accent,
+    },
+    strokeWidth: {
+      default: 1,
+      [stylex.when.ancestor(":focus-visible", flowNodeMarker)]: 1.5,
+    },
+    vectorEffect: "non-scaling-stroke",
+    transition: `fill ${motion.medium} ${motion.ease}, stroke ${motion.medium} ${motion.ease}`,
+  },
+  outlineSelected: {
+    fill: tokens.markerTint,
+    stroke: tokens.accent,
+    strokeWidth: 1.5,
+  },
+  // A decision rests as a dashed box; the trace draws it solid. With
+  // pathLength 1, the dashes are fractions of the outline: about 4px on,
+  // 3px off.
+  outlineDecision: {
+    stroke: tokens.inkMuted,
+    strokeDasharray: "0.0075 0.0057",
+  },
+  // While drawn, the trace strokes it in the marker.
+  outlineTracing: {
+    stroke: tokens.accent,
+    strokeWidth: 1.6,
+  },
+  outlineOnly: {
+    fill: tokens.transparent,
+    stroke: tokens.accent,
+    strokeWidth: 1.6,
+  },
+  outlineAttention: {
+    fill: tokens.markerTint,
+    stroke: tokens.accent,
+    strokeWidth: 1.6,
+  },
+  text: {
+    position: "absolute",
+    inset: 0,
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "center",
+    gap: space.s2,
+    minWidth: 0,
+    padding: `0 ${space.s12}`,
+  },
+  measure: {
+    padding: `0 ${space.s12}`,
+    position: "absolute",
+    visibility: "hidden",
+    pointerEvents: "none",
+  },
+  label: {
+    display: "-webkit-box",
+    overflow: "hidden",
+    WebkitBoxOrient: "vertical",
+    WebkitLineClamp: 3,
+    overflowWrap: "anywhere",
+    fontWeight: fontWeight.medium,
+  },
+  caption: {
+    color: tokens.inkFaint,
+    fontSize: fontSize.micro,
+  },
+  edge: {
+    fill: "none",
+    stroke: tokens.inkMuted,
+    strokeWidth: 1.4,
+  },
+  edgeTracing: {
+    strokeWidth: 1.6,
+  },
+  edgeLabel: {
+    font: `${fontSize.micro} ${tokens.fontMono}`,
+    fill: tokens.inkMuted,
+    paintOrder: "stroke",
+    stroke: tokens.tray,
+    strokeWidth: "4px",
+  },
+});
+
+const changeOutline = stylex.create({
+  unchanged: {},
+  added: {
+    fill: tokens.diffAddedBg,
+    stroke: {
+      default: tokens.changeAdded,
+      [stylex.when.ancestor(":focus-visible", flowNodeMarker)]: tokens.accent,
+    },
+  },
+  removed: {
+    fill: tokens.diffRemovedBg,
+    stroke: {
+      default: tokens.changeRemoved,
+      [stylex.when.ancestor(":focus-visible", flowNodeMarker)]: tokens.accent,
+    },
+  },
+  modified: {
+    fill: tokens.diffModifiedBg,
+    stroke: {
+      default: tokens.changeModified,
+      [stylex.when.ancestor(":focus-visible", flowNodeMarker)]: tokens.accent,
+    },
+  },
+});

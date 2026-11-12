@@ -1,0 +1,346 @@
+---
+import { siAnthropic, siCursor } from 'simple-icons';
+import SplashLayout from '../layouts/SplashLayout.astro';
+import Hero from '../components/homepage/Hero.astro';
+import Steps from '../components/content/Steps.astro';
+import { responsiveArt } from '../utils/art';
+import { latestReleases, repoStats } from '../utils/project';
+import closingImage from '../assets/illustrations/closing.jpg';
+import localImage from '../assets/illustrations/section-indexing.jpg';
+
+const [closing, local] = await Promise.all([
+  responsiveArt(closingImage, [960, 1440, 1920, 2400]),
+  responsiveArt(localImage, [640, 960, 1440]),
+]);
+const installCommand = 'curl -sSL https://raw.githubusercontent.com/yoanbernabeu/grepai/main/install.sh | sh';
+const [latest] = latestReleases(1, 1);
+const stats = await repoStats();
+const formatDate = (iso: string) =>
+  new Date(`${iso}T12:00:00Z`).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+
+const agents = [
+  { name: 'Claude Code', icon: siAnthropic.path },
+  { name: 'Cursor', icon: siCursor.path },
+  { name: 'Codex CLI' },
+  { name: 'Windsurf' },
+  { name: 'Gemini CLI' },
+  { name: 'OpenCode' },
+];
+
+const voices = [
+  {
+    quote: 'I just hit my limit and it took 13% of my max5 plan just to read my codebase. I am very, very excited about your new tool.',
+    who: 'u/911pleasehold',
+    where: 'Reddit, r/ClaudeAI',
+    href: 'https://www.reddit.com/r/ClaudeAI/comments/1qiv0d3/open_source_i_reduced_claude_code_input_tokens_by/',
+  },
+  {
+    quote: 'It works great! Takes 5 minutes to install. Crazy!',
+    who: '@LesSaleGeek',
+    where: 'X',
+    href: 'https://x.com/LesSaleGeek/status/2010335803604611124',
+  },
+  {
+    quote: 'The results are incredible!',
+    who: 'Kenny Nguyen',
+    where: 'LinkedIn',
+    href: 'https://www.linkedin.com/feed/update/urn:li:activity:7419451883293061120?commentUrn=urn%3Ali%3Acomment%3A%28activity%3A7419451883293061120%2C7419464457388453888%29',
+  },
+];
+---
+
+<SplashLayout
+  title="Semantic Code Search for AI Agents"
+  description="grepai is an open-source CLI that searches code by meaning and traces callers. Runs locally with Ollama. Works with Claude Code, Cursor and MCP."
+  software
+>
+  <Hero />
+
+  <!-- Benefits: the three things that change for someone using a coding agent -->
+  <section class="gutter max-w-7xl mx-auto py-20 md:py-28" aria-labelledby="why-title">
+    <h2 id="why-title" class="max-w-3xl font-display text-3xl md:text-[2.75rem] leading-[1.1] tracking-[-0.01em]">
+      Your agent spends most of a session looking for code. grepai cuts that short.
+    </h2>
+
+    <div class="mt-14 grid gap-12 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)] lg:gap-16">
+      <div class="lg:border-r lg:border-rule lg:pr-16">
+        <p class="font-display text-7xl md:text-8xl leading-none tracking-[-0.03em]">97%</p>
+        <h3 class="mt-4 text-xl font-semibold">Fewer tokens spent reading</h3>
+        <p class="mt-2 text-ink-muted">
+          In a benchmark on Claude Code, the agent answered the same questions with 97% fewer input tokens and a 27.5% lower
+          bill, because it opened the right files instead of scanning the repository.
+        </p>
+        <p class="mt-4 text-sm"><a href="/grepai/blog/benchmark-grepai-vs-grep-claude-code/" class="link">How it was measured</a></p>
+      </div>
+
+      <div class="grid gap-10 sm:grid-cols-2">
+        <div>
+          <h3 class="text-xl font-semibold">The right file on the first try</h3>
+          <p class="mt-2 text-ink-muted">
+            Your agent asks what it needs in plain English, like “where do we refresh expired tokens?”, and gets the matching
+            functions. The code doesn't need to contain those words.
+          </p>
+        </div>
+        <div>
+          <h3 class="text-xl font-semibold">Changes that don't break callers</h3>
+          <p class="mt-2 text-ink-muted">
+            Before editing a function, your agent lists every place that calls it, so it updates them in the same change
+            instead of finding out from your tests.
+          </p>
+        </div>
+        <div class="sm:col-span-2 border-t border-rule pt-8">
+          <h3 class="text-xl font-semibold">Set up once, then forget it</h3>
+          <p class="mt-2 text-ink-muted max-w-xl">
+            One command connects grepai to your agent, and grepai watch keeps the index current as you save files.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- One demo on a project people know. Real runs, condensed. -->
+  <section class="border-y border-rule bg-paper-raised" aria-labelledby="demo-title">
+    <div class="gutter max-w-7xl mx-auto py-20 md:py-24 grid gap-10 lg:grid-cols-[minmax(0,4fr)_minmax(0,8fr)] lg:items-center">
+      <div>
+        <p class="kicker">On a real project</p>
+        <h2 id="demo-title" class="mt-2 font-display text-3xl md:text-[2.4rem] leading-[1.12] tracking-[-0.01em]">
+          “How does gin turn a panic into a 500?”
+        </h2>
+        <p class="mt-4 text-ink-muted">
+          A question you might ask about <a href="https://github.com/gin-gonic/gin" target="_blank" rel="noopener noreferrer" class="link">gin</a>,
+          the Go web framework. Searching for the word gives you a pile. Asking grepai gives you the file.
+        </p>
+      </div>
+
+      <div class="min-w-0">
+        <pre class="demo !my-0" data-no-copy><code><span class="prompt">grep -rn "panic" --include='*.go' .</span>
+<span class="dim">102 matching lines in 20 files</span>
+
+<span class="prompt">grepai search "how a panic in a handler is recovered and turned into a 500"</span>
+<span class="hit">1. recovery.go:1-70       score 0.59</span>
+<span class="dim">2. gin.go:360-424         score 0.54</span>
+
+<span class="prompt">grepai trace callers "Recovery"</span>
+<span class="hit">Default                   gin.go:253</span>
+<span class="dim">+ 3 more in tests and benchmarks</span></code></pre>
+        <p class="mt-3 text-xs text-ink-muted">grepai v0.39.0 on gin at commit 0f09c3a, local Ollama embeddings. Output condensed.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Local by default, and the agents it plugs into -->
+  <section class="gutter max-w-7xl mx-auto py-20 md:py-28 grid gap-12 lg:grid-cols-2 lg:items-center" aria-labelledby="local-title">
+    <picture>
+      <source type="image/avif" srcset={local.avif} sizes="(min-width: 1024px) 600px, 100vw" />
+      <source type="image/webp" srcset={local.webp} sizes="(min-width: 1024px) 600px, 100vw" />
+      <img
+        src={local.fallback}
+        srcset={local.jpeg}
+        sizes="(min-width: 1024px) 600px, 100vw"
+        width={local.width}
+        height={local.height}
+        alt="The explorer draws the map of the city by lantern light, alone in a tower room."
+        loading="lazy"
+        decoding="async"
+        class="block w-full h-auto aspect-[4/3] object-cover object-[70%_50%] rounded-md bg-[#172629]"
+      />
+    </picture>
+    <div>
+      <h2 id="local-title" class="font-display text-3xl md:text-[2.6rem] leading-[1.1] tracking-[-0.01em]">
+        Your code stays on your machine.
+      </h2>
+      <p class="mt-4 text-lg text-ink-muted">
+        By default grepai builds its index with Ollama on your laptop. Nothing is sent anywhere. If you prefer a hosted model,
+        OpenAI and other providers are one line of config away.
+      </p>
+      <p class="mt-8 text-sm font-semibold text-ink-muted">Works with</p>
+      <ul class="mt-3 grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-2.5">
+        {agents.map((agent) => (
+          <li class="flex items-center gap-2">
+            {agent.icon ? (
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" class="text-ink-muted" aria-hidden="true"><path d={agent.icon} /></svg>
+            ) : (
+              <span class="w-[15px] h-[15px] grid place-items-center" aria-hidden="true"><span class="w-1.5 h-1.5 rounded-full bg-ink-muted"></span></span>
+            )}
+            {agent.name}
+          </li>
+        ))}
+      </ul>
+      <p class="mt-4 text-ink-muted">and any tool that speaks MCP. <a href="/grepai/mcp/" class="link">MCP setup</a></p>
+    </div>
+  </section>
+
+  <!-- What people said, and proof the project is alive -->
+  <section class="border-t border-rule bg-paper-raised" aria-labelledby="voices-title">
+    <div class="gutter max-w-7xl mx-auto py-20 md:py-24">
+      <h2 id="voices-title" class="kicker">From people who installed it</h2>
+      <div class="mt-8 grid gap-10 md:grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)_minmax(0,1fr)]">
+        {voices.map((voice, i) => (
+          <figure class="flex flex-col">
+            <blockquote class:list={['font-display leading-snug', i === 0 ? 'text-2xl md:text-[1.75rem]' : 'text-xl md:text-2xl']}>
+              “{voice.quote}”
+            </blockquote>
+            <figcaption class="mt-4 text-sm text-ink-muted">
+              <a href={voice.href} target="_blank" rel="noopener noreferrer" class="hover:text-ink hover:underline underline-offset-4">
+                {voice.who}, {voice.where}
+              </a>
+            </figcaption>
+          </figure>
+        ))}
+      </div>
+      {(latest || (stats.releases && stats.contributors)) && (
+        <p class="mt-14 pt-6 border-t border-rule text-sm text-ink-muted">
+          {stats.releases && stats.contributors && (
+            <>Open source, {stats.releases} releases and {stats.contributors} contributors since January 2026. </>
+          )}
+          {latest && (
+            <>
+              Latest: <a href={`https://github.com/yoanbernabeu/grepai/releases/tag/v${latest.version}`} target="_blank" rel="noopener noreferrer" class="link">v{latest.version}</a>
+              {' '}({formatDate(latest.date)}), {latest.added[0]}.
+            </>
+          )}
+        </p>
+      )}
+    </div>
+  </section>
+
+  <!-- Install: three real steps -->
+  <section class="border-t border-rule" aria-labelledby="install-title">
+    <div class="gutter max-w-7xl mx-auto py-20 md:py-28 grid gap-12 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
+      <div>
+        <p class="kicker">Get started</p>
+        <h2 id="install-title" class="mt-2 font-display text-3xl md:text-[2.6rem] leading-[1.1] tracking-[-0.01em]">
+          Three commands to get going.
+        </h2>
+        <p class="mt-4 text-ink-muted max-w-md">
+          You need <a href="https://ollama.com" target="_blank" rel="noopener noreferrer" class="link">Ollama</a> running with the
+          embedding model: <code class="font-mono text-[0.9em] text-ink">ollama pull nomic-embed-text</code>.
+        </p>
+        <p class="mt-6"><a href="/grepai/quickstart/" class="link">Full quick start</a></p>
+      </div>
+      <div class="min-w-0">
+        <Steps>
+          <ol>
+            <li>
+              <strong>Install grepai</strong>
+              <pre><code>{installCommand}</code></pre>
+            </li>
+            <li>
+              <strong>Index your project and keep it in sync</strong>
+              <pre><code>cd your-project && grepai init && grepai watch</code></pre>
+            </li>
+            <li>
+              <strong>Tell your agent to use it</strong>
+              <pre><code>grepai agent-setup</code></pre>
+            </li>
+          </ol>
+        </Steps>
+      </div>
+    </div>
+  </section>
+
+  <!-- Closing: the explorer arrives where the thread ends -->
+  <section class="closing relative overflow-hidden bg-[#172629]" aria-labelledby="closing-title">
+    <picture>
+      <source type="image/avif" srcset={closing.avif} sizes="100vw" />
+      <source type="image/webp" srcset={closing.webp} sizes="100vw" />
+      <img
+        src={closing.fallback}
+        srcset={closing.jpeg}
+        sizes="100vw"
+        width={closing.width}
+        height={closing.height}
+        alt="At dusk, the explorer reaches the small lit building where the golden thread ends."
+        loading="lazy"
+        decoding="async"
+        class="closing-img"
+      />
+    </picture>
+    <div class="closing-copy gutter max-w-7xl mx-auto">
+      <div class="max-w-md">
+        <h2 id="closing-title" class="font-display text-3xl md:text-[2.75rem] leading-[1.08] tracking-[-0.01em]">
+          Hand your agent the map.
+        </h2>
+        <div class="cmd mt-6">
+          <code class="cmd-text">{installCommand}</code>
+          <button type="button" class="cmd-copy" data-copy={installCommand}>Copy</button>
+        </div>
+        <p class="mt-4 text-sm closing-links">
+          <a href="https://github.com/yoanbernabeu/grepai" target="_blank" rel="noopener noreferrer" class="link">Star the repository on GitHub</a>
+          <span aria-hidden="true" class="mx-1.5">·</span>
+          <a href="/grepai/getting-started/" class="link">Read the docs</a>
+        </p>
+      </div>
+    </div>
+  </section>
+</SplashLayout>
+
+<style>
+  .demo {
+    font-size: 0.8125rem;
+    line-height: 1.7;
+    white-space: pre;
+  }
+  .demo code {
+    font-size: inherit;
+  }
+  .prompt::before {
+    content: '$ ';
+    color: rgb(var(--code-muted));
+  }
+  .dim {
+    color: rgb(var(--code-muted));
+  }
+  .hit {
+    color: rgb(var(--gold));
+  }
+
+  /* Closing: image on top on mobile, copy over the dusk sky on desktop */
+  .closing {
+    color: #ece2cb;
+  }
+  .closing-img {
+    display: block;
+    width: 100%;
+    height: auto;
+    aspect-ratio: 2400 / 1018;
+    object-fit: cover;
+  }
+  .closing-copy {
+    padding-top: 2rem;
+    padding-bottom: 3rem;
+  }
+  .closing-links :global(.link) {
+    color: #ece2cb;
+  }
+  @media (min-width: 900px) {
+    .closing {
+      color: #172629;
+    }
+    .closing-img {
+      position: absolute;
+      inset: 0;
+      height: 100%;
+      object-position: center 60%;
+    }
+    .closing::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(ellipse 50% 85% at 18% 40%, rgb(244 232 204 / 0.85), rgb(244 232 204 / 0) 75%);
+      pointer-events: none;
+    }
+    .closing-copy {
+      position: relative;
+      z-index: 1;
+      min-height: min(42vw, 640px);
+      display: flex;
+      align-items: center;
+      padding-top: 4rem;
+      padding-bottom: 4rem;
+    }
+    .closing-links :global(.link) {
+      color: #172629;
+    }
+  }
+</style>

@@ -1,0 +1,841 @@
+import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { PassThrough, Readable, Writable } from "node:stream";
+
+import type { JsonObject } from "@dev.fast/json";
+import { REVIEW_DESKTOP_DISCOVERY_VERSION } from "@dev.fast/review-protocol";
+import { ListToolsResultSchema } from "@modelcontextprotocol/core";
+import { readReviewServerDiscovery } from "@review/server-discovery.js";
+import {
+  isolatedEnv,
+  sourceCli,
+  stopServersUnder,
+} from "@review/server/background-server-test-utils.js";
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+import { z } from "zod";
+
+import { runReviewAgentCli } from "./agent-cli.js";
+import * as agentClient from "./agent-client.js";
+import { type AuthoringTool, callAuthoringTool } from "./agent-client.js";
+import { ReviewApiClient } from "./client.js";
+import { createReviewApi } from "./http.js";
+import { serveReviewMcp } from "./mcp.js";
+import { callPublicTool, publicTool } from "./public-tools.js";
+import { ReviewStore } from "./store.js";
+
+const store = new ReviewStore(":memory:", {
+  validatePins: async () => {},
+  validateSource: async () => {},
+  validateResource: async () => {},
+});
+
+const app = createReviewApi(store);
+
+afterAll(() => store.close());
+
+const client = new ReviewApiClient(
+  { serverUrl: "http://review.test", token: "test" },
+  async (url, init) => app.request(url.replace("/reviews-api", ""), init),
+);
+
+afterEach(async () => {
+  for (const { reviewId, trashedAt } of store.list()) {
+    if (!trashedAt)
+      await store.execute({
+        operation: { type: "lifecycle", state: "trash", reviewId },
+      });
+    await store.execute({
+      operation: { type: "delete", reviewId },
+    });
+  }
+});
+
+it("uses host-advertised tools to edit, retry, reject invalid content and inspect saved IDs", async () => {
+  const tools = await client.read<AuthoringTool[]>("/authoring");
+
+  const call = (name: string, args: Parameters<typeof callAuthoringTool>[2]) =>
+    callAuthoringTool(
+      client,
+      tools.find((t) => t.name === `review_${name}`)!,
+      args,
+    );
+
+  const created = (await call("create", {
+    title: "Authoring",
+    target: {
+      kind: "commits",
+      repositoryPath: "repo",
+      base: "base",
+      head: "head",
+    },
+  })) as { reviewId: string };
+
+  const input = {
+    reviewId: created.reviewId,
+    edit: {
+      type: "insert",
+      content: {
+        type: "sequence",
+        title: "Save",
+        actors: { agent: "Agent", host: "Host" },
+        steps: [
+          {
+            from: "agent",
+            to: "host",
+            label: "Save",
+            explanation: "Validated before saving.",
+          },
+        ],
+      },
+    },
+  };
+
+  const result = (await call("edit", input)) as { targetId: string };
+  expect(store.read(created.reviewId).version).toBe(1);
+  expect(
+    await call("get", {
+      reviewId: created.reviewId,
+      targetId: result.targetId,
+      format: "json",
+    }),
+  ).toMatchObject({ type: "sequence", id: result.targetId });
+  await expect(
+    call("edit", {
+      ...input,
+      edit: {
+        type: "update",
+        targetId: result.targetId,
+        changes: { actors: { agent: "Agent" } },
+      },
+    }),
+  ).rejects.toThrow(Error);
+  expect(store.read(created.reviewId).version).toBe(1);
+  await call("edit", {
+    reviewId: created.reviewId,
+    edit: {
+      type: "update",
+      targetId: result.targetId,
+      changes: { title: "Saved" },
+    },
+  });
+  expect(
+    await call("get", {
+      reviewId: created.reviewId,
+      full: true,
+      format: "json",
+    }),
+  ).toMatchObject({
+    version: 2,
+    document: [{ id: result.targetId, title: "Saved" }],
+  });
+  expect(
+    await call("get", {
+      reviewId: created.reviewId,
+      version: 1,
+      full: true,
+      format: "json",
+    }),
+  ).toMatchObject({ version: 1, document: [{ title: "Save" }] });
+  const text = await call("get", { reviewId: created.reviewId, full: true });
+  expect(text).toContain(`[${result.targetId}] sequence: Saved`);
+  expect(text).toContain("Validated before saving.");
+  expect(
+    await call("get", { reviewId: created.reviewId, version: 1 }),
+  ).toContain("sequence: Save");
+  // IDs discovered in the reading view still identify the same editable nodes.
+  const stepId = String(text).match(/\[(step-\d+)\]/)![1];
+  await call("edit", {
+    reviewId: created.reviewId,
+    edit: {
+      type: "update",
+      targetId: stepId,
+      changes: { explanation: "Updated through the reading view." },
+    },
+  });
+  expect(
+    await call("get", { reviewId: created.reviewId, targetId: stepId }),
+  ).toContain("Updated through the reading view.");
+});
+
+it("serves MCP framing without stdout diagnostics and returns host errors as tool errors", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const calls: Array<[string, string, boolean, string?]> = [];
+
+  const server = await serveReviewMcp(
+    async () => ({ client }),
+    stdin,
+    stdout,
+    undefined,
+    false,
+    undefined,
+    ({ tool, via, ok, errorName }) =>
+      void calls.push(errorName ? [tool, via, ok, errorName] : [tool, via, ok]),
+  );
+
+  let output = "";
+  stdout.on("data", (chunk) => {
+    output += chunk;
+  });
+
+  const request = async <Params>(
+    id: number,
+    method: string,
+    params: Params,
+  ) => {
+    stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    await expect
+      .poll(() =>
+        output
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line))
+          .find((reply) => reply.id === id),
+      )
+      .toBeTruthy();
+
+    return output
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .find((reply) => reply.id === id);
+  };
+
+  try {
+    await request(1, "initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "test", version: "1" },
+    });
+    const list = await request(2, "tools/list", {});
+    ListToolsResultSchema.parse(list.result);
+    // The Anthropic API rejects these at the top level of a tool input schema.
+    expect(
+      list.result.tools.filter((tool: AuthoringTool) =>
+        ["anyOf", "oneOf", "allOf"].some((key) => key in tool.inputSchema),
+      ),
+    ).toEqual([]);
+    // Codex and Claude Code mishandle $ref (openai/codex#13746,
+    // anthropics/claude-code#18260).
+    expect(
+      list.result.tools.filter((tool: AuthoringTool) =>
+        JSON.stringify(tool.inputSchema).includes("$ref"),
+      ),
+    ).toEqual([]);
+    expect(
+      list.result.tools.find(
+        (tool: AuthoringTool) => tool.name === "session_edit",
+      ).inputSchema,
+    ).toMatchObject({
+      type: "object",
+      required: ["sessionId", "edit"],
+      properties: expect.objectContaining({ activityId: expect.anything() }),
+    });
+
+    const annotations = (name: string) =>
+      list.result.tools.find((tool: AuthoringTool) => tool.name === name)
+        .annotations;
+
+    expect(annotations("session_get")).toEqual({ readOnlyHint: true });
+    expect(annotations("session_delete")).toBeUndefined();
+
+    const error = await request(3, "tools/call", {
+      name: "session_get",
+      arguments: { sessionId: "missing" },
+    });
+
+    expect(error.result).toMatchObject({
+      isError: true,
+      content: [{ type: "text", text: expect.stringMatching(/not found/i) }],
+    });
+
+    const next = await request(4, "tools/call", {
+      name: "session_list",
+      arguments: {},
+    });
+
+    expect(JSON.parse(next.result.content[0].text)).toEqual([]);
+
+    const created = await store.execute({
+      operation: {
+        type: "create",
+        title: "Readable review",
+        target: {
+          kind: "commits",
+          repositoryId: "repo",
+          base: "base",
+          head: "head",
+        },
+      },
+    });
+
+    const read = await request(5, "tools/call", {
+      name: "session_get",
+      arguments: { sessionId: created.reviewId },
+    });
+
+    expect(read.result.content[0].text.startsWith("# Readable review\n")).toBe(
+      true,
+    );
+
+    const raw = await request(6, "tools/call", {
+      name: "session_get",
+      arguments: { sessionId: created.reviewId, full: true, format: "json" },
+    });
+
+    expect(JSON.parse(raw.result.content[0].text)).toMatchObject({
+      sessionId: created.reviewId,
+      document: [],
+    });
+
+    await request(7, "tools/call", { name: "my private notes", arguments: {} });
+
+    expect(calls).toEqual([
+      ["session_get", "mcp", false, "review_not_found"],
+      ["session_list", "mcp", true],
+      ["session_get", "mcp", true],
+      ["session_get", "mcp", true],
+      ["other", "mcp", false, "usage_error"],
+    ]);
+  } finally {
+    await server.close();
+  }
+});
+
+it("reports each api tool call with its outcome", async () => {
+  const connection = vi
+    .spyOn(agentClient, "connectReviewInstance")
+    .mockResolvedValue({ client, instance: { key: "stable" } });
+
+  const calls: Array<[string, string, boolean, string?]> = [];
+
+  const discard = new Writable({
+    write(_chunk, _encoding, done) {
+      done();
+    },
+  });
+
+  const run = (argv: string[]) =>
+    runReviewAgentCli({
+      argv,
+      stdout: discard,
+      stderr: discard,
+      // Queued a tick late, like a real capture: the command must wait.
+      onToolCall: async ({ tool, via, ok, errorName }) => {
+        await new Promise((resolve) => setImmediate(resolve));
+        calls.push(errorName ? [tool, via, ok, errorName] : [tool, via, ok]);
+      },
+    });
+
+  try {
+    expect(await run(["api", "session_list"])).toBe(0);
+    expect(await run(["api", "session_get", '{"sessionId":"missing"}'])).toBe(
+      1,
+    );
+    expect(await run(["api", "no_such_tool"])).toBe(1);
+    expect(calls).toEqual([
+      ["session_list", "api", true],
+      ["session_get", "api", false, "review_not_found"],
+    ]);
+  } finally {
+    connection.mockRestore();
+  }
+});
+
+it("hands the parent CLI the release of the Desktop an api call reached", async () => {
+  const connection = vi
+    .spyOn(agentClient, "connectReviewInstance")
+    .mockResolvedValue({
+      client,
+      instance: { key: "preview", appVersion: "0.1.6-preview.20261002.90" },
+    });
+
+  const releases: Array<string | undefined> = [];
+
+  const discard = new Writable({
+    write(_chunk, _encoding, done) {
+      done();
+    },
+  });
+
+  try {
+    expect(
+      await runReviewAgentCli({
+        argv: ["api", "session_list"],
+        stdout: discard,
+        stderr: discard,
+        onDesktop: (appVersion) => releases.push(appVersion),
+      }),
+    ).toBe(0);
+    expect(releases).toEqual(["0.1.6-preview.20261002.90"]);
+  } finally {
+    connection.mockRestore();
+  }
+});
+
+it("shows CLI help without requiring Desktop or touching review storage", async () => {
+  let output = "";
+
+  const stream = new Writable({
+    write(chunk, _encoding, done) {
+      output += chunk;
+      done();
+    },
+  });
+
+  expect(
+    await runReviewAgentCli({
+      argv: ["api", "--help"],
+      stdin: Readable.from([]),
+      stdout: stream,
+      stderr: stream,
+      env: { DEV_REVIEW_HOME: "/does-not-exist" },
+    }),
+  ).toBe(0);
+  expect(output).toContain("whiteboard api <tool-name>");
+});
+
+it("prints readable CLI output by default and raw objects with --json", async () => {
+  const connection = vi
+    .spyOn(agentClient, "connectReviewInstance")
+    .mockResolvedValue({ client });
+
+  const created = await store.execute({
+    operation: {
+      type: "create",
+      title: "CLI reading",
+      target: {
+        kind: "commits",
+        repositoryId: "repo",
+        base: "base",
+        head: "head",
+      },
+    },
+  });
+
+  try {
+    const read = async (flags: string[]) => {
+      let output = "";
+
+      const stdout = new Writable({
+        write(chunk, _encoding, done) {
+          output += chunk;
+          done();
+        },
+      });
+
+      expect(
+        await runReviewAgentCli({
+          argv: [
+            "api",
+            "session_get",
+            JSON.stringify({ sessionId: created.reviewId, full: true }),
+            ...flags,
+          ],
+          stdout,
+          stderr: stdout,
+        }),
+      ).toBe(0);
+
+      return output;
+    };
+
+    expect((await read([])).startsWith("# CLI reading\n")).toBe(true);
+    expect(JSON.parse(await read(["--json"]))).toMatchObject({
+      sessionId: created.reviewId,
+      document: [],
+    });
+  } finally {
+    connection.mockRestore();
+  }
+});
+
+it("binds existing content through the host-advertised PR tool", async () => {
+  const tools = await client.read<AuthoringTool[]>("/authoring");
+
+  const created = await store.execute({
+    operation: {
+      type: "create",
+      title: "PR",
+      target: {
+        kind: "commits",
+        repositoryId: "repo",
+        base: "base",
+        head: "head",
+      },
+    },
+  });
+
+  await store.execute({
+    operation: {
+      type: "edit",
+      reviewId: created.reviewId,
+      edit: {
+        type: "insert",
+        content: { type: "markdown", markdown: "Keep the authored review" },
+      },
+    },
+  });
+
+  const authored = store.read(created.reviewId).document;
+
+  await callAuthoringTool(
+    client,
+    tools.find((tool) => tool.name === "review_set_target")!,
+    {
+      reviewId: created.reviewId,
+      target: {
+        kind: "commits",
+        repositoryPath: "repo",
+        base: "base",
+        head: "head",
+      },
+      pullRequestUrl: "https://github.com/devdotfast/review/pull/310",
+    },
+  );
+  expect(store.read(created.reviewId).document).toEqual(authored);
+  expect(
+    store.list().find((review) => review.reviewId === created.reviewId)?.origin,
+  ).toEqual({
+    pullRequestNumber: 310,
+    pullRequestUrl: "https://github.com/devdotfast/review/pull/310",
+  });
+});
+
+it("tells the server which surface and agent harness made the call", async () => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), "agent-origin-"));
+  const instanceId = randomUUID();
+  const seen: Array<[string | undefined, string | undefined]> = [];
+
+  const server = createServer((request, response) => {
+    response.setHeader("content-type", "application/json");
+
+    if (request.url === "/health") {
+      response.end(JSON.stringify({ ok: true, instanceId }));
+
+      return;
+    }
+
+    seen.push([
+      request.headers["x-review-via"]?.toString(),
+      request.headers["x-review-agent"]?.toString(),
+    ]);
+    response.end("[]");
+  });
+
+  try {
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const { port } = z.object({ port: z.number() }).parse(server.address());
+    await mkdir(path.join(stateDir, "review-server"), { recursive: true });
+    await writeFile(
+      path.join(stateDir, "review-server", "server.json"),
+      JSON.stringify({
+        version: 1,
+        instanceId,
+        url: `http://127.0.0.1:${port}`,
+        serverPid: process.pid,
+        token: "token",
+      }),
+    );
+
+    const discard = new Writable({
+      write(_chunk, _encoding, done) {
+        done();
+      },
+    });
+
+    expect(
+      await runReviewAgentCli({
+        argv: ["api", "tools"],
+        stdout: discard,
+        stderr: discard,
+        env: { DEV_REVIEW_SERVER_DIR: stateDir, CODEX_THREAD_ID: "thread-1" },
+      }),
+    ).toBe(0);
+    expect(seen).toEqual([["api", "codex"]]);
+  } finally {
+    server.close();
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+it("keeps an MCP session on the instance key it first reached", async () => {
+  const keys: (string | undefined)[] = [];
+
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  let output = "";
+  stdout.on("data", (chunk) => {
+    output += chunk;
+  });
+
+  const server = await serveReviewMcp(
+    async (key) => {
+      keys.push(key);
+
+      return { client, instance: { key: "preview" } };
+    },
+    stdin,
+    stdout,
+    process.stderr,
+    false,
+    async (problem) => ({ desktopAvailable: false, problem }),
+  );
+
+  const reply = async (id: number, method: string, params: JsonObject) => {
+    stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    let found: { result: { isError?: boolean; content?: { text: string }[] } };
+    await expect
+      .poll(() => {
+        found = output
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line))
+          .find((line) => line.id === id);
+
+        return found;
+      })
+      .toBeTruthy();
+
+    return found!.result;
+  };
+
+  try {
+    await reply(1, "initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "test", version: "1" },
+    });
+    await reply(2, "tools/list", {});
+
+    const result = await reply(3, "tools/call", {
+      name: "session_list",
+      arguments: {},
+    });
+
+    // Every connect after the first names the latched key, so a Desktop that
+    // restarts under the same key is followed and another key is never chosen.
+    expect(keys).toEqual([undefined, "preview"]);
+    expect(result.isError).toBeFalsy();
+  } finally {
+    await server.close();
+  }
+});
+
+it("names the agent from the MCP handshake, falling back to the session environment", async () => {
+  // The header names the agent on reviews the session creates; the call names it on tool events.
+  const headerAgents: (string | undefined)[] = [];
+  const callAgents: (string | undefined)[] = [];
+
+  const connection = vi
+    .spyOn(agentClient, "connectReviewInstance")
+    .mockImplementation(async (_env, headers) => {
+      headerAgents.push(headers?.["x-review-agent"]);
+
+      return { client };
+    });
+
+  const session = async (clientName: string, env: NodeJS.ProcessEnv) => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    let output = "";
+    stdout.on("data", (chunk) => {
+      output += chunk;
+    });
+
+    await runReviewAgentCli({
+      argv: ["mcp"],
+      env,
+      stdin,
+      stdout,
+      stderr: new PassThrough(),
+      onToolCall: ({ agentKind }) => void callAgents.push(agentKind),
+    });
+
+    const reply = async (id: number, method: string, params: JsonObject) => {
+      stdin.write(
+        JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n",
+      );
+      await expect
+        .poll(() =>
+          output
+            .split("\n")
+            .filter(Boolean)
+            .some((line) => JSON.parse(line).id === id),
+        )
+        .toBe(true);
+    };
+
+    await reply(1, "initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: clientName, version: "1" },
+    });
+    await reply(2, "tools/call", { name: "session_list", arguments: {} });
+    stdin.end();
+  };
+
+  try {
+    // Codex strips CODEX_* from the server's environment; its handshake says who it is.
+    await session("codex-mcp-client", {});
+    await session("some-editor", { CLAUDE_CODE_SESSION_ID: "session" });
+    expect(headerAgents).toEqual(["codex", "claude"]);
+    expect(callAgents).toEqual(["codex", "claude"]);
+  } finally {
+    connection.mockRestore();
+  }
+});
+
+describe("with no Desktop running", () => {
+  let root: string;
+  let env: NodeJS.ProcessEnv;
+
+  const home = () => env.DEV_REVIEW_HOME!;
+
+  beforeEach(async () => {
+    root = await realpath(await mkdtemp(path.join(tmpdir(), "wb-connect-")));
+    env = isolatedEnv(root);
+  });
+
+  afterEach(async () => {
+    await stopServersUnder(root);
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("starts the default headless server for a tool call when no Desktop is installed", async () => {
+    const connected = await agentClient.connectReviewInstance(
+      env,
+      {},
+      { desktopInstalled: () => false, cli: sourceCli },
+    );
+
+    const tools = (
+      await connected.client.read<AuthoringTool[]>("/authoring")
+    ).map(publicTool);
+
+    const list = tools.find((tool) => tool.name === "session_list")!;
+
+    expect(await callPublicTool(connected.client, list, {})).toEqual(
+      expect.any(Array),
+    );
+    expect(connected.instance).toBeUndefined();
+    expect(await readReviewServerDiscovery(home())).toMatchObject({
+      startedBy: "cli",
+    });
+  }, 60_000);
+
+  it.each([
+    ["an explicit selection that is not running", "selected"],
+    ["a broken instance record", "broken"],
+    ["several running and none selected", "several"],
+  ] as const)(
+    "keeps the old diagnosis for %s, even with no Desktop installed",
+    async (_case, kind) => {
+      const desktops = await fakeDesktops(kind, env);
+
+      try {
+        const connect = (installed: boolean) =>
+          agentClient
+            .connectReviewInstance(
+              env,
+              {},
+              { desktopInstalled: () => installed, cli: sourceCli },
+            )
+            .then(
+              () => "connected",
+              (error: Error) => error.message,
+            );
+
+        const before = await connect(true);
+
+        expect(before).not.toBe("connected");
+        expect(await connect(false)).toBe(before);
+        expect(await readReviewServerDiscovery(home())).toBeNull();
+      } finally {
+        for (const server of desktops) server.close();
+      }
+    },
+    30_000,
+  );
+
+  it("fails as before when a Desktop is installed but not running", async () => {
+    await expect(
+      agentClient.connectReviewInstance(
+        env,
+        {},
+        { desktopInstalled: () => true, cli: sourceCli },
+      ),
+    ).rejects.toThrow(
+      "Whiteboard `stable` is not running. Start it with `whiteboard app launch`, or pick another instance with `whiteboard instances`. No Whiteboard is running. For headless authoring, select a running server with --state-dir or DEV_REVIEW_SERVER_DIR.",
+    );
+    expect(await readReviewServerDiscovery(home())).toBeNull();
+  });
+});
+
+async function fakeDesktops(
+  kind: "selected" | "broken" | "several",
+  env: NodeJS.ProcessEnv,
+) {
+  const instances = path.join(
+    env.DEV_REVIEW_HOME!,
+    "review-desktop",
+    "instances",
+  );
+
+  await mkdir(instances, { recursive: true });
+
+  if (kind === "selected") {
+    env.DEV_REVIEW_INSTANCE = "preview";
+
+    return [];
+  }
+
+  if (kind === "broken") {
+    await writeFile(path.join(instances, "stable.json"), "{");
+
+    return [];
+  }
+
+  return Promise.all(
+    ["preview", "dev-other-0123456789ab"].map(async (key) => {
+      const instanceId = randomUUID();
+
+      const server = createServer((_request, response) =>
+        response.end(
+          JSON.stringify({ ok: true, instanceId, desktopAttached: true }),
+        ),
+      ).listen(0, "127.0.0.1");
+
+      await once(server, "listening");
+      const { port } = z.object({ port: z.number() }).parse(server.address());
+      await writeFile(
+        path.join(instances, `${key}.json`),
+        JSON.stringify({
+          version: REVIEW_DESKTOP_DISCOVERY_VERSION,
+          instanceId,
+          url: `http://127.0.0.1:${port}`,
+          appPid: process.pid,
+          serverPid: process.pid,
+          token: "token",
+          startedAt: 1,
+          key,
+        }),
+      );
+
+      return server;
+    }),
+  );
+}

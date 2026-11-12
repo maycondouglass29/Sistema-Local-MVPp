@@ -1,0 +1,53 @@
+{
+  "name": "portaria-escolar-localfirst",
+  "productName": "Portaria Escolar Local-First",
+  "description": "Sistema desktop Local-First de alta performance para portaria e controle de acesso escolar",
+  "author": "Escola Horizonte TI",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "vite --port=3001 --host=0.0.0.0",
+    "dev:backend": "bun run ./backend/src/server.ts",
+    "dev:electron": "node ./scripts/build-electron.mjs && electron ./electron/main.js",
+    "build": "vite build",
+    "build:electron": "vite build && node ./scripts/build-electron.mjs",
+    "build:exe": "bun run build:electron && electron-builder --win nsis",
+    "build:portable": "bun run build:electron && electron-builder --win portable",
+    "build:all": "bun run build:electron && electron-builder --win",
+    "preview": "vite preview",
+    "clean": "rm -rf dist dist_electron electron/main.js electron/preload.js",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google/genai": "^2.4.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/qrcode": "^1.5.6",
+    "@vitejs/plugin-react": "^6.1.1",
+    "cors": "^2.8.6",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "jsqr": "^1.4.0",
+    "lucide-react": "^0.546.0",
+    "motion": "^12.23.24",
+    "qrcode": "^1.5.4",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "vite": "^8.3.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.14.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "autoprefixer": "^10.4.21",
+    "electron": "^45.3.0",
+    "electron-builder": "^26.18.0",
+    "esbuild": "^0.25.0",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.21.0",
+    "typescript": "^7.0.2"
+  }
+}

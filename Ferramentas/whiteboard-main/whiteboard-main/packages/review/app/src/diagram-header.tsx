@@ -1,0 +1,48 @@
+import { Chip } from "@canvas/ui/chip";
+import { textStyles } from "@canvas/ui/text";
+import * as stylex from "@stylexjs/stylex";
+import type { ReactNode } from "react";
+
+import { diagramStyles } from "./diagram-styles";
+
+export function DiagramHeader({
+  kind,
+  title,
+  meta,
+  action,
+  xstyle,
+  titleStyle,
+  metaStyle,
+}: {
+  kind: string;
+  title?: string;
+  meta?: string;
+  action?: ReactNode;
+  xstyle?: stylex.StaticStyles;
+  titleStyle?: stylex.StaticStyles;
+  metaStyle?: stylex.StaticStyles;
+}) {
+  return (
+    <figcaption {...stylex.props(diagramStyles.header, xstyle)}>
+      <div {...stylex.props(diagramStyles.headerMain)}>
+        <Chip>{kind}</Chip>
+        {title && (
+          <span
+            {...stylex.props(
+              textStyles.truncate,
+              diagramStyles.title,
+              titleStyle,
+            )}
+            data-review-copy-prose
+          >
+            {title}
+          </span>
+        )}
+        {meta && (
+          <em {...stylex.props(diagramStyles.meta, metaStyle)}>{meta}</em>
+        )}
+      </div>
+      {action}
+    </figcaption>
+  );
+}

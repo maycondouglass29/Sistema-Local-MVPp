@@ -1,0 +1,880 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
+	"testing"
+)
+
+const (
+	endpoints  = "https://api.grepai.com/v1"
+	dimensions = 1536
+)
+
+func TestDefaultConfig(t *testing.T) {
+	cfg := DefaultConfig()
+
+	if cfg.Version != 1 {
+		t.Errorf("expected version 1, got %d", cfg.Version)
+	}
+
+	if cfg.Embedder.Provider != "ollama" {
+		t.Errorf("expected provider ollama, got %s", cfg.Embedder.Provider)
+	}
+
+	if cfg.Embedder.Model != "nomic-embed-text" {
+		t.Errorf("expected model nomic-embed-text, got %s", cfg.Embedder.Model)
+	}
+
+	if cfg.Embedder.Dimensions == nil || *cfg.Embedder.Dimensions != 768 {
+		t.Errorf("expected dimensions 768, got %v", cfg.Embedder.Dimensions)
+	}
+
+	if cfg.Store.Backend != "gob" {
+		t.Errorf("expected backend gob, got %s", cfg.Store.Backend)
+	}
+
+	if cfg.Chunking.Size != 512 {
+		t.Errorf("expected chunk size 512, got %d", cfg.Chunking.Size)
+	}
+
+	if cfg.Chunking.Overlap != 50 {
+		t.Errorf("expected chunk overlap 50, got %d", cfg.Chunking.Overlap)
+	}
+
+	if cfg.Chunking.Strategy != "fixed" {
+		t.Errorf("expected chunking strategy fixed, got %q", cfg.Chunking.Strategy)
+	}
+
+	if !cfg.Framework.Enabled {
+		t.Error("expected framework_processing.enabled=true by default")
+	}
+	if cfg.Framework.Mode != "auto" {
+		t.Errorf("expected framework_processing.mode=auto, got %s", cfg.Framework.Mode)
+	}
+	if !cfg.Framework.Frameworks.Vue.Enabled {
+		t.Error("expected framework_processing.frameworks.vue.enabled=true by default")
+	}
+	if cfg.Framework.Frameworks.Svelte.Enabled || cfg.Framework.Frameworks.Astro.Enabled || cfg.Framework.Frameworks.Solid.Enabled {
+		t.Error("expected non-vue framework scaffolds disabled by default")
+	}
+
+	if cfg.Watch.DebounceMs != 500 {
+		t.Errorf("expected debounce 500ms, got %d", cfg.Watch.DebounceMs)
+	}
+	if cfg.Watch.RPGPersistIntervalMs != DefaultWatchRPGPersistIntervalMs {
+		t.Errorf("expected watch.rpg_persist_interval_ms=%d, got %d", DefaultWatchRPGPersistIntervalMs, cfg.Watch.RPGPersistIntervalMs)
+	}
+	if cfg.Watch.RPGDerivedDebounceMs != DefaultWatchRPGDerivedDebounceMs {
+		t.Errorf("expected watch.rpg_derived_debounce_ms=%d, got %d", DefaultWatchRPGDerivedDebounceMs, cfg.Watch.RPGDerivedDebounceMs)
+	}
+	if cfg.Watch.RPGFullReconcileIntervalSec != DefaultWatchRPGFullReconcileIntervalS {
+		t.Errorf("expected watch.rpg_full_reconcile_interval_sec=%d, got %d", DefaultWatchRPGFullReconcileIntervalS, cfg.Watch.RPGFullReconcileIntervalSec)
+	}
+	if cfg.Watch.RPGMaxDirtyFilesPerBatch != DefaultWatchRPGMaxDirtyFilesPerBatch {
+		t.Errorf("expected watch.rpg_max_dirty_files_per_batch=%d, got %d", DefaultWatchRPGMaxDirtyFilesPerBatch, cfg.Watch.RPGMaxDirtyFilesPerBatch)
+	}
+	for _, ext := range []string{".cxx", ".hxx"} {
+		if !slices.Contains(cfg.Trace.EnabledLanguages, ext) {
+			t.Errorf("expected trace.enabled_languages to contain %s", ext)
+		}
+	}
+}
+
+func TestDefaultEmbedderForProvider(t *testing.T) {
+	ollama := DefaultEmbedderForProvider("ollama")
+	if ollama.Endpoint != DefaultOllamaEndpoint || ollama.Model != DefaultOllamaEmbeddingModel {
+		t.Fatalf("unexpected ollama defaults: %+v", ollama)
+	}
+	if ollama.Dimensions == nil || *ollama.Dimensions != DefaultLocalEmbeddingDimensions {
+		t.Fatalf("unexpected ollama dimensions: %v", ollama.Dimensions)
+	}
+
+	lmstudio := DefaultEmbedderForProvider("lmstudio")
+	if lmstudio.Endpoint != DefaultLMStudioEndpoint || lmstudio.Model != DefaultLMStudioEmbeddingModel {
+		t.Fatalf("unexpected lmstudio defaults: %+v", lmstudio)
+	}
+	if lmstudio.Dimensions == nil || *lmstudio.Dimensions != DefaultLocalEmbeddingDimensions {
+		t.Fatalf("unexpected lmstudio dimensions: %v", lmstudio.Dimensions)
+	}
+
+	openai := DefaultEmbedderForProvider("openai")
+	if openai.Endpoint != DefaultOpenAIEndpoint || openai.Model != DefaultOpenAIEmbeddingModel {
+		t.Fatalf("unexpected openai defaults: %+v", openai)
+	}
+	if openai.Dimensions != nil {
+		t.Fatalf("openai dimensions should be nil, got %v", openai.Dimensions)
+	}
+	if openai.Parallelism != DefaultOpenAIParallelism {
+		t.Fatalf("openai parallelism = %d, want %d", openai.Parallelism, DefaultOpenAIParallelism)
+	}
+}
+
+func TestEmbedderConfigCacheNamespace(t *testing.T) {
+	dim := 2048
+	cfg := EmbedderConfig{
+		Provider:   " openai ",
+		Model:      " text-embedding-3-small ",
+		Endpoint:   " https://api.openai.com/v1 ",
+		Dimensions: &dim,
+	}
+
+	got := cfg.CacheNamespace()
+	want := "embedding-cache-v2:provider=openai:model=text-embedding-3-small:dimensions=2048:endpoint=https://api.openai.com/v1"
+	if got != want {
+		t.Fatalf("CacheNamespace() = %q, want %q", got, want)
+	}
+}
+
+func TestEmbedderConfigCacheNamespaceUsesResolvedDimensions(t *testing.T) {
+	cfg := EmbedderConfig{
+		Provider: "openai",
+		Model:    OpenAIEmbeddingModelLarge,
+	}
+
+	if got, want := cfg.CacheNamespace(), "embedding-cache-v2:provider=openai:model=text-embedding-3-large:dimensions=3072:endpoint="; got != want {
+		t.Fatalf("CacheNamespace() = %q, want %q", got, want)
+	}
+}
+
+func TestEmbedderConfigCacheNamespaceChangesForModel(t *testing.T) {
+	small := EmbedderConfig{Provider: "openai", Model: DefaultOpenAIEmbeddingModel}
+	large := EmbedderConfig{Provider: "openai", Model: OpenAIEmbeddingModelLarge}
+
+	if small.CacheNamespace() == large.CacheNamespace() {
+		t.Fatalf("cache namespace must differ across models: %q", small.CacheNamespace())
+	}
+}
+
+func TestDefaultStoreForBackend(t *testing.T) {
+	postgres := DefaultStoreForBackend("postgres")
+	if postgres.Backend != "postgres" || postgres.Postgres.DSN != DefaultPostgresDSN {
+		t.Fatalf("unexpected postgres defaults: %+v", postgres)
+	}
+
+	qdrant := DefaultStoreForBackend("qdrant")
+	if qdrant.Backend != "qdrant" {
+		t.Fatalf("unexpected qdrant backend: %q", qdrant.Backend)
+	}
+	if qdrant.Qdrant.Endpoint != DefaultQdrantEndpoint || qdrant.Qdrant.Port != DefaultQdrantPort {
+		t.Fatalf("unexpected qdrant defaults: %+v", qdrant.Qdrant)
+	}
+}
+
+func TestConfigLoad_FrameworkProcessingDefaultsRespectExplicitFalseAndNestedDefaults(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ConfigDir), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	cfgPath := GetConfigPath(tmpDir)
+
+	tests := []struct {
+		name              string
+		yaml              string
+		wantEnabled       bool
+		wantVueEnabled    bool
+		wantSvelteEnabled bool
+	}{
+		{
+			name:              "explicit framework disabled",
+			yaml:              "framework_processing:\n  enabled: false\n",
+			wantEnabled:       false,
+			wantVueEnabled:    true,
+			wantSvelteEnabled: false,
+		},
+		{
+			name:              "framework section present without nested flags keeps vue default",
+			yaml:              "framework_processing:\n  mode: auto\n",
+			wantEnabled:       true,
+			wantVueEnabled:    true,
+			wantSvelteEnabled: false,
+		},
+		{
+			name:              "explicit vue disabled preserved",
+			yaml:              "framework_processing:\n  frameworks:\n    vue:\n      enabled: false\n",
+			wantEnabled:       true,
+			wantVueEnabled:    false,
+			wantSvelteEnabled: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := os.WriteFile(cfgPath, []byte(strings.TrimSpace(tt.yaml)+"\n"), 0o644); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := Load(tmpDir)
+			if err != nil {
+				t.Fatalf("Load failed: %v", err)
+			}
+			if cfg.Framework.Enabled != tt.wantEnabled {
+				t.Fatalf("framework enabled = %v, want %v", cfg.Framework.Enabled, tt.wantEnabled)
+			}
+			if cfg.Framework.Frameworks.Vue.Enabled != tt.wantVueEnabled {
+				t.Fatalf("framework vue enabled = %v, want %v", cfg.Framework.Frameworks.Vue.Enabled, tt.wantVueEnabled)
+			}
+			if cfg.Framework.Frameworks.Svelte.Enabled != tt.wantSvelteEnabled {
+				t.Fatalf("framework svelte enabled = %v, want %v", cfg.Framework.Frameworks.Svelte.Enabled, tt.wantSvelteEnabled)
+			}
+		})
+	}
+}
+
+func TestConfigLoad_ChunkingStrategy(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ConfigDir), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	cfgPath := GetConfigPath(tmpDir)
+
+	tests := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{"absent defaults to fixed", "chunking:\n  size: 256\n", "fixed"},
+		{"no chunking section defaults to fixed", "version: 1\n", "fixed"},
+		{"ast is preserved", "chunking:\n  strategy: ast\n", "ast"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := os.WriteFile(cfgPath, []byte(tt.yaml), 0o644); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := Load(tmpDir)
+			if err != nil {
+				t.Fatalf("Load failed: %v", err)
+			}
+			if cfg.Chunking.Strategy != tt.want {
+				t.Fatalf("chunking strategy = %q, want %q", cfg.Chunking.Strategy, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfigSaveAndLoad(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := DefaultConfig()
+	cfg.Embedder.Provider = "openai"
+	dim := dimensions
+	cfg.Embedder.Dimensions = &dim
+	cfg.Embedder.Endpoint = endpoints
+	cfg.Store.Backend = "postgres"
+
+	err := cfg.Save(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to save config: %v", err)
+	}
+
+	// Check file exists
+	configPath := GetConfigPath(tmpDir)
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		t.Fatal("config file was not created")
+	}
+
+	// Load config
+	loaded, err := Load(tmpDir)
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+
+	if loaded.Embedder.Provider != "openai" {
+		t.Errorf("expected provider openai, got %s", loaded.Embedder.Provider)
+	}
+
+	if loaded.Embedder.Dimensions == nil || *loaded.Embedder.Dimensions != dimensions {
+		t.Errorf("expected dimensions %d, got %v", dimensions, loaded.Embedder.Dimensions)
+	}
+
+	if loaded.Store.Backend != "postgres" {
+		t.Errorf("expected backend postgres, got %s", loaded.Store.Backend)
+	}
+	if loaded.Embedder.Endpoint != endpoints {
+		t.Errorf("expected endpoint %s, got %s", endpoints, loaded.Embedder.Endpoint)
+	}
+}
+
+func TestConfigExists(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Should not exist initially
+	if Exists(tmpDir) {
+		t.Error("config should not exist initially")
+	}
+
+	// Create config
+	cfg := DefaultConfig()
+	if err := cfg.Save(tmpDir); err != nil {
+		t.Fatalf("failed to save config: %v", err)
+	}
+
+	// Should exist now
+	if !Exists(tmpDir) {
+		t.Error("config should exist after saving")
+	}
+}
+
+func TestGetConfigDir(t *testing.T) {
+	result := GetConfigDir("/test/path")
+	expected := filepath.Join("/test/path", ConfigDir)
+
+	if result != expected {
+		t.Errorf("expected %s, got %s", expected, result)
+	}
+}
+
+func TestGetConfigPath(t *testing.T) {
+	result := GetConfigPath("/test/path")
+	expected := filepath.Join("/test/path", ConfigDir, ConfigFileName)
+
+	if result != expected {
+		t.Errorf("expected %s, got %s", expected, result)
+	}
+}
+
+func TestGetIndexPath(t *testing.T) {
+	result := GetIndexPath("/test/path")
+	expected := filepath.Join("/test/path", ConfigDir, IndexFileName)
+
+	if result != expected {
+		t.Errorf("expected %s, got %s", expected, result)
+	}
+}
+
+// TestParallelismConfig verifies parallelism defaults and validation
+func TestParallelismConfig(t *testing.T) {
+	tests := []struct {
+		name                string
+		configYAML          string
+		expectedParallelism int
+	}{
+		{
+			name: "default parallelism is 4 when not specified",
+			configYAML: `version: 1
+embedder:
+  provider: openai
+  model: text-embedding-3-small
+  api_key: sk-test
+store:
+  backend: gob
+`,
+			expectedParallelism: 4,
+		},
+		{
+			name: "custom parallelism is respected",
+			configYAML: `version: 1
+embedder:
+  provider: openai
+  model: text-embedding-3-small
+  api_key: sk-test
+  parallelism: 8
+store:
+  backend: gob
+`,
+			expectedParallelism: 8,
+		},
+		{
+			name: "parallelism of 1 is valid",
+			configYAML: `version: 1
+embedder:
+  provider: openai
+  model: text-embedding-3-small
+  api_key: sk-test
+  parallelism: 1
+store:
+  backend: gob
+`,
+			expectedParallelism: 1,
+		},
+		{
+			name: "parallelism of 0 defaults to 4",
+			configYAML: `version: 1
+embedder:
+  provider: openai
+  model: text-embedding-3-small
+  api_key: sk-test
+  parallelism: 0
+store:
+  backend: gob
+`,
+			expectedParallelism: 4,
+		},
+		{
+			name: "negative parallelism defaults to 4",
+			configYAML: `version: 1
+embedder:
+  provider: openai
+  model: text-embedding-3-small
+  api_key: sk-test
+  parallelism: -1
+store:
+  backend: gob
+`,
+			expectedParallelism: 4,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			configDir := filepath.Join(tmpDir, ConfigDir)
+			if err := os.MkdirAll(configDir, 0755); err != nil {
+				t.Fatalf("failed to create config dir: %v", err)
+			}
+
+			configPath := filepath.Join(configDir, ConfigFileName)
+			if err := os.WriteFile(configPath, []byte(tt.configYAML), 0600); err != nil {
+				t.Fatalf("failed to write config: %v", err)
+			}
+
+			loaded, err := Load(tmpDir)
+			if err != nil {
+				t.Fatalf("failed to load config: %v", err)
+			}
+
+			if loaded.Embedder.Parallelism != tt.expectedParallelism {
+				t.Errorf("expected parallelism %d, got %d", tt.expectedParallelism, loaded.Embedder.Parallelism)
+			}
+		})
+	}
+}
+
+// TestFindProjectRootWithSymlink verifies that FindProjectRoot resolves symlinks correctly.
+func TestFindProjectRootWithSymlink(t *testing.T) {
+	// Create a real directory with grepai config
+	realDir := t.TempDir()
+	configDir := filepath.Join(realDir, ConfigDir)
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+
+	cfg := DefaultConfig()
+	if err := cfg.Save(realDir); err != nil {
+		t.Fatalf("failed to save config: %v", err)
+	}
+
+	// Create a symlink to the real directory
+	symlinkParent := t.TempDir()
+	symlinkPath := filepath.Join(symlinkParent, "symlink-project")
+	if err := os.Symlink(realDir, symlinkPath); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("skipping: symlink creation requires elevated privileges on Windows: %v", err)
+		}
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	// Save original working directory
+	originalWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get original working directory: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(originalWd); err != nil {
+			t.Logf("warning: failed to restore working directory: %v", err)
+		}
+	}()
+
+	// Change to the symlink directory
+	if err := os.Chdir(symlinkPath); err != nil {
+		t.Fatalf("failed to change to symlink directory: %v", err)
+	}
+
+	// Call FindProjectRoot - it should return the resolved (real) path
+	projectRoot, err := FindProjectRoot()
+	if err != nil {
+		t.Fatalf("FindProjectRoot failed: %v", err)
+	}
+
+	// Resolve realDir for comparison (in case it contains symlinks itself)
+	expectedPath, err := filepath.EvalSymlinks(realDir)
+	if err != nil {
+		t.Fatalf("failed to resolve expected path: %v", err)
+	}
+
+	if projectRoot != expectedPath {
+		t.Errorf("expected resolved path %s, got %s", expectedPath, projectRoot)
+	}
+
+	// Verify the returned path is not the symlink path
+	if projectRoot == symlinkPath {
+		t.Error("FindProjectRoot returned symlink path instead of resolved path")
+	}
+}
+
+// TestBackwardCompatibility verifies that old configs without dimensions/endpoint
+// still work correctly by applying sensible defaults.
+func TestBackwardCompatibility(t *testing.T) {
+	tests := []struct {
+		name               string
+		configYAML         string
+		expectedEndpoint   string
+		expectedDimensions int
+	}{
+		{
+			name: "ollama without endpoint or dimensions",
+			configYAML: `version: 1
+embedder:
+  provider: ollama
+  model: nomic-embed-text
+store:
+  backend: gob
+`,
+			expectedEndpoint:   "http://localhost:11434",
+			expectedDimensions: 768,
+		},
+		{
+			name: "openai without endpoint or dimensions",
+			configYAML: `version: 1
+embedder:
+  provider: openai
+  model: text-embedding-3-small
+  api_key: sk-test
+store:
+  backend: gob
+`,
+			expectedEndpoint:   "https://api.openai.com/v1",
+			expectedDimensions: 1536,
+		},
+		{
+			name: "lmstudio without endpoint or dimensions",
+			configYAML: `version: 1
+embedder:
+  provider: lmstudio
+  model: text-embedding-nomic-embed-text-v1.5
+store:
+  backend: gob
+`,
+			expectedEndpoint:   "http://127.0.0.1:1234",
+			expectedDimensions: 768,
+		},
+		{
+			name: "openai with custom endpoint keeps it",
+			configYAML: `version: 1
+embedder:
+  provider: openai
+  model: text-embedding-ada-002
+  endpoint: https://my-azure.openai.azure.com/v1
+  api_key: sk-test
+store:
+  backend: gob
+`,
+			expectedEndpoint:   "https://my-azure.openai.azure.com/v1",
+			expectedDimensions: 1536,
+		},
+		{
+			name: "custom dimensions preserved",
+			configYAML: `version: 1
+embedder:
+  provider: openai
+  model: text-embedding-3-large
+  dimensions: 3072
+  api_key: sk-test
+store:
+  backend: gob
+`,
+			expectedEndpoint:   "https://api.openai.com/v1",
+			expectedDimensions: 3072,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			configDir := filepath.Join(tmpDir, ConfigDir)
+			if err := os.MkdirAll(configDir, 0755); err != nil {
+				t.Fatalf("failed to create config dir: %v", err)
+			}
+
+			configPath := filepath.Join(configDir, ConfigFileName)
+			if err := os.WriteFile(configPath, []byte(tt.configYAML), 0600); err != nil {
+				t.Fatalf("failed to write config: %v", err)
+			}
+
+			loaded, err := Load(tmpDir)
+			if err != nil {
+				t.Fatalf("failed to load config: %v", err)
+			}
+
+			if loaded.Embedder.Endpoint != tt.expectedEndpoint {
+				t.Errorf("expected endpoint %s, got %s", tt.expectedEndpoint, loaded.Embedder.Endpoint)
+			}
+
+			if loaded.Embedder.GetDimensions() != tt.expectedDimensions {
+				t.Errorf("expected dimensions %d, got %d", tt.expectedDimensions, loaded.Embedder.GetDimensions())
+			}
+		})
+	}
+}
+
+// TestDimensionsPointerBehavior verifies the *int dimension behavior (issue #91).
+func TestDimensionsPointerBehavior(t *testing.T) {
+	tests := []struct {
+		name               string
+		configYAML         string
+		expectedNil        bool
+		expectedDimensions int
+	}{
+		{
+			name: "openai without dimensions leaves Dimensions nil",
+			configYAML: `version: 1
+embedder:
+  provider: openai
+  model: text-embedding-3-small
+  api_key: sk-test
+store:
+  backend: gob
+`,
+			expectedNil:        true,
+			expectedDimensions: 1536, // GetDimensions() returns default
+		},
+		{
+			name: "openai large without dimensions infers large dimensions",
+			configYAML: `version: 1
+embedder:
+  provider: openai
+  model: text-embedding-3-large
+  api_key: sk-test
+store:
+  backend: gob
+`,
+			expectedNil:        true,
+			expectedDimensions: 3072,
+		},
+		{
+			name: "openai with explicit dimensions sets pointer",
+			configYAML: `version: 1
+embedder:
+  provider: openai
+  model: text-embedding-3-small
+  api_key: sk-test
+  dimensions: 512
+store:
+  backend: gob
+`,
+			expectedNil:        false,
+			expectedDimensions: 512,
+		},
+		{
+			name: "ollama without dimensions gets default pointer",
+			configYAML: `version: 1
+embedder:
+  provider: ollama
+  model: nomic-embed-text
+store:
+  backend: gob
+`,
+			expectedNil:        false,
+			expectedDimensions: 768,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			configDir := filepath.Join(tmpDir, ConfigDir)
+			if err := os.MkdirAll(configDir, 0755); err != nil {
+				t.Fatalf("failed to create config dir: %v", err)
+			}
+
+			configPath := filepath.Join(configDir, ConfigFileName)
+			if err := os.WriteFile(configPath, []byte(tt.configYAML), 0600); err != nil {
+				t.Fatalf("failed to write config: %v", err)
+			}
+
+			loaded, err := Load(tmpDir)
+			if err != nil {
+				t.Fatalf("failed to load config: %v", err)
+			}
+
+			if tt.expectedNil {
+				if loaded.Embedder.Dimensions != nil {
+					t.Errorf("expected nil Dimensions, got %d", *loaded.Embedder.Dimensions)
+				}
+			} else {
+				if loaded.Embedder.Dimensions == nil {
+					t.Error("expected non-nil Dimensions, got nil")
+				} else if *loaded.Embedder.Dimensions != tt.expectedDimensions {
+					t.Errorf("expected Dimensions=%d, got %d", tt.expectedDimensions, *loaded.Embedder.Dimensions)
+				}
+			}
+
+			// GetDimensions() should always return the expected value
+			if loaded.Embedder.GetDimensions() != tt.expectedDimensions {
+				t.Errorf("GetDimensions() expected %d, got %d", tt.expectedDimensions, loaded.Embedder.GetDimensions())
+			}
+		})
+	}
+}
+
+func TestValidateRPGConfig_FeatureGroupStrategy(t *testing.T) {
+	tests := []struct {
+		name     string
+		strategy string
+		wantErr  bool
+	}{
+		{"sample is valid", "sample", false},
+		{"split is valid", "split", false},
+		{"empty is invalid", "", true},
+		{"unknown is invalid", "random", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := RPGConfig{
+				DriftThreshold:       DefaultRPGDriftThreshold,
+				MaxTraversalDepth:    DefaultRPGMaxTraversalDepth,
+				FeatureMode:          DefaultRPGFeatureMode,
+				FeatureGroupStrategy: tt.strategy,
+			}
+			err := ValidateRPGConfig(cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateRPGConfig() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestApplyDefaults_FeatureGroupStrategy(t *testing.T) {
+	// When FeatureGroupStrategy is empty, applyDefaults should set it to "sample"
+	cfg := &Config{}
+	cfg.applyDefaults()
+	if cfg.RPG.FeatureGroupStrategy != DefaultRPGFeatureGroupStrategy {
+		t.Errorf("expected FeatureGroupStrategy=%q, got %q", DefaultRPGFeatureGroupStrategy, cfg.RPG.FeatureGroupStrategy)
+	}
+}
+
+func TestApplyDefaults_WatchRealtimeFields(t *testing.T) {
+	cfg := &Config{}
+	cfg.applyDefaults()
+
+	if cfg.Watch.RPGPersistIntervalMs != DefaultWatchRPGPersistIntervalMs {
+		t.Errorf("expected watch.rpg_persist_interval_ms=%d, got %d", DefaultWatchRPGPersistIntervalMs, cfg.Watch.RPGPersistIntervalMs)
+	}
+	if cfg.Watch.RPGDerivedDebounceMs != DefaultWatchRPGDerivedDebounceMs {
+		t.Errorf("expected watch.rpg_derived_debounce_ms=%d, got %d", DefaultWatchRPGDerivedDebounceMs, cfg.Watch.RPGDerivedDebounceMs)
+	}
+	if cfg.Watch.RPGFullReconcileIntervalSec != DefaultWatchRPGFullReconcileIntervalS {
+		t.Errorf("expected watch.rpg_full_reconcile_interval_sec=%d, got %d", DefaultWatchRPGFullReconcileIntervalS, cfg.Watch.RPGFullReconcileIntervalSec)
+	}
+	if cfg.Watch.RPGMaxDirtyFilesPerBatch != DefaultWatchRPGMaxDirtyFilesPerBatch {
+		t.Errorf("expected watch.rpg_max_dirty_files_per_batch=%d, got %d", DefaultWatchRPGMaxDirtyFilesPerBatch, cfg.Watch.RPGMaxDirtyFilesPerBatch)
+	}
+}
+
+func TestValidateWatchConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     WatchConfig
+		wantErr bool
+	}{
+		{
+			name: "valid config",
+			cfg: WatchConfig{
+				RPGPersistIntervalMs:        1000,
+				RPGDerivedDebounceMs:        300,
+				RPGFullReconcileIntervalSec: 300,
+				RPGMaxDirtyFilesPerBatch:    128,
+			},
+			wantErr: false,
+		},
+		{
+			name: "persist interval too low",
+			cfg: WatchConfig{
+				RPGPersistIntervalMs:        199,
+				RPGDerivedDebounceMs:        300,
+				RPGFullReconcileIntervalSec: 300,
+				RPGMaxDirtyFilesPerBatch:    128,
+			},
+			wantErr: true,
+		},
+		{
+			name: "derived debounce too low",
+			cfg: WatchConfig{
+				RPGPersistIntervalMs:        1000,
+				RPGDerivedDebounceMs:        99,
+				RPGFullReconcileIntervalSec: 300,
+				RPGMaxDirtyFilesPerBatch:    128,
+			},
+			wantErr: true,
+		},
+		{
+			name: "full reconcile interval too low",
+			cfg: WatchConfig{
+				RPGPersistIntervalMs:        1000,
+				RPGDerivedDebounceMs:        300,
+				RPGFullReconcileIntervalSec: 29,
+				RPGMaxDirtyFilesPerBatch:    128,
+			},
+			wantErr: true,
+		},
+		{
+			name: "max dirty files too low",
+			cfg: WatchConfig{
+				RPGPersistIntervalMs:        1000,
+				RPGDerivedDebounceMs:        300,
+				RPGFullReconcileIntervalSec: 300,
+				RPGMaxDirtyFilesPerBatch:    0,
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateWatchConfig(tt.cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateWatchConfig() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestConfigLoad_EmbedderBatchLimits(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ConfigDir), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	cfgPath := GetConfigPath(tmpDir)
+
+	tests := []struct {
+		name       string
+		yaml       string
+		wantSize   int
+		wantTokens int
+	}{
+		{"absent keeps zero (provider defaults)", "embedder:\n  provider: openai\n", 0, 0},
+		{"custom values", "embedder:\n  provider: openai\n  max_batch_size: 100\n  max_batch_tokens: 50000\n", 100, 50000},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := os.WriteFile(cfgPath, []byte(tt.yaml), 0o644); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := Load(tmpDir)
+			if err != nil {
+				t.Fatalf("Load failed: %v", err)
+			}
+			if cfg.Embedder.MaxBatchSize != tt.wantSize || cfg.Embedder.MaxBatchTokens != tt.wantTokens {
+				t.Fatalf("batch limits = (%d, %d), want (%d, %d)",
+					cfg.Embedder.MaxBatchSize, cfg.Embedder.MaxBatchTokens, tt.wantSize, tt.wantTokens)
+			}
+		})
+	}
+
+	// A config saved without batch limits must not gain the new keys.
+	if err := DefaultConfig().Save(tmpDir); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(data), "max_batch") {
+		t.Fatalf("default config should not write batch limit keys, got:\n%s", data)
+	}
+}

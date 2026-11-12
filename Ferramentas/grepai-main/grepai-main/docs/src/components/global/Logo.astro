@@ -1,0 +1,29 @@
+---
+interface Props {
+  size?: number;
+  showText?: boolean;
+}
+
+const { size = 28, showText = true } = Astro.props;
+---
+
+<span class="inline-flex items-center gap-2 text-ink">
+  <!-- Lens with the gold thread: the path from a query to the code it finds -->
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    class="shrink-0"
+    aria-hidden="true"
+  >
+    <circle cx="10.5" cy="10.5" r="7.5" stroke="currentColor" stroke-width="1.7" />
+    <path d="m16 16 5 5" stroke="currentColor" stroke-width="2.2" />
+    <path d="M5.6 12.6c1.9 0 1.9-4.4 4.4-4.4s1.6 3.2 3.6 3.2" stroke="rgb(var(--gold))" stroke-width="1.7" />
+    <circle cx="14" cy="11.4" r="1.1" fill="rgb(var(--gold))" />
+  </svg>
+  {showText && <span class="font-display text-[1.35rem] leading-none tracking-tight">grepai</span>}
+</span>

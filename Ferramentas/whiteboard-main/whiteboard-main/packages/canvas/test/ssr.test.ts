@@ -1,0 +1,173 @@
+import {
+  cpSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+import { createElement } from "react";
+import { renderToString } from "react-dom/server";
+import { expect, it } from "vitest";
+
+import { shareFixture } from "../../review/app/src/share/share-fixture";
+import {
+  type PeekViewer,
+  Whiteboard,
+  WhiteboardProvider,
+  boardView,
+  openShare,
+  readOnlyHost,
+} from "../dist/index.js";
+
+type Canvas = typeof import("../dist/index.js");
+
+const renderShare = async (
+  { Whiteboard, WhiteboardProvider, openShare }: Canvas,
+  wasmUrl?: string,
+) => {
+  const view = await openShare(shareFixture, { theme: "system", wasmUrl });
+
+  const html = renderToString(
+    createElement(
+      "div",
+      { className: "review-canvas-root" },
+      createElement(
+        WhiteboardProvider,
+        { data: view.data, host: view.host, settings: {} },
+        createElement(Whiteboard),
+      ),
+    ),
+  );
+
+  view.dispose();
+
+  return html;
+};
+
+it("renders a share on a server, leaving its diagram to the client", async () => {
+  expect(globalThis).not.toHaveProperty("document");
+
+  const html = await renderShare({ Whiteboard, WhiteboardProvider, openShare });
+
+  for (const text of [
+    "Orders now queue.",
+    "Queueing",
+    "Careful",
+    "Sent only once.",
+    "Queue it first",
+    // Escaped: excerpts are untrusted.
+    "&#34;&#60;queued&#62;&#34;",
+    "// sent once written",
+  ])
+    expect(html).toContain(text);
+
+  expect(html).not.toContain("<queued>");
+  // Images are not shared yet; the block keeps its place and its alt text.
+  expect(html).toContain('alt="The queue"');
+  expect(html).not.toContain("src=");
+  expect(html).toContain('data-diagram-placeholder="FLOW"');
+  expect(html).not.toContain("Write order");
+  expect(html).toContain('data-diagram-placeholder="ANIMATION"');
+  expect(html).not.toContain("<iframe");
+});
+
+it("imports and renders where import.meta.url is undefined, as in a Worker", async () => {
+  // Inside node_modules, so the copy still resolves react.
+  const dist = mkdtempSync(
+    path.join(import.meta.dirname, "../node_modules/.worker-dist-"),
+  );
+
+  try {
+    cpSync(path.join(import.meta.dirname, "../dist"), dist, {
+      recursive: true,
+    });
+
+    for (const file of readdirSync(dist, { recursive: true })) {
+      const target = path.join(dist, String(file));
+
+      if (target.endsWith(".js"))
+        writeFileSync(
+          target,
+          readFileSync(target, "utf8").replaceAll(
+            "import.meta.url",
+            "undefined",
+          ),
+        );
+    }
+
+    const canvas: Canvas = await import(
+      /* @vite-ignore */ pathToFileURL(path.join(dist, "index.js")).href
+    );
+
+    // A server has no wasm to route diagrams with; cloudboard passes this.
+    expect(await renderShare(canvas, "about:blank")).toContain(
+      "Orders now queue.",
+    );
+  } finally {
+    rmSync(dist, { recursive: true, force: true });
+  }
+});
+
+/** A live board: the snapshot without its pins, its peeks from `options`,
+ * quoting `code` once it arrives. */
+const renderLive = async (
+  options: Parameters<typeof readOnlyHost>[0],
+  code?: Parameters<ReturnType<typeof readOnlyHost>["setSources"]>[0],
+) => {
+  const { snapshot, selections } = shareFixture;
+  const { pins: _pins, ...live } = snapshot;
+  const host = readOnlyHost(options);
+
+  if (code) await host.setSources(code);
+  const data = boardView(live, { resolvedSelections: selections });
+
+  const html = renderToString(
+    createElement(
+      "div",
+      { className: "review-canvas-root" },
+      createElement(
+        WhiteboardProvider,
+        { data, host, settings: {} },
+        createElement(Whiteboard),
+      ),
+    ),
+  );
+
+  host.dispose();
+
+  return html;
+};
+
+it("quotes a live board's sources once the host has them", async () => {
+  const { sources, snapshot } = shareFixture;
+
+  expect(await renderLive({})).toContain("Code unavailable");
+  const html = await renderLive({}, { sources, pins: snapshot.pins });
+
+  expect(html).toContain("// sent once written");
+  expect(html).not.toContain("Code unavailable");
+});
+
+it("draws peeks through any PeekViewer", async () => {
+  const seen: string[] = [];
+
+  const viewer: PeekViewer = {
+    renderStatic(spec) {
+      seen.push(`${spec.side}/${spec.path}`);
+
+      return `<pre data-viewer>${spec.ranges.map((range) => `${range.startLine}-${range.endLine}`).join(",")}</pre>`;
+    },
+    create() {
+      throw new Error("not mounted on a server");
+    },
+    find: async () => ({ matchCount: 0 }),
+  };
+
+  const html = await renderLive({ peeks: () => viewer });
+  expect(seen).toEqual(["head/order.ts"]);
+  expect(html).toContain("<pre data-viewer>1-2</pre>");
+});

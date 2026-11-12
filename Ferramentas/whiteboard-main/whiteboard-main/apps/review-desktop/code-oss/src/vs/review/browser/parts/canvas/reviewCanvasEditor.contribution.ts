@@ -1,0 +1,135 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) dev.fast. All rights reserved.
+ *  Licensed under the MIT License. See LICENSE in the repository root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import { Event } from "../../../../base/common/event.js";
+import { Disposable } from "../../../../base/common/lifecycle.js";
+import { SyncDescriptor } from "../../../../platform/instantiation/common/descriptors.js";
+import { Registry } from "../../../../platform/registry/common/platform.js";
+import { EditorPaneDescriptor, IEditorPaneRegistry } from "../../../../workbench/browser/editor.js";
+import {
+	IWorkbenchContribution,
+	registerWorkbenchContribution2,
+	WorkbenchPhase,
+} from "../../../../workbench/common/contributions.js";
+import {
+	EditorExtensions,
+	EditorResourceAccessor,
+	EditorsOrder,
+	SideBySideEditor,
+	type IEditorFactoryRegistry,
+} from "../../../../workbench/common/editor.js";
+import { IEditorGroupsService } from "../../../../workbench/services/editor/common/editorGroupsService.js";
+import { IEditorService } from "../../../../workbench/services/editor/common/editorService.js";
+import { IReviewApiCatalogService } from "../../../services/reviewApiCatalogService.js";
+import { IReviewCanvasEditorTabsService } from "../../../services/reviewCanvasEditorTabsService.js";
+import { IReviewDesktopConnectionService } from "../../../services/reviewDesktopConnectionService.js";
+import { ReviewApiEditorSerializer } from "./reviewApiEditorSerializer.js";
+import { ReviewCanvasEditorInput } from "./reviewCanvasEditorInput.js";
+import { ReviewCanvasEditorPane } from "./reviewCanvasPart.js";
+import { isReviewReadonlySource } from "../../../common/reviewReadonlySource.js";
+
+Registry.as<IEditorFactoryRegistry>(EditorExtensions.EditorFactory).registerEditorSerializer(
+	ReviewCanvasEditorInput.ID,
+	ReviewApiEditorSerializer,
+);
+
+Registry.as<IEditorPaneRegistry>(EditorExtensions.EditorPane).registerEditorPane(
+	EditorPaneDescriptor.create(ReviewCanvasEditorPane, ReviewCanvasEditorPane.ID, "Whiteboard"),
+	[new SyncDescriptor(ReviewCanvasEditorInput)],
+);
+
+class ReviewCanvasEditorContribution extends Disposable implements IWorkbenchContribution {
+	static readonly ID = "workbench.contrib.devfast.reviewCanvasEditor";
+
+	constructor(
+		@IEditorService private readonly editorService: IEditorService,
+		@IEditorGroupsService
+		private readonly editorGroupsService: IEditorGroupsService,
+		@IReviewDesktopConnectionService
+		private readonly desktopConnection: IReviewDesktopConnectionService,
+		@IReviewApiCatalogService private readonly apiCatalog: IReviewApiCatalogService,
+		@IReviewCanvasEditorTabsService
+		private readonly tabsService: IReviewCanvasEditorTabsService,
+	) {
+		super();
+		this._register(this.editorService.onDidActiveEditorChange(() => {
+			const editor = this.editorService.activeEditor;
+			const resource = EditorResourceAccessor.getCanonicalUri(editor, { supportSideBySide: SideBySideEditor.PRIMARY });
+			if (editor && resource && isReviewReadonlySource(resource)) this.tabsService.registerReviewEditor(resource.authority, editor);
+		}));
+		this._register(
+			this.editorService.onDidCloseEditor(({ editor, groupId }) => {
+				if (!(editor instanceof ReviewCanvasEditorInput) || editor.target.kind === "api") return;
+				// Closing Settings or Welcome returns to the board shown
+				// before it, or Home when there is none.
+				const board = this.editorGroupsService.getGroup(groupId)?.getEditors(EditorsOrder.MOST_RECENTLY_ACTIVE)
+					.find((open) => open instanceof ReviewCanvasEditorInput && open.target.kind === "api");
+				if (board) void this.editorGroupsService.getGroup(groupId)?.openEditor(board);
+				else void this.tabsService.openHome(true);
+			}),
+		);
+		this._register(
+			apiCatalog.onDidCloseReview((uuid) => {
+				void this.tabsService.closeReview(uuid);
+			}),
+		);
+		void this.initialize();
+	}
+
+	private async initialize(): Promise<void> {
+		await this.editorGroupsService.whenRestored;
+		// Restored pinned source editors belong to the same review as their URI.
+		for (const group of this.editorGroupsService.groups) {
+			for (const editor of group.editors) {
+				const resource = EditorResourceAccessor.getCanonicalUri(editor, {
+					supportSideBySide: SideBySideEditor.PRIMARY,
+				});
+				if (resource && isReviewReadonlySource(resource)) this.tabsService.registerReviewEditor(resource.authority, editor);
+			}
+		}
+		this.closeRestoredApiTabsMissingFromCatalog();
+		await this.tabsService.openHome(!this.editorService.activeEditor);
+		await this.desktopConnection.initialize();
+		await this.apiCatalog.initialize();
+		// Windows restored for a review dismissed at quit, or while closed, show checkouts the host frees at startup.
+		await this.desktopConnection.closeSourceWindows(
+			this.apiCatalog.reviews.filter((review) => review.trashedAt).map((review) => review.reviewId),
+		);
+	}
+
+	/** Restored API tabs may belong to reviews deleted or dismissed while the app was closed. */
+	private closeRestoredApiTabsMissingFromCatalog(): void {
+		const restored = new Set(
+			this.editorGroupsService.groups.flatMap((group) =>
+				group.editors.flatMap((editor) =>
+					editor instanceof ReviewCanvasEditorInput &&
+					(editor.target.kind === "api" || editor.target.kind === "api-source")
+						? [editor.target.reviewId]
+						: [],
+				),
+			),
+		);
+		if (restored.size === 0) return;
+		const reconcile = () => {
+			for (const reviewId of restored) {
+				const review = this.apiCatalog.reviews.find((review) => review.reviewId === reviewId);
+				if (!review || review.trashedAt) void this.tabsService.closeReview(reviewId);
+			}
+		};
+		if (this.apiCatalog.loaded) void reconcile();
+		else
+			this._register(
+				Event.once(this.apiCatalog.onDidChange)(() => {
+					void reconcile();
+				}),
+			);
+	}
+}
+
+registerWorkbenchContribution2(
+	ReviewCanvasEditorContribution.ID,
+	ReviewCanvasEditorContribution,
+	WorkbenchPhase.AfterRestored,
+);

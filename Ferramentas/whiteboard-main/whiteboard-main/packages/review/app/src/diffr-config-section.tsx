@@ -1,0 +1,578 @@
+import { Button } from "@canvas/ui/button";
+import { Checkbox } from "@canvas/ui/checkbox";
+import { DisclosureChevron, disclosureStyles } from "@canvas/ui/disclosure";
+import { focusStyles } from "@canvas/ui/focus";
+import { textStyles } from "@canvas/ui/text";
+import { TextArea, TextField } from "@canvas/ui/text-field";
+import { isStringValue } from "@dev.fast/json";
+import {
+  type JsonValue,
+  type ReviewDiffrConfig,
+  type ReviewDiffrConfigActions,
+  type ReviewDiffrSummarizerInput,
+  isJsonObject,
+} from "@dev.fast/review-protocol";
+import * as stylex from "@stylexjs/stylex";
+import { useEffect, useRef, useState } from "react";
+
+import { chevronMarker } from "./markers.stylex";
+import { Row } from "./settings-section";
+import { settingsStyles as styles } from "./settings-styles";
+import { SegmentedControl } from "./ui/segmented";
+
+const hideKey = "plugins.classify.bundled.hide";
+
+const displaySettings = [
+  ["plugins.shape.bundled.context.enabled", "Collapse unchanged lines"],
+  ["plugins.shape.bundled.test-bodies.enabled", "Collapse test bodies"],
+  [
+    "plugins.shape.bundled.deleted-bodies.enabled",
+    "Collapse deleted function bodies",
+  ],
+  [
+    "plugins.shape.bundled.removed-runs.enabled",
+    "Collapse long removed stretches",
+  ],
+  [hideKey, "Hide files by tag"],
+  ["plugins.classify.bundled.hide_deleted", "Hide deleted files"],
+] as const;
+
+function setting(
+  config: ReviewDiffrConfig,
+  key: string,
+): JsonValue | undefined {
+  let value: JsonValue | undefined = config.values;
+
+  for (const part of key.split("."))
+    value = isJsonObject(value) ? value[part] : undefined;
+
+  return value;
+}
+
+function provider(config: ReviewDiffrConfig): string {
+  return String(
+    setting(config, "plugins.shape.bundled.summarize.provider") ?? "",
+  );
+}
+
+/** The provider diffr describes as `id`, if any. */
+function described(config: ReviewDiffrConfig, id: string) {
+  return config.providers?.find((known) => known.id === id);
+}
+
+function title(config: ReviewDiffrConfig, id: string): string {
+  return described(config, id)?.title ?? id;
+}
+
+/** Codex when summaries are off, nothing else has a key, and it is signed in. */
+function preferCodex(config: ReviewDiffrConfig): boolean {
+  return (
+    setting(config, "plugins.shape.bundled.summarize.enabled") !== true &&
+    config.credentialSource === "missing" &&
+    !!described(config, "codex") &&
+    !!config.logins?.codex?.ready
+  );
+}
+
+function summaryDraft(config: ReviewDiffrConfig): ReviewDiffrSummarizerInput {
+  const codex = preferCodex(config);
+
+  return {
+    enabled:
+      setting(config, "plugins.shape.bundled.summarize.enabled") === true,
+    provider: codex ? "codex" : provider(config),
+    model: codex
+      ? (described(config, "codex")?.model ?? "")
+      : String(setting(config, "plugins.shape.bundled.summarize.model") ?? ""),
+    endpoint: codex
+      ? ""
+      : String(
+          setting(config, "plugins.shape.bundled.summarize.endpoint") ?? "",
+        ),
+    systemPrompt: String(
+      setting(config, "plugins.shape.bundled.summarize.system_prompt") ??
+        config.defaultPrompt ??
+        "",
+    ),
+    tests: setting(config, "plugins.shape.bundled.summarize.tests") === true,
+    apiKey: "",
+  };
+}
+
+export function DiffrConfigSection({
+  actions,
+  reloadWindow,
+}: {
+  actions: ReviewDiffrConfigActions;
+  reloadWindow(): Promise<void>;
+}) {
+  const [opened, setOpened] = useState(false);
+  const [config, setConfig] = useState<ReviewDiffrConfig>();
+  const [draft, setDraft] = useState<ReviewDiffrSummarizerInput>();
+  const [busy, setBusy] = useState(false);
+  const pending = useRef(false);
+  const rememberedTags = useRef<string[] | undefined>(undefined);
+  const [error, setError] = useState<string>();
+  const [summary, setSummary] = useState<string>();
+  const [changed, setChanged] = useState(false);
+  const [confirmReload, setConfirmReload] = useState(false);
+
+  useEffect(() => {
+    if (!opened) return;
+    let cancelled = false;
+    actions.read().then(
+      (result) => {
+        if (cancelled) return;
+        rememberTags(result);
+        setConfig(result);
+        setDraft(summaryDraft(result));
+      },
+      () => {
+        if (!cancelled)
+          setError(
+            "Could not read diffr settings. Reopen Settings to try again.",
+          );
+      },
+    );
+
+    return () => {
+      cancelled = true;
+    };
+  }, [actions, opened]);
+
+  async function run(operation: () => Promise<void>) {
+    if (pending.current) return;
+    pending.current = true;
+    setBusy(true);
+    setError(undefined);
+
+    try {
+      await operation();
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Could not update diffr settings.",
+      );
+    } finally {
+      pending.current = false;
+      setBusy(false);
+    }
+  }
+
+  function rememberTags(result: ReviewDiffrConfig) {
+    const tags = setting(result, hideKey);
+
+    if (Array.isArray(tags) && tags.length)
+      rememberedTags.current = tags.filter(isStringValue);
+  }
+
+  function saved(result: ReviewDiffrConfig) {
+    rememberTags(result);
+    setConfig(result);
+
+    if (result.changed) setChanged(true);
+    setError(result.error);
+  }
+
+  const dirty =
+    config &&
+    draft &&
+    JSON.stringify(draft) !== JSON.stringify(summaryDraft(config));
+
+  const unavailable =
+    !config ||
+    setting(config, "plugins.shape.bundled.summarize.enabled") === undefined;
+
+  const summaryValid = !!draft?.model.trim();
+  const login = config && draft && described(config, draft.provider)?.login;
+  const savedDraft = config && summaryDraft(config);
+  const hiddenTags = config && setting(config, hideKey);
+
+  return (
+    <div {...stylex.props(styles.nested)}>
+      <details>
+        <summary
+          {...stylex.props(
+            chevronMarker,
+            disclosureStyles.toggle,
+            focusStyles.ring,
+            styles.nestedSummary,
+          )}
+          onClick={() => setOpened(true)}
+        >
+          <DisclosureChevron />
+          Diff display and AI summaries
+        </summary>
+        {opened && (
+          <>
+            <p {...stylex.props(styles.rowDescription)}>
+              Shared with the diffr CLI. Applies to all repositories.
+            </p>
+            {!config && !error && <p role="status">Reading diffr settings…</p>}
+            {config && (
+              <>
+                <h3>Display</h3>
+                {displaySettings.map(([key, label]) => (
+                  <div key={key}>
+                    <Row label={label}>
+                      <Checkbox
+                        aria-label={label}
+                        checked={
+                          key === hideKey
+                            ? Array.isArray(hiddenTags) && hiddenTags.length > 0
+                            : setting(config, key) === true
+                        }
+                        disabled={busy || setting(config, key) === undefined}
+                        onChange={(event) => {
+                          const value =
+                            key === hideKey
+                              ? event.target.checked
+                                ? (rememberedTags.current ??
+                                  config.defaultHiddenTags ??
+                                  [])
+                                : []
+                              : event.target.checked;
+
+                          void run(async () =>
+                            saved(await actions.set(key, value)),
+                          );
+                        }}
+                      />
+                    </Row>
+                    {setting(config, key) === undefined && (
+                      <p {...stylex.props(styles.unavailable)}>
+                        Not available in this configuration.
+                      </p>
+                    )}
+                    {key === "plugins.shape.bundled.context.enabled" && (
+                      <Row label="Context lines">
+                        <ContextLines
+                          value={setting(
+                            config,
+                            "plugins.shape.bundled.context.lines",
+                          )}
+                          disabled={busy || setting(config, key) !== true}
+                          commit={(value) =>
+                            void run(async () =>
+                              saved(
+                                await actions.set(
+                                  "plugins.shape.bundled.context.lines",
+                                  value,
+                                ),
+                              ),
+                            )
+                          }
+                        />
+                      </Row>
+                    )}
+                    {key === hideKey && Array.isArray(hiddenTags) && (
+                      <p {...stylex.props(styles.rowDescription)}>
+                        Tags: {hiddenTags.join(", ")}
+                      </p>
+                    )}
+                  </div>
+                ))}
+                <h3>AI summaries</h3>
+                <p {...stylex.props(styles.rowDescription)}>
+                  Sends source-file contents to the selected provider to
+                  summarize large new functions and tests.
+                </p>
+                {unavailable && (
+                  <p {...stylex.props(styles.unavailable)}>
+                    The summarizer is not available in this configuration.
+                  </p>
+                )}
+                {draft && (
+                  <fieldset
+                    disabled={busy || unavailable}
+                    {...stylex.props(styles.summaryFields)}
+                  >
+                    <Row label="Enable summaries">
+                      <Checkbox
+                        aria-label="Enable summaries"
+                        checked={draft.enabled}
+                        onChange={(event) =>
+                          setDraft({ ...draft, enabled: event.target.checked })
+                        }
+                      />
+                    </Row>
+                    {!!config.providers?.length && (
+                      <Row label="Provider">
+                        <SegmentedControl
+                          label="Provider"
+                          value={draft.provider}
+                          options={config.providers.map((known) => ({
+                            value: known.id,
+                            label: known.title,
+                          }))}
+                          disabled={busy || unavailable}
+                          onChange={(choice) =>
+                            setDraft({
+                              ...draft,
+                              provider: choice,
+                              model: described(config, choice)?.model ?? "",
+                              endpoint: "",
+                              apiKey: "",
+                            })
+                          }
+                        />
+                      </Row>
+                    )}
+                    {login ? (
+                      <p {...stylex.props(styles.rowDescription)}>
+                        {config.logins?.[login]?.ready
+                          ? `Uses the ${title(config, draft.provider)} sign-in saved on this computer. No key needed.`
+                          : (config.logins?.[login]?.message ??
+                            "Sign-in status unavailable.")}
+                      </p>
+                    ) : (
+                      <>
+                        <Row label="API key">
+                          <TextField
+                            xstyle={styles.input}
+                            aria-label="API key"
+                            type="password"
+                            autoComplete="off"
+                            placeholder="Enter replacement key"
+                            value={draft.apiKey}
+                            onChange={(event) =>
+                              setDraft({ ...draft, apiKey: event.target.value })
+                            }
+                          />
+                        </Row>
+                        <p {...stylex.props(styles.rowDescription)}>
+                          {draft.provider !== provider(config) ||
+                          draft.endpoint !== savedDraft?.endpoint
+                            ? config.credentialSource !== "config"
+                              ? `Enter a key for ${title(config, draft.provider)}, or leave blank to use its environment variable.`
+                              : draft.provider !== provider(config)
+                                ? `Saving clears the key saved for ${title(config, provider(config))}.`
+                                : "Saving clears the saved key, since the endpoint changed."
+                            : `${
+                                config.credentialSource === "config"
+                                  ? "Saved key"
+                                  : config.credentialSource === "environment"
+                                    ? "Environment key available"
+                                    : "Not configured"
+                              }. Replacement keys are stored in diffr’s config. Leave blank to keep the current key.`}
+                        </p>
+                      </>
+                    )}
+                    <Row label="Model">
+                      <TextField
+                        xstyle={styles.input}
+                        aria-label="Model"
+                        value={draft.model}
+                        onChange={(event) =>
+                          setDraft({ ...draft, model: event.target.value })
+                        }
+                      />
+                    </Row>
+                    {!login && (
+                      <>
+                        <Row label="Endpoint URL">
+                          <TextField
+                            xstyle={styles.input}
+                            aria-label="Endpoint URL"
+                            placeholder={
+                              described(config, draft.provider)?.endpoint
+                            }
+                            value={draft.endpoint}
+                            onChange={(event) =>
+                              setDraft({
+                                ...draft,
+                                endpoint: event.target.value,
+                              })
+                            }
+                          />
+                        </Row>
+                        <p {...stylex.props(styles.rowDescription)}>
+                          Optional. With OpenAI, point this at any compatible
+                          server, such as OpenRouter or Ollama.
+                        </p>
+                      </>
+                    )}
+                    <label {...stylex.props(styles.prompt)}>
+                      <span {...stylex.props(styles.rowLabel)}>
+                        Prompt{" "}
+                        <span {...stylex.props(styles.rowDescription)}>
+                          {draft.systemPrompt === config.defaultPrompt
+                            ? "Default"
+                            : "Customized"}
+                        </span>
+                      </span>
+                      <TextArea
+                        aria-label="Prompt"
+                        rows={6}
+                        value={draft.systemPrompt}
+                        onChange={(event) =>
+                          setDraft({
+                            ...draft,
+                            systemPrompt: event.target.value,
+                          })
+                        }
+                      />
+                    </label>
+                    <p {...stylex.props(styles.rowDescription)}>
+                      Sent with every request. diffr adds the file and the folds
+                      to summarize, and asks for structured output where the
+                      provider supports it.{" "}
+                      {config.defaultPrompt &&
+                        draft.systemPrompt !== config.defaultPrompt && (
+                          <Button
+                            onClick={() =>
+                              setDraft({
+                                ...draft,
+                                systemPrompt: config.defaultPrompt ?? "",
+                              })
+                            }
+                          >
+                            Reset to default
+                          </Button>
+                        )}
+                    </p>
+                    <Row label="Include tests">
+                      <Checkbox
+                        aria-label="Include tests"
+                        checked={draft.tests}
+                        onChange={(event) =>
+                          setDraft({ ...draft, tests: event.target.checked })
+                        }
+                      />
+                    </Row>
+                    <div {...stylex.props(styles.summaryActions)}>
+                      <Button
+                        disabled={!summaryValid}
+                        onClick={() =>
+                          void run(async () => {
+                            setSummary(undefined);
+                            setSummary(await actions.testSummarizer(draft));
+                          })
+                        }
+                      >
+                        Test setup
+                      </Button>
+                      <Button
+                        disabled={!summaryValid || !dirty}
+                        onClick={() =>
+                          void run(async () => {
+                            const result = await actions.saveSummarizer(draft);
+                            saved(result);
+
+                            if (!result.error || result.changed)
+                              setDraft(summaryDraft(result));
+                          })
+                        }
+                      >
+                        Save summaries
+                      </Button>
+                    </div>
+                    <p {...stylex.props(styles.rowDescription)}>
+                      Test setup sends synthetic code without saving your
+                      settings.
+                    </p>
+                  </fieldset>
+                )}
+                {summary && (
+                  <pre
+                    {...stylex.props(styles.summaryResult)}
+                    aria-label="Sample summary"
+                  >
+                    {summary}
+                  </pre>
+                )}
+              </>
+            )}
+          </>
+        )}
+      </details>
+      {busy && <p role="status">Working…</p>}
+      {error && (
+        <p role="alert" {...stylex.props(textStyles.error, styles.error)}>
+          {error}
+        </p>
+      )}
+      {changed && (
+        <p role="status">
+          Reload the window to see changes.{" "}
+          <Button
+            disabled={busy}
+            onClick={() => {
+              if (dirty) setConfirmReload(true);
+              else void run(reloadWindow);
+            }}
+          >
+            Reload window
+          </Button>
+        </p>
+      )}
+      {confirmReload && (
+        <div role="alertdialog" aria-label="Discard summary changes?">
+          <p>Discard unsaved summary settings and reload?</p>
+          <Button disabled={busy} onClick={() => void run(reloadWindow)}>
+            Discard and reload
+          </Button>{" "}
+          <Button onClick={() => setConfirmReload(false)}>Cancel</Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ContextLines({
+  value,
+  disabled,
+  commit,
+}: {
+  value: JsonValue | undefined;
+  disabled: boolean;
+  commit(value: number): void;
+}) {
+  const [text, setText] = useState(String(value ?? ""));
+  const [error, setError] = useState(false);
+  useEffect(() => {
+    setText(String(value ?? ""));
+  }, [value]);
+
+  function save() {
+    if (text === String(value ?? "")) return;
+    const number = Number(text);
+
+    if (
+      !text.trim() ||
+      !Number.isInteger(number) ||
+      number < 0 ||
+      number > 0xffff_ffff
+    ) {
+      setError(true);
+
+      return;
+    }
+
+    setError(false);
+    commit(number);
+  }
+
+  return (
+    <div>
+      <TextField
+        xstyle={styles.input}
+        aria-label="Context lines"
+        type="number"
+        min={0}
+        max={0xffff_ffff}
+        step={1}
+        value={text}
+        disabled={disabled || value === undefined}
+        aria-invalid={error}
+        onChange={(event) => setText(event.target.value)}
+        onBlur={save}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") save();
+        }}
+      />
+      {error && <p role="alert">Enter a nonnegative whole number.</p>}
+    </div>
+  );
+}

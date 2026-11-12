@@ -1,0 +1,76 @@
+---
+// Steps component wrapper
+---
+
+<div class="steps-container my-8">
+  <slot />
+</div>
+
+<style>
+  .steps-container :global(ol) {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    counter-reset: steps;
+  }
+
+  .steps-container :global(ol > li) {
+    position: relative;
+    padding-left: 2.75rem;
+    padding-bottom: 2rem;
+    counter-increment: steps;
+    min-width: 0;
+  }
+
+  .steps-container :global(ol > li:last-child) {
+    padding-bottom: 0;
+  }
+
+  /* Numbered waypoint */
+  .steps-container :global(ol > li::before) {
+    content: counter(steps);
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 1.75rem;
+    height: 1.75rem;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font: 600 0.8rem/1 'Public Sans', system-ui, sans-serif;
+    color: rgb(var(--on-gold));
+    background: rgb(var(--gold));
+  }
+
+  /* The thread linking one step to the next */
+  .steps-container :global(ol > li::after) {
+    content: '';
+    position: absolute;
+    left: calc(0.875rem - 1px);
+    top: 2.1rem;
+    width: 2px;
+    height: calc(100% - 2.4rem);
+    background: rgb(var(--gold) / 0.55);
+    border-radius: 1px;
+  }
+
+  .steps-container :global(ol > li:last-child::after) {
+    display: none;
+  }
+
+  .steps-container :global(ol > li > strong:first-child) {
+    display: block;
+    color: rgb(var(--ink));
+    font-size: 1rem;
+    line-height: 1.75rem;
+    margin-bottom: 0.25rem;
+  }
+
+  .steps-container :global(pre) {
+    margin-top: 0.5rem;
+    margin-bottom: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+</style>

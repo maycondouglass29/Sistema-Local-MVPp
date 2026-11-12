@@ -1,0 +1,25 @@
+import { z } from "zod";
+
+import { type BlockDefinition, defineBlock, label } from "./definition.js";
+import { type Block, blockSchema } from "./index.js";
+
+export interface SectionBlock {
+  id?: string;
+  type: "section";
+  title: string;
+  defaultCollapsed?: boolean;
+  children: Block[];
+}
+
+// blockSchema is read inside z.lazy, after every module in the cycle has evaluated.
+export const sectionSchema = defineBlock("section", {
+  title: label,
+  defaultCollapsed: z.boolean().optional(),
+  children: z.array(z.lazy((): z.ZodType<Block> => blockSchema)),
+});
+
+export const section: BlockDefinition<SectionBlock> = {
+  type: "section",
+  reference: ["- section {title, children: component[], defaultCollapsed?}"],
+  schema: sectionSchema,
+};

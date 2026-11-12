@@ -1,0 +1,440 @@
+/**
+ * The `whiteboard` global an animation's scripts call. Read-only
+ * reference: Whiteboard rewrites this file, and editing it changes nothing.
+ * The CSS classes and --wb-* variables every animation loads are in whiteboard.css beside it.
+ *
+ * Frames are states, not events: whatever a frame shows must also be right
+ * when the reader jumps to it or steps back, not only when it plays.
+ *
+ * A clip has no frames: its script builds one timeline with clip(), places
+ * the block's markers on it, and the reader plays it or jumps to a marker.
+ */
+
+/* oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-object-parameters -- Documents a script API; anime.js parses its own targets and params. */
+
+/** Colors any scene part, arrow, token, or kit element (as data-tone). */
+export type Tone = "accent" | "added" | "removed" | "modified" | "muted";
+
+/** A card's silhouette, so a reader tells kinds apart before reading a
+ * title. Pick by what the card stands for: `cylinder` for a database,
+ * `drum` for a cache, `stack` for a queue or topic, `window` for a client
+ * (a browser, an app), `bars` for a service or worker of this codebase,
+ * `pill` for a start or end, `cut` for a branch. Any kit element takes it as
+ * data-form. */
+export type Form =
+  | "box"
+  | "pill"
+  | "cut"
+  | "cylinder"
+  | "drum"
+  | "stack"
+  | "window"
+  | "bars";
+
+/** A border's line. `dashed` reads as outside the system: a third-party
+ * service or API. As data-outline on a kit element. */
+export type Outline = "solid" | "dashed" | "dotted";
+
+/** A border's colour at rest, for grouping cards of a kind: `teal` suits
+ * stores, `violet` queues, `accent` the part under discussion. A tone from
+ * on() takes over while set. As data-color on a kit element. */
+export type Color = "ink" | "accent" | "teal" | "violet";
+
+/** What the change under review did to the part a card stands for. A
+ * resting mark in the change colours, its dot and a stripe down its left
+ * edge, that a frame's `tone` does not replace; a removed part's title is
+ * struck through. As data-change on a kit element. */
+export type Change = "added" | "modified" | "removed";
+
+/** One frame, as your scripts read it. */
+export interface Frame {
+  key: string;
+  title: string;
+  caption?: string;
+  /** The frame's own state, from its `data`: draw the frame from this. */
+  data?: unknown;
+  /** The code names the frame lists, for data-wb-open. */
+  code?: string[];
+  /** Its position in the active path. */
+  index: number;
+}
+
+/** What a frame handler learns about the change that called it. */
+export interface FrameChange {
+  frame: Frame;
+  previous: Frame | undefined;
+  direction: "forward" | "backward" | "none";
+  /** Skip motion and draw the end state: a jump, the first draw, or reduced
+   * motion. */
+  instant: boolean;
+}
+
+/** One of a clip's markers, as your scripts read it. */
+export interface Marker {
+  key: string;
+  title: string;
+  caption?: string;
+  /** The code names the marker lists, for data-wb-open. */
+  code?: string[];
+  /** Milliseconds into the active timeline, once the scripts have run. */
+  at?: number;
+}
+
+/** A marker the playhead reached: placed, with its place in time order. */
+export interface ReachedMarker extends Marker {
+  at: number;
+  index: number;
+}
+
+/** What a marker handler learns as a clip's playhead reaches its marker. */
+export interface MarkerChange {
+  marker: ReachedMarker;
+  /** A jump to the marker, the first draw, or reduced motion: draw the
+   * marker's state at once. */
+  instant: boolean;
+}
+
+/** What a paint handler learns as the block paints its first frame in. */
+export interface PaintChange {
+  /** The first frame, already drawn in its end state. A clip has none: it
+   * paints in at time 0. */
+  frame?: Frame;
+  /** Skip motion and leave everything in its end state: the block loaded
+   * without painting in, or the reader prefers reduced motion. */
+  instant: boolean;
+}
+
+/** Return the animations a handler starts, or a finite promise, so playback
+ * waits for them. */
+export type FrameResult =
+  | void
+  | Animation
+  | readonly Animation[]
+  | Promise<void>;
+
+export interface Whiteboard {
+  /** The active path's frames, in order: a scenario's, or all of them. A
+   * frame outside the active scenario is not listed. */
+  readonly frames: readonly Frame[];
+  /** The current frame object; read `.key` for its name. */
+  readonly frame: Frame;
+  /** The --wb-* theme values, by name without the prefix. */
+  readonly theme: Readonly<Record<string, string>>;
+  /** Whether the reader's theme is light or dark; <html> carries the same as
+   * data-wb-theme. */
+  readonly colorScheme: "light" | "dark";
+  /** The reader's prefers-reduced-motion setting, live. Skip motion the
+   * helpers do not manage when it is true. */
+  readonly reducedMotion: boolean;
+
+  /** Paint the first frame in yourself, in place of the default painter. Runs
+   * once, after the first frame is drawn: with motion when an agent writes
+   * the block, with `instant: true` on a cold load or under reduced motion,
+   * when it must leave everything in its end state. Painting ends when what
+   * it returns has finished. */
+  on(key: "paint", handler: (paint: PaintChange) => FrameResult): () => void;
+  /** Run when a frame shows; "*" runs on every frame, before frame-specific
+   * handlers, and again when reduced motion changes. Cancel earlier work when
+   * another frame shows. Returns an unsubscribe function. */
+  on(key: string, handler: (change: FrameChange) => FrameResult): () => void;
+  /** In a clip: run when the playhead crosses the marker playing forward, or
+   * lands on it after a jump (`instant: true`); "*" runs on every marker.
+   * What a marker sets must also be right when the reader jumps there.
+   * Returns an unsubscribe function. */
+  on(key: string, handler: (change: MarkerChange) => FrameResult): () => void;
+  /** element.animate that holds its end state, lands at the end on a jump, and
+   * skips motion under reduced motion. Give every keyframe its start value, and
+   * measure positions before starting one: a started animation already
+   * reports its transform. */
+  animate(
+    target: Element | string,
+    keyframes: Keyframe[] | PropertyIndexedKeyframes,
+    options?: number | KeyframeAnimationOptions,
+  ): Animation;
+  /** The frame's part of one anime.js timeline: it plays when the reader steps
+   * into the frame and lands at its end on a jump. A tween starts where the
+   * frames before it left the element, so write only where it goes. Add to it
+   * while the script first runs, not from a frame handler. "paint" is a
+   * timeline of its own that plays once, after the first frame is drawn, as
+   * the block paints in, in place of the default painter; it lands at its end
+   * otherwise. Numeric positions count from its start. */
+  timeline(key: string): FrameTimeline;
+  /** A clip's one timeline: build it while the script first runs and place
+   * every marker on it. With scenarios, call it once per scenario key, each
+   * a timeline of its own; one built without a key serves every scenario
+   * without its own. Throws in an animation. */
+  clip(scenario?: string): ClipTimeline;
+  /** A clip's markers as declared, each with `at` once placed. Empty in an
+   * animation. */
+  readonly markers: readonly Marker[];
+  /** The marker a clip's playhead last reached, if any. */
+  readonly marker: ReachedMarker | undefined;
+  /** anime.js v4, also the global `anime`: easings, stagger, utils. */
+  readonly anime: unknown;
+
+  /** A placeholder the whiteboard fills with the block's code peek by name.
+   * A peek is drawn over your HTML: do not draw or travel over it. It is about
+   * 40px of header plus 18px a line, up to about 400px. */
+  code(name: string): HTMLElement;
+  /** A placeholder for another block of this whiteboard, by id. */
+  block(id: string): HTMLElement;
+  /** Open the named code beside the whiteboard. An element with
+   * data-wb-open="name" does this when clicked, with no script. */
+  reveal(name: string): void;
+
+  /** Select the ordered path the host's controls step through, for a branch
+   * the drawing decides. Every key must be a declared frame; repeating the
+   * same path does nothing. Prefer `scenarios` on the block for paths the
+   * reader picks. */
+  setSequence(keys: readonly string[]): void;
+  /** Jump to a frame of the active path. */
+  goto(key: string): void;
+  next(): void;
+  prev(): void;
+
+  /** A grid of cards with edges and moving chips: the quickest way to draw a
+   * request flow or a few services whose notes change per frame. */
+  scene(options?: SceneOptions): Scene;
+  /** An SVG arrow between two elements that follows them as they move, for a
+   * hand-made layout the scene cannot express. */
+  arrow(from: CardRef, to: CardRef, options?: ArrowOptions): SVGGElement;
+  /** A dot, or a pill with a label, that travel() moves along arrows. */
+  token(options?: TokenOptions): HTMLElement;
+  /** Move a token along an arrow during a frame, at the arrow's live geometry.
+   * It waits at the head until the next frame unless `stay` is false. Trips append
+   * to the frame; `position: 0` starts trips together, a number of
+   * milliseconds sequences one after another. Declare trips while the script
+   * first runs, not from a frame handler. */
+  travel(
+    token: HTMLElement | string,
+    arrow: SVGGElement,
+    frame: string,
+    options?: TravelOptions,
+  ): void;
+  /** Removed: throws, saying how to rebuild the diagram. */
+  mermaid(...args: unknown[]): never;
+}
+
+export interface FrameTimeline {
+  /** Numeric positions count milliseconds from the frame's start; "<" starts
+   * at the previous call's end and "<<" at its beginning. */
+  add(
+    targets: unknown,
+    params: object,
+    position?: number | string,
+  ): FrameTimeline;
+  set(
+    targets: unknown,
+    params: object,
+    position?: number | string,
+  ): FrameTimeline;
+  call(callback: () => void, position?: number | string): FrameTimeline;
+}
+
+/** A clip's timeline. Numeric positions count milliseconds from its start;
+ * "<" starts at the previous call's end and "<<" at its beginning. */
+export interface ClipTimeline {
+  add(
+    targets: unknown,
+    params: object,
+    position?: number | string,
+  ): ClipTimeline;
+  set(
+    targets: unknown,
+    params: object,
+    position?: number | string,
+  ): ClipTimeline;
+  call(callback: () => void, position?: number | string): ClipTimeline;
+  /** Place a declared marker at the timeline's end so far, or at an anime.js
+   * position. Every marker must be placed once on each timeline. */
+  marker(key: string, position?: number | string): ClipTimeline;
+}
+
+export interface TravelOptions {
+  duration?: number;
+  ease?: string;
+  position?: number | string;
+  stay?: boolean;
+}
+
+/** A scene card, its id, or an element. In `whiteboard.arrow` and `travel`
+ * a string is a CSS selector (`"#api"`); in a scene's methods it is a card
+ * id. */
+export type CardRef = SceneCard | string | Element;
+
+/** 1-based column and row, with optional row and column spans: [1, 2, 1, 4] is
+ * row 2, four columns wide. */
+export type Cell = [
+  column: number,
+  row: number,
+  rowSpan?: number,
+  colSpan?: number,
+];
+
+export interface SceneOptions {
+  /** Declared columns; default 3. Three cards with short labels fit a row at
+   * the document's width; past four, use a second row. The scene keeps its
+   * columns at any width: a narrower block scrolls it sideways. */
+  columns?: number;
+  /** Where the scene goes; defaults to the animation's body. */
+  container?: string | HTMLElement;
+}
+
+export interface Scene {
+  /** A labeled card: a service, a process, an actor. */
+  actor(options: SceneCardOptions): SceneCard;
+  /** A card that holds items, e.g. a queue or a cache. */
+  store(options: SceneCardOptions): SceneStore;
+  /** A card holding a small table with a header row. */
+  table(options: SceneCardOptions & { columns: string[] }): SceneTable;
+  /** A cell holding a code peek by name. Span columns when the code needs
+   * width; a one-column peek clips long lines. */
+  peek(
+    name: string,
+    options: { at: Cell; enter?: string; exit?: string; only?: string[] },
+  ): HTMLElement;
+  /** A pill above the scene, e.g. a version; on() changes its text. */
+  badge(options: { text?: string; tone?: Tone }): HTMLElement;
+  /** A washed box behind the cards in its cells, titled in its corner: a
+   * boundary such as a service, a process or a layer. Declare it before or
+   * after its cards. */
+  group(options: SceneGroupOptions): HTMLElement;
+  /** A row under the scene saying what the cards' marks mean: one glyph,
+   * drawn like a card with the entry's marks, and a label each. Name only
+   * what the reader must decode. */
+  legend(entries: SceneLegendEntry[]): HTMLElement;
+  /** Change a card's note, or an item's or badge's text, or a tone, from this
+   * frame on, until a later frame changes it. Follows the active path. */
+  on(frame: string, part: CardRef, change: SceneChange): void;
+  /** A straight edge between two cards that follows them. It bows around
+   * cards in the way; keep the cells between linked cards empty. */
+  link(from: CardRef, to: CardRef, options?: SceneLinkOptions): SVGGElement;
+  /** A message from one card to another in a frame, drawing the edge if there
+   * is none. While the frame shows, the message is the edge's label and the
+   * edge takes the marker colour, however the frame was reached; stepping
+   * into the frame rides a chip from the sender that settles into the label.
+   * Keep labels to about 12 characters. */
+  send(
+    from: CardRef,
+    to: CardRef,
+    label: string,
+    frame: string,
+    options?: SceneSendOptions,
+  ): void;
+}
+
+export interface SceneCard {
+  readonly element: HTMLElement;
+  readonly id: string;
+}
+
+export interface SceneStore extends SceneCard {
+  /** A chip inside the store. */
+  item(label: string, options?: SceneItemOptions): HTMLElement;
+}
+
+export interface SceneTable extends SceneCard {
+  /** A row of cells, matching the table's columns. */
+  row(cells: string[], options?: SceneItemOptions): HTMLTableRowElement;
+}
+
+/** When a part shows: from `enter` on, until `exit`, or `only` in these frames.
+ * With a scenario, enter and exit follow its order; only matches keys. Hidden
+ * parts take no space. */
+interface Lifecycle {
+  enter?: string;
+  exit?: string;
+  only?: string[];
+}
+
+export interface SceneCardOptions extends Lifecycle {
+  /** Names the card for link, send and on. */
+  id: string;
+  at: Cell;
+  /** The first line; defaults to the id. */
+  title?: string;
+  /** The second line; on() changes it per frame. */
+  note?: string;
+  tone?: Tone;
+  /** What the card is, by silhouette; see Form. Default box. */
+  form?: Form;
+  /** The border's line; see Outline. Default solid. */
+  outline?: Outline;
+  /** The border's colour at rest; see Color. */
+  color?: Color;
+  /** What the change under review did to this part; see Change. */
+  change?: Change;
+  /** Frames during which the card is ringed. */
+  highlight?: string[];
+  /** The code the card opens when clicked: a name in the block's code. */
+  code?: string;
+}
+
+export interface SceneGroupOptions extends Lifecycle {
+  id: string;
+  /** The cells the group covers; its cards sit on its wash. */
+  at: Cell;
+  /** A caps title in its top-left corner, e.g. SEARCH SERVICE. */
+  title?: string;
+  /** The wash and title colour; see Color. Default a neutral well. */
+  color?: Color;
+}
+
+export interface SceneLegendEntry {
+  label: string;
+  form?: Form;
+  outline?: Outline;
+  color?: Color;
+  tone?: Tone;
+  change?: Change;
+}
+
+export interface SceneItemOptions extends Lifecycle {
+  tone?: Tone;
+}
+
+export interface SceneChange {
+  /** The card's note, or an item's or badge's text. `note` works too. */
+  text?: string;
+  /** "none" clears the tone back to the neutral surface. */
+  tone?: Tone | "none";
+}
+
+export interface SceneLinkOptions extends Lifecycle {
+  label?: string;
+  tone?: Tone;
+  /** Dashed means async: a reply, a stream, a background send. */
+  dashed?: boolean;
+  /** Default true; false for an undirected guide or relationship. */
+  arrowhead?: boolean;
+}
+
+export interface SceneSendOptions extends Lifecycle {
+  /** Colours the chip, and the edge and its label while the frame shows. */
+  tone?: Tone;
+}
+
+export interface ArrowOptions extends Lifecycle {
+  label?: string;
+  tone?: Tone;
+  dashed?: boolean;
+  /** Default true. */
+  arrowhead?: boolean;
+  /** Pixels the arrow bows to its left; negative bows right. Two arrows
+   * pointing at each other need the same sign to sit on opposite sides. */
+  bend?: number;
+  /** Frames during which the arrow is ringed. */
+  highlight?: string[];
+}
+
+export interface TokenOptions extends Lifecycle {
+  label?: string;
+  tone?: Tone;
+  /** Show it as a static marker where you place it (left and top; it centers
+   * itself), without travel(). Otherwise it stays hidden until it travels. */
+  visible?: boolean;
+}
+
+declare global {
+  const whiteboard: Whiteboard;
+}

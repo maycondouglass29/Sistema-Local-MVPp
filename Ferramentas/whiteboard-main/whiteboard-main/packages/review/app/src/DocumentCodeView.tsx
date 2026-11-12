@@ -1,0 +1,419 @@
+import { fontSize, leading, radius, space } from "@canvas/scale.stylex";
+import type {
+  ReviewDiffProgress,
+  ReviewDiffSide,
+  ReviewFindQuery,
+  ReviewPeekHandle,
+  ReviewPeekHeightMode,
+  ReviewPeekRange,
+  ReviewSourcePins,
+} from "@dev.fast/review-protocol";
+import { coverageProgress, coverageSources } from "@review/viewed-coverage";
+import * as stylex from "@stylexjs/stylex";
+import { useCallback, useLayoutEffect, useRef, useState } from "react";
+
+import { AskCodePins } from "./ask-code-pins";
+import { useCodeCommit } from "./code-commit";
+import { useReviewSession } from "./host/review-session";
+import { useReviewFindRegistration } from "./review-find";
+import { type ReviewLensView, useReviewLenses } from "./review-lenses";
+import { useOptionalReviewPanel } from "./review-panel";
+import { tokens } from "./tokens.stylex";
+import { useHydrated } from "./use-hydrated";
+
+const LINE_HEIGHT = 20;
+
+const MAX_VISIBLE_LINES = 18;
+
+const INLINE_HEADER_HEIGHT = 40;
+
+export function DocumentCodeView({
+  path,
+  title,
+  description,
+  side,
+  pins,
+  ranges,
+  heightMode,
+  countRanges,
+  active,
+  onFocus,
+  onOpen,
+  collapsed = false,
+  lenses: lensesOverride,
+  edgeToEdge = false,
+}: {
+  path: string;
+  title: string;
+  description?: string;
+  side: ReviewDiffSide;
+  /** Read at these pins instead of the review's. Such a view is outside
+   * the review's comparison, so it carries no viewed-coverage marks. */
+  pins?: ReviewSourcePins;
+  ranges: readonly ReviewPeekRange[];
+  heightMode: ReviewPeekHeightMode;
+  countRanges?: readonly ReviewPeekRange[];
+  active: boolean;
+  onFocus?: () => void;
+  onOpen?: () => void;
+  collapsed?: boolean;
+  lenses?: ReviewLensView;
+  /** Run across its column like the Diff panel, not as an inset card. */
+  edgeToEdge?: boolean;
+}) {
+  const session = useReviewSession();
+
+  const documentVisible = useOptionalReviewPanel(
+    (state) => state.view === "review",
+  );
+
+  const contextLenses = useReviewLenses();
+  const lenses = lensesOverride ?? contextLenses;
+  const markRef = useRef(contextLenses?.mark);
+  markRef.current = contextLenses?.mark;
+
+  const sources = (countRanges ?? ranges).map((range) => ({
+    file: path,
+    side: range.side ?? side,
+    fromLine: range.startLine,
+    toLine: range.endLine,
+  }));
+
+  const progress: ReviewDiffProgress = {
+    files: (pins ? [] : (lenses?.progress?.files ?? []))
+      .filter((file) => file.path === path || file.previousPath === path)
+      .map((file) => ({
+        path: file.path,
+        ...coverageProgress([file], sources),
+        viewedRanges: coverageSources(file),
+        changedRanges: coverageSources(file, file.changed),
+      })),
+  };
+
+  const progressRef = useRef(progress);
+  progressRef.current = progress;
+  const [container, setContainer] = useState<HTMLDivElement | null>(null);
+
+  const [shouldMount, setShouldMount] = useState(active);
+
+  // A host that renders static markup sizes the peek by its content, so a
+  // server render and the live editor agree without an estimate.
+  const sizedByHost = session.bridge.peeks.renderStatic !== undefined;
+
+  const [height, setHeight] = useState(() =>
+    estimatedHeight(ranges, heightMode),
+  );
+
+  const rangesKey = ranges
+    .map((range) => `${range.side ?? side}:${range.startLine}-${range.endLine}`)
+    .join(",");
+
+  const countRangesKey = JSON.stringify(countRanges);
+  const pinsKey = JSON.stringify(pins);
+  const commit = useCodeCommit(pins, side);
+  const commitRef = useRef(commit);
+  commitRef.current = commit;
+  const commitKey = JSON.stringify(commit ?? null);
+
+  const [error, setError] = useState<string | null>(null);
+  const handleRef = useRef<ReviewPeekHandle | null>(null);
+
+  const [askTarget, setAskTarget] = useState<ReviewPeekHandle | null>(null);
+
+  const creationFailedRef = useRef(false);
+  const latestFindQueryRef = useRef<ReviewFindQuery | null>(null);
+
+  const handleWaitersRef = useRef<
+    Array<(handle: ReviewPeekHandle | null) => void>
+  >([]);
+
+  const onFocusRef = useRef(onFocus);
+  onFocusRef.current = onFocus;
+  const handleFocus = useCallback(() => onFocusRef.current?.(), []);
+  const onOpenRef = useRef(onOpen);
+  onOpenRef.current = onOpen;
+  const handleOpen = useCallback(() => onOpenRef.current?.(), []);
+  const collapsedRef = useRef(collapsed);
+  collapsedRef.current = collapsed;
+  const inlineEditorFactory = session.bridge.peeks;
+  const inlineEditorSessionId = session.reviewId;
+  const reviewFind = useReviewFindRegistration();
+
+  // A server render and its hydration show the host's markup; create() then
+  // takes the container over.
+  const staticHtml = useHydrated()
+    ? undefined
+    : inlineEditorFactory.renderStatic?.({
+        path,
+        title,
+        side,
+        pins,
+        ranges,
+        heightMode,
+      });
+
+  const ensureEditor = useCallback(async () => {
+    if (handleRef.current) return handleRef.current;
+
+    if (creationFailedRef.current) return null;
+    setShouldMount(true);
+
+    return new Promise<ReviewPeekHandle | null>((resolve) => {
+      handleWaitersRef.current.push(resolve);
+    });
+  }, []);
+
+  const setFindQuery = useCallback(
+    async (query: ReviewFindQuery) => {
+      latestFindQueryRef.current = query;
+      const handle = handleRef.current;
+
+      if (handle) return handle.setFindQuery(query);
+
+      return inlineEditorFactory.find({ path, side, pins, ranges }, query);
+    },
+    [inlineEditorFactory, path, rangesKey, side, pinsKey],
+  );
+
+  const revealFindMatch = useCallback(
+    async (index: number) => {
+      const query = latestFindQueryRef.current;
+
+      if (!query) return;
+      const handle = await ensureEditor();
+
+      if (!handle) return;
+      await handle.setFindQuery(query);
+      handle.revealFindMatch(index);
+    },
+    [ensureEditor],
+  );
+
+  const clearFind = useCallback(() => {
+    latestFindQueryRef.current = null;
+    handleRef.current?.clearFind();
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!container || !reviewFind) return;
+
+    return reviewFind.register({
+      container,
+      setFindQuery,
+      revealFindMatch,
+      clearFind,
+      clearActiveFindMatch: () => handleRef.current?.clearActiveFindMatch(),
+      expand: () => {
+        container
+          .closest(".review-section--collapsed")
+          ?.dispatchEvent(new CustomEvent("review-section-expand"));
+      },
+    });
+  }, [clearFind, container, revealFindMatch, reviewFind, setFindQuery]);
+
+  useLayoutEffect(() => {
+    if (active) setShouldMount(true);
+  }, [active]);
+
+  useLayoutEffect(() => {
+    if (!container || shouldMount) return;
+
+    // jsdom and legacy hosts lack IntersectionObserver; mounting eagerly
+    // beats never mounting.
+    if (typeof IntersectionObserver === "undefined") {
+      setShouldMount(true);
+
+      return;
+    }
+
+    // Mount a viewport-margin early so scrolling never reveals an empty host.
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) setShouldMount(true);
+      },
+      { rootMargin: "600px 0px" },
+    );
+
+    observer.observe(container);
+
+    return () => observer.disconnect();
+  }, [container, shouldMount]);
+
+  useLayoutEffect(() => {
+    if (!container || !shouldMount) return;
+    setError(null);
+    creationFailedRef.current = false;
+    let handle: ReviewPeekHandle;
+
+    try {
+      handle = inlineEditorFactory.create({
+        progress: progressRef.current,
+        onSetViewed:
+          !pins && !lensesOverride && contextLenses
+            ? (ranges, viewed) => markRef.current?.(ranges, viewed)
+            : undefined,
+        container,
+        path,
+        title,
+        description,
+        side,
+        pins,
+        commit: commitRef.current,
+        ranges,
+        heightMode,
+        active,
+
+        countRanges,
+        onDidFocus: handleFocus,
+        onDidOpen: handleOpen,
+      });
+    } catch (caught) {
+      creationFailedRef.current = true;
+      setError(caught instanceof Error ? caught.message : String(caught));
+
+      for (const resolve of handleWaitersRef.current.splice(0)) resolve(null);
+
+      return;
+    }
+
+    handle.setCollapsed(collapsedRef.current);
+    handleRef.current = handle;
+    setAskTarget(handle);
+
+    for (const resolve of handleWaitersRef.current.splice(0)) resolve(handle);
+    setHeight(handle.height);
+    const findQuery = latestFindQueryRef.current;
+
+    if (findQuery) void handle.setFindQuery(findQuery);
+    const heightSubscription = handle.onDidChangeHeight(setHeight);
+    const errorSubscription = handle.onDidError(setError);
+
+    return () => {
+      if (handleRef.current === handle) handleRef.current = null;
+      setAskTarget(null);
+      handle.clearFind();
+      errorSubscription.dispose();
+      heightSubscription.dispose();
+      handle.dispose();
+    };
+  }, [
+    container,
+    description,
+    countRangesKey,
+    handleFocus,
+    handleOpen,
+    heightMode,
+    inlineEditorFactory,
+    inlineEditorSessionId,
+    path,
+    pinsKey,
+    rangesKey,
+    shouldMount,
+    side,
+    title,
+  ]);
+
+  useLayoutEffect(() => {
+    handleRef.current?.setActive(active);
+  }, [active]);
+
+  useLayoutEffect(() => {
+    handleRef.current?.setCommit?.(commitRef.current);
+  }, [commitKey]);
+
+  useLayoutEffect(() => {
+    handleRef.current?.setProgress?.(progressRef.current);
+  }, [lenses?.progress, countRangesKey, rangesKey, path, side]);
+
+  useLayoutEffect(() => {
+    handleRef.current?.setCollapsed(collapsed);
+  }, [collapsed]);
+
+  useLayoutEffect(() => {
+    if (documentVisible) handleRef.current?.setCollapsed(collapsedRef.current);
+  }, [documentVisible]);
+
+  useLayoutEffect(
+    () => () => {
+      for (const resolve of handleWaitersRef.current.splice(0)) resolve(null);
+    },
+    [],
+  );
+
+  return (
+    <>
+      <div
+        ref={setContainer}
+        {...stylex.props(
+          styles.editor,
+          edgeToEdge && styles.edgeToEdge,
+          sizedByHost && styles.sizedByHost,
+        )}
+        data-review-inline-editor={path}
+        data-tour-target="code-editor"
+        data-review-inline-editor-active={active ? "true" : "false"}
+        style={sizedByHost ? undefined : { height }}
+        {...(staticHtml !== undefined && {
+          dangerouslySetInnerHTML: { __html: staticHtml },
+        })}
+      />
+      <AskCodePins handle={askTarget} />
+      {error ? (
+        <div {...stylex.props(styles.error)} title={error}>
+          Inline preview unavailable
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function estimatedHeight(
+  ranges: readonly ReviewPeekRange[],
+  heightMode: ReviewPeekHeightMode,
+): number {
+  const lineCount = ranges.reduce((total, range) => {
+    const contextBefore = Math.min(3, Math.max(0, range.startLine - 1));
+
+    return total + range.endLine - range.startLine + 1 + contextBefore + 3;
+  }, 0);
+
+  const lines =
+    heightMode === "content"
+      ? lineCount
+      : Math.min(MAX_VISIBLE_LINES, lineCount);
+
+  return Math.max(1, lines) * LINE_HEIGHT + INLINE_HEADER_HEIGHT;
+}
+
+const styles = stylex.create({
+  // Skipping offscreen rendering would collapse a peek with no set height.
+  sizedByHost: { contentVisibility: "visible" },
+  editor: {
+    position: "relative",
+    width: "100%",
+    minWidth: 0,
+    overflow: "hidden",
+    contentVisibility: "auto",
+    borderWidth: "1px",
+    borderStyle: "solid",
+    borderColor: tokens.rule,
+    borderRadius: radius.control,
+    backgroundColor: tokens.bg,
+  },
+  // Square, with rules above and below. The editor's header and code read
+  // --review-code-inset to sit 16px in from the column edge.
+  edgeToEdge: {
+    borderWidth: "1px 0",
+    borderRadius: 0,
+    "--review-code-inset": "6px",
+  },
+  error: {
+    display: "flex",
+    alignItems: "center",
+    padding: `0 ${space.s10}`,
+    borderColor: tokens.ruleSoft,
+    backgroundColor: tokens.surface,
+    color: tokens.inkFaint,
+    font: `${fontSize.small}/${leading.none} ${tokens.chromeFont}`,
+  },
+});

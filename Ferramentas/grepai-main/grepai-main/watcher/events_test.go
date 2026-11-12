@@ -1,0 +1,484 @@
+package watcher
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"syscall"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
+	"github.com/yoanbernabeu/grepai/indexer"
+)
+
+func TestCreateDirectoryNamedLikeSourceRegistersDescendants(t *testing.T) {
+	root := t.TempDir()
+	w := newTestWatcher(t, root)
+	defer w.Close()
+	generated := filepath.Join(root, "generated.go")
+	child := filepath.Join(generated, "child")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(child, "main.go"), []byte("package main"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	added := make(map[string]bool)
+	w.addWatch = func(path string) error { added[path] = true; return nil }
+	if err := w.handleEvent(fsnotify.Event{Name: generated, Op: fsnotify.Create}); err != nil {
+		t.Fatalf("handleEvent() error = %v", err)
+	}
+	if !added[generated] || !added[child] {
+		t.Fatalf("registered paths = %#v, want generated.go and child directories", added)
+	}
+}
+
+func TestRuntimeVanishedDirectoryAddENOENTIsIgnored(t *testing.T) {
+	root := t.TempDir()
+	w := newTestWatcher(t, root)
+	created := filepath.Join(root, "vanished")
+	if err := os.Mkdir(created, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w.addWatch = func(string) error { return syscall.ENOENT }
+	if err := w.handleEvent(fsnotify.Event{Name: created, Op: fsnotify.Create}); err != nil {
+		t.Fatalf("handleEvent() error = %v", err)
+	}
+}
+
+func TestCreateStatFailuresPublishFatal(t *testing.T) {
+	for _, cause := range []error{syscall.EACCES, syscall.EIO} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			root := t.TempDir()
+			w := newTestWatcher(t, root)
+			w.statPath = func(string) (fs.FileInfo, error) { return nil, cause }
+			events := make(chan fsnotify.Event)
+			w.backendEvents, w.backendErrors = events, make(chan error)
+			if err := w.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			events <- fsnotify.Event{Name: filepath.Join(root, "newdir"), Op: fsnotify.Create}
+			err := <-w.Errors()
+			var fatalErr *FatalError
+			if !errors.As(err, &fatalErr) || !errors.Is(err, cause) {
+				t.Fatalf("Errors() = %T %v, want FatalError preserving %v", err, err, cause)
+			}
+			<-w.processingDone
+			_ = w.Close()
+		})
+	}
+}
+
+func TestCreateStatENOENTIsIgnored(t *testing.T) {
+	root := t.TempDir()
+	w := newTestWatcher(t, root)
+	w.statPath = func(string) (fs.FileInfo, error) { return nil, syscall.ENOENT }
+	if err := w.handleEvent(fsnotify.Event{Name: filepath.Join(root, "gone"), Op: fsnotify.Create}); err != nil {
+		t.Fatalf("handleEvent() error = %v", err)
+	}
+	_ = w.Close()
+}
+
+func TestRelativePathFailurePublishesFatal(t *testing.T) {
+	root := t.TempDir()
+	w := newTestWatcher(t, root)
+	events := make(chan fsnotify.Event)
+	w.backendEvents, w.backendErrors = events, make(chan error)
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	w.relPath = func(string, string) (string, error) { return "", syscall.EIO }
+	events <- fsnotify.Event{Name: filepath.Join(root, "new.go"), Op: fsnotify.Create}
+	err := <-w.Errors()
+	var fatalErr *FatalError
+	if !errors.As(err, &fatalErr) || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("Errors() = %T %v, want EIO FatalError", err, err)
+	}
+	<-w.processingDone
+	_ = w.Close()
+}
+
+func TestFullEventQueueAppliesBackpressure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := &Watcher{
+			events:  make(chan FileEvent, 100),
+			errors:  make(chan error, 1),
+			done:    make(chan struct{}),
+			pending: make(map[string]FileEvent),
+		}
+		defer w.Abort()
+		for i := 0; i <= cap(w.events); i++ {
+			path := string(rune('a' + i))
+			w.pending[path] = FileEvent{Type: EventModify, Path: path}
+		}
+		total := len(w.pending)
+		flushed := make(chan struct{})
+		go func() { w.flush(); close(flushed) }()
+		synctest.Wait()
+		if got := len(w.events); got != cap(w.events) {
+			t.Fatalf("queue holds %d events, want %d", got, cap(w.events))
+		}
+		select {
+		case <-flushed:
+			t.Fatal("flush returned while the queue was full; want it to wait")
+		case err := <-w.Errors():
+			t.Fatalf("full queue must not be fatal, got %v", err)
+		default:
+		}
+		deadline := time.NewTimer(2 * time.Second)
+		defer deadline.Stop()
+		for i := 0; i < total; i++ {
+			select {
+			case <-w.Events():
+			case err := <-w.Errors():
+				t.Fatalf("full queue must not be fatal, got %v", err)
+			case <-deadline.C:
+				t.Fatalf("only received %d of %d events", i, total)
+			}
+		}
+		select {
+		case <-flushed:
+		case <-deadline.C:
+			t.Fatal("flush did not finish after the queue was drained")
+		}
+		select {
+		case err := <-w.Errors():
+			t.Fatalf("full queue must not be fatal, got %v", err)
+		default:
+		}
+	})
+}
+
+// TestConcurrentFlushesPreserveEventOrder checks that while the queue is full,
+// a newer flush cannot deliver its events before an older, still-blocked flush:
+// otherwise a stale delete could land after a re-create and drop a file that
+// exists from the index.
+func TestConcurrentFlushesPreserveEventOrder(t *testing.T) {
+	for trial := 0; trial < 50; trial++ {
+		w := &Watcher{
+			events:  make(chan FileEvent, 100),
+			errors:  make(chan error, 1),
+			done:    make(chan struct{}),
+			pending: make(map[string]FileEvent),
+		}
+		for i := 0; i < 150; i++ {
+			path := fmt.Sprintf("file%d", i)
+			w.pending[path] = FileEvent{Type: EventModify, Path: path}
+		}
+		w.pending["target"] = FileEvent{Type: EventDelete, Path: "target"}
+		total := len(w.pending) + 1
+
+		go w.flush()
+		for len(w.events) < cap(w.events) {
+			time.Sleep(time.Microsecond)
+		}
+		w.pendingMu.Lock()
+		w.pending["target"] = FileEvent{Type: EventCreate, Path: "target"}
+		w.pendingMu.Unlock()
+		go w.flush()
+		time.Sleep(time.Millisecond)
+
+		deadline := time.NewTimer(2 * time.Second)
+		var last EventType
+		for i := 0; i < total; i++ {
+			select {
+			case event := <-w.Events():
+				if event.Path == "target" {
+					last = event.Type
+				}
+			case <-deadline.C:
+				t.Fatalf("trial %d: only received %d of %d events", trial, i, total)
+			}
+		}
+		deadline.Stop()
+		close(w.done)
+		if last != EventCreate {
+			t.Fatalf("trial %d: last event for target = %v, want create", trial, last)
+		}
+	}
+}
+
+func TestUnexpectedBackendChannelClosureIsFatal(t *testing.T) {
+	setups := []struct {
+		name string
+		set  func(*Watcher) func()
+	}{
+		{"events", func(w *Watcher) func() {
+			ch := make(chan fsnotify.Event)
+			w.backendEvents, w.backendErrors = ch, make(chan error)
+			return func() { close(ch) }
+		}},
+		{"errors", func(w *Watcher) func() {
+			ch := make(chan error)
+			w.backendEvents, w.backendErrors = make(chan fsnotify.Event), ch
+			return func() { close(ch) }
+		}},
+	}
+	for _, tc := range setups {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newTestWatcher(t, t.TempDir())
+			closeBackend := tc.set(w)
+			if err := w.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			closeBackend()
+			var fatalErr *FatalError
+			if err := <-w.Errors(); !errors.As(err, &fatalErr) {
+				t.Fatalf("Errors() = %T %v", err, err)
+			}
+			<-w.processingDone
+			_ = w.Close()
+		})
+	}
+}
+
+func TestBackendClosureAfterContextCancellationIsClean(t *testing.T) {
+	w := newTestWatcher(t, t.TempDir())
+	events := make(chan fsnotify.Event)
+	w.backendEvents, w.backendErrors = events, make(chan error)
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := w.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	<-w.processingDone
+	close(events)
+	select {
+	case err := <-w.Errors():
+		t.Fatalf("Errors() = %v", err)
+	default:
+	}
+	_ = w.Close()
+}
+
+func TestUnderlyingFSNotifyErrorPublishesFatalAndStops(t *testing.T) {
+	w := newTestWatcher(t, t.TempDir())
+	backendErrors := make(chan error)
+	w.backendEvents, w.backendErrors = make(chan fsnotify.Event), backendErrors
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	backendErrors <- fsnotify.ErrEventOverflow
+	err := <-w.Errors()
+	var fatalErr *FatalError
+	if !errors.As(err, &fatalErr) || !errors.Is(err, fsnotify.ErrEventOverflow) {
+		t.Fatalf("Errors() = %T %v, want overflow FatalError", err, err)
+	}
+	<-w.processingDone
+}
+
+func TestReadyRefusesAlreadyPublishedFatal(t *testing.T) {
+	w := newTestWatcher(t, t.TempDir())
+	defer w.Close()
+	fatal := &FatalError{Operation: "watch", Cause: syscall.ENOSPC}
+	w.publishFatal(fatal)
+	called := false
+	err := w.Ready(func() error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, fatal) {
+		t.Fatalf("Ready() error = %v, want fatal error", err)
+	}
+	if called {
+		t.Fatal("Ready() invoked callback after fatal publication")
+	}
+}
+
+// Event paths must be slash-separated like the indexed paths, otherwise
+// deletes and renames never match the stored document on Windows.
+func TestEventPathsAreSlashSeparated(t *testing.T) {
+	root := t.TempDir()
+	w := newTestWatcher(t, root)
+	events := make(chan fsnotify.Event)
+	w.backendEvents, w.backendErrors = events, make(chan error)
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+
+	events <- fsnotify.Event{Name: filepath.Join(root, "sub", "gone.go"), Op: fsnotify.Remove}
+	select {
+	case ev := <-w.Events():
+		if ev.Path != "sub/gone.go" {
+			t.Fatalf("event path = %q, want %q", ev.Path, "sub/gone.go")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the delete event")
+	}
+}
+
+// Removing a watched directory emits one directory event (#310).
+func TestRemovedWatchedDirectoryEmitsDirEvent(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "pkg", "inner"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w := newTestWatcher(t, root)
+	events := make(chan fsnotify.Event)
+	w.backendEvents, w.backendErrors = events, make(chan error)
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+
+	events <- fsnotify.Event{Name: filepath.Join(root, "pkg"), Op: fsnotify.Remove}
+	select {
+	case ev := <-w.Events():
+		if !ev.Dir || ev.Path != "pkg" || ev.Type != EventDelete {
+			t.Fatalf("event = %+v, want a directory delete of pkg", ev)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the directory event")
+	}
+	if w.forgetWatchedDir("pkg/inner") {
+		t.Fatal("subdirectories of a removed directory must be forgotten too")
+	}
+}
+
+// A directory moved into the project produces create events for the
+// supported files it already holds (#310).
+func TestNewDirectoryEmitsCreateForExistingFiles(t *testing.T) {
+	root := t.TempDir()
+	w := newTestWatcher(t, root)
+	events := make(chan fsnotify.Event)
+	w.backendEvents, w.backendErrors = events, make(chan error)
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+
+	moved := filepath.Join(root, "imported")
+	if err := os.MkdirAll(filepath.Join(moved, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"a.go", "sub/b.py", "notes.bin"} {
+		if err := os.WriteFile(filepath.Join(moved, f), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events <- fsnotify.Event{Name: moved, Op: fsnotify.Create}
+
+	got := map[string]bool{}
+	timeout := time.After(5 * time.Second)
+	for len(got) < 2 {
+		select {
+		case ev := <-w.Events():
+			if ev.Type != EventCreate {
+				t.Fatalf("unexpected event %+v", ev)
+			}
+			got[ev.Path] = true
+		case <-timeout:
+			t.Fatalf("timed out; got %v", got)
+		}
+	}
+	if !got["imported/a.go"] || !got["imported/sub/b.py"] {
+		t.Fatalf("missing create events: %v", got)
+	}
+}
+
+// Dotfiles follow the same rules as the scanner: only ignore patterns
+// exclude them, so live edits keep their index entries fresh (#367).
+func TestDotfileEventsFollowIgnoreRules(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		".gitignore":    ".env.local\n",
+		".env":          "APP_ENV=dev\n",
+		".env.local":    "SECRET=x\n",
+		".eslintrc.yml": "root: true\n",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := newTestWatcher(t, root)
+	defer w.Close()
+	w.debounceMs = int(time.Hour / time.Millisecond)
+
+	for _, name := range []string{".env", ".env.local", ".eslintrc.yml"} {
+		if err := w.handleEvent(fsnotify.Event{Name: filepath.Join(root, name), Op: fsnotify.Write}); err != nil {
+			t.Fatalf("handleEvent(%s) error = %v", name, err)
+		}
+	}
+
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+	for _, name := range []string{".env", ".eslintrc.yml"} {
+		if _, ok := w.pending[name]; !ok {
+			t.Errorf("%s modification was dropped, want it queued", name)
+		}
+	}
+	if _, ok := w.pending[".env.local"]; ok {
+		t.Error(".env.local is gitignored and must not be queued")
+	}
+}
+
+func TestCreatedDotDirectoryIsWatchedAndIndexed(t *testing.T) {
+	root := t.TempDir()
+	w := newTestWatcher(t, root)
+	defer w.Close()
+	w.debounceMs = int(time.Hour / time.Millisecond)
+
+	dotDir := filepath.Join(root, ".github")
+	workflows := filepath.Join(dotDir, "workflows")
+	if err := os.MkdirAll(workflows, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workflows, "ci.yml"), []byte("on: push\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	added := make(map[string]bool)
+	w.addWatch = func(path string) error { added[path] = true; return nil }
+
+	if err := w.handleEvent(fsnotify.Event{Name: dotDir, Op: fsnotify.Create}); err != nil {
+		t.Fatalf("handleEvent() error = %v", err)
+	}
+	if !added[dotDir] || !added[workflows] {
+		t.Fatalf("registered paths = %#v, want .github and .github/workflows", added)
+	}
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+	if _, ok := w.pending[".github/workflows/ci.yml"]; !ok {
+		t.Fatalf("pending = %#v, want .github/workflows/ci.yml queued", w.pending)
+	}
+}
+
+// Custom extensions indexed by the scanner must also produce watch events.
+func TestCustomExtensionEventsFollowScanner(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"script.tengo", "main.go", "notes.unknown"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ignore, err := indexer.NewIgnoreMatcher(root, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := indexer.NewScanner(root, ignore).WithCustomExtensions([]string{".tengo"})
+
+	w := newTestWatcher(t, root).WithSupportedExtensions(scanner.IsSupported)
+	defer w.Close()
+	w.debounceMs = int(time.Hour / time.Millisecond)
+
+	for _, name := range []string{"script.tengo", "main.go", "notes.unknown"} {
+		if err := w.handleEvent(fsnotify.Event{Name: filepath.Join(root, name), Op: fsnotify.Write}); err != nil {
+			t.Fatalf("handleEvent(%s) error = %v", name, err)
+		}
+	}
+
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+	for name, want := range map[string]bool{"script.tengo": true, "main.go": true, "notes.unknown": false} {
+		if _, got := w.pending[name]; got != want {
+			t.Errorf("%s queued = %v, want %v", name, got, want)
+		}
+	}
+}

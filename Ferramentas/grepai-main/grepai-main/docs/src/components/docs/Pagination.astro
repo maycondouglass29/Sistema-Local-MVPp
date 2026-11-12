@@ -1,0 +1,27 @@
+---
+import { findPrevNext } from '../../utils/navigation';
+
+interface Props {
+  currentSlug?: string;
+}
+
+const { currentSlug = '' } = Astro.props;
+const { prev, next } = findPrevNext(currentSlug);
+---
+
+{(prev || next) && (
+  <nav class="grid grid-cols-2 gap-4 mt-16 pt-8 border-t border-rule" aria-label="Previous and next pages">
+    {prev ? (
+      <a href={prev.href} class="group block p-4 rounded-md border border-rule hover:border-ink-muted transition-colors min-w-0">
+        <span class="block text-xs text-ink-muted">Previous</span>
+        <span class="block mt-1 font-medium text-ink truncate group-hover:underline group-hover:decoration-gold group-hover:underline-offset-4">{prev.label}</span>
+      </a>
+    ) : <div></div>}
+    {next ? (
+      <a href={next.href} class="group block p-4 rounded-md border border-rule hover:border-ink-muted transition-colors text-right min-w-0">
+        <span class="block text-xs text-ink-muted">Next</span>
+        <span class="block mt-1 font-medium text-ink truncate group-hover:underline group-hover:decoration-gold group-hover:underline-offset-4">{next.label}</span>
+      </a>
+    ) : <div></div>}
+  </nav>
+)}

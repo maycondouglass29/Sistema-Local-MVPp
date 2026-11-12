@@ -1,0 +1,877 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+	"github.com/yoanbernabeu/grepai/config"
+	"github.com/yoanbernabeu/grepai/embedder"
+	"github.com/yoanbernabeu/grepai/internal/toon"
+	"github.com/yoanbernabeu/grepai/rpg"
+	gstats "github.com/yoanbernabeu/grepai/stats"
+	"github.com/yoanbernabeu/grepai/trace"
+)
+
+// traceExtractionMode is the only symbol extraction mode the index uses.
+// The --mode flag is kept for compatibility but deprecated: it never changed
+// extraction, which always runs the regex ("fast") extractor.
+const traceExtractionMode = "fast"
+
+var (
+	traceMode      string
+	traceDepth     int
+	traceJSON      bool
+	traceTOON      bool
+	traceCompact   bool
+	traceUI        bool
+	traceWorkspace string
+	traceProject   string
+)
+
+var runTraceActionCardUIRunner = runTraceActionCardUI
+
+var traceCmd = &cobra.Command{
+	Use:   "trace <subcommand> <symbol>",
+	Short: "Trace symbol callers and callees",
+	Long: `Trace command helps you understand code dependencies by finding:
+- callers: functions that call the specified symbol
+- callees: functions that the specified symbol calls
+- graph: full call graph visualization
+
+Examples:
+  grepai trace callers "Login"
+  grepai trace callees "HandleRequest" --mode precise
+  grepai trace graph "ProcessOrder" --depth 3 --json`,
+}
+
+var traceCallersCmd = &cobra.Command{
+	Use:   "callers <symbol>",
+	Short: "Find all functions that call the specified symbol",
+	Long: `Find all functions that call the specified symbol.
+
+Examples:
+  grepai trace callers "Login"
+  grepai trace callers "HandleRequest" --json
+  grepai trace callers "ProcessOrder" --mode precise`,
+	Args: cobra.ExactArgs(1),
+	RunE: runTraceCallers,
+}
+
+var traceCalleesCmd = &cobra.Command{
+	Use:   "callees <symbol>",
+	Short: "Find all functions called by the specified symbol",
+	Long: `Find all functions called by the specified symbol.
+
+Examples:
+  grepai trace callees "Login"
+  grepai trace callees "HandleRequest" --json`,
+	Args: cobra.ExactArgs(1),
+	RunE: runTraceCallees,
+}
+
+var traceGraphCmd = &cobra.Command{
+	Use:   "graph <symbol>",
+	Short: "Build a call graph around the specified symbol",
+	Long: `Build a call graph showing callers and callees around a symbol.
+
+Examples:
+  grepai trace graph "Login" --depth 2
+  grepai trace graph "HandleRequest" --depth 3 --json`,
+	Args: cobra.ExactArgs(1),
+	RunE: runTraceGraph,
+}
+
+func init() {
+	// Add flags to all trace subcommands
+	for _, cmd := range []*cobra.Command{traceCallersCmd, traceCalleesCmd, traceGraphCmd} {
+		cmd.Flags().StringVarP(&traceMode, "mode", "m", traceExtractionMode, "Deprecated, has no effect")
+		_ = cmd.Flags().MarkDeprecated("mode", "it has no effect: symbols are always extracted in fast (regex) mode")
+		cmd.Flags().BoolVar(&traceJSON, "json", false, "Output results in JSON format")
+		cmd.Flags().BoolVarP(&traceTOON, "toon", "t", false, "Output results in TOON format (token-efficient for AI agents)")
+		cmd.Flags().BoolVarP(&traceCompact, "compact", "c", false, "Output minimal format without call-site context (requires --json or --toon)")
+		cmd.Flags().BoolVar(&traceUI, "ui", false, "Show interactive UI output")
+		cmd.MarkFlagsMutuallyExclusive("json", "toon")
+		cmd.MarkFlagsMutuallyExclusive("json", "ui")
+		cmd.MarkFlagsMutuallyExclusive("toon", "ui")
+		cmd.Flags().StringVar(&traceWorkspace, "workspace", "", "Workspace name for cross-project trace")
+		cmd.Flags().StringVar(&traceProject, "project", "", "Project name within workspace (requires --workspace)")
+	}
+	traceGraphCmd.Flags().IntVarP(&traceDepth, "depth", "d", 2, "Maximum depth for graph traversal")
+
+	traceCmd.AddCommand(traceCallersCmd)
+	traceCmd.AddCommand(traceCalleesCmd)
+	traceCmd.AddCommand(traceGraphCmd)
+
+	rootCmd.AddCommand(traceCmd)
+}
+
+func validateTraceOutputFlags() error {
+	if traceCompact && !traceJSON && !traceTOON {
+		return fmt.Errorf("--compact flag requires --json or --toon flag")
+	}
+	return nil
+}
+
+func runTraceCallers(cmd *cobra.Command, args []string) error {
+	symbolName := args[0]
+	ctx := context.Background()
+
+	if err := validateTraceOutputFlags(); err != nil {
+		return err
+	}
+
+	if traceProject != "" && traceWorkspace == "" {
+		return fmt.Errorf("--project requires --workspace")
+	}
+
+	// Workspace mode: aggregate across projects
+	if traceWorkspace != "" {
+		stores, err := trace.LoadWorkspaceSymbolStores(ctx, traceWorkspace, traceProject)
+		if err != nil {
+			return err
+		}
+		defer trace.CloseSymbolStores(stores)
+
+		result := trace.TraceResult{Query: symbolName, Mode: traceExtractionMode}
+		for _, ss := range stores {
+			refs, err := ss.LookupCallers(ctx, symbolName)
+			if err != nil {
+				log.Printf("Warning: failed to lookup callers of %q: %v", symbolName, err)
+			}
+			symbols, err := ss.LookupSymbol(ctx, symbolName)
+			if err != nil {
+				log.Printf("Warning: failed to lookup symbol %q: %v", symbolName, err)
+			}
+			if len(symbols) > 0 && result.Symbol == nil {
+				result.Symbol = trace.PickTargetSymbol(symbols, refs)
+			}
+			for _, ref := range refs {
+				callerSym := trace.ResolveCallerSymbol(ctx, ss, ref)
+				result.Callers = append(result.Callers, trace.CallerInfo{
+					Symbol: callerSym,
+					CallSite: trace.CallSite{
+						File:    ref.File,
+						Line:    ref.Line,
+						Context: ref.Context,
+					},
+				})
+			}
+		}
+
+		if result.Symbol == nil {
+			return outputTraceResult(result, traceViewCallers)
+		}
+
+		return outputTraceResult(result, traceViewCallers)
+	}
+
+	projectRoot, err := config.FindProjectRoot()
+	if err != nil {
+		return err
+	}
+
+	// Initialize symbol store
+	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRoot))
+	if err := symbolStore.Load(ctx); err != nil {
+		if traceUI {
+			return showTraceActionCardUIError(
+				fmt.Errorf("failed to load symbol index: %w", err),
+				"Trace unavailable",
+				fmt.Sprintf("Failed to load symbol index: %v", err),
+				"Run `grepai watch` first to build the index",
+			)
+		}
+		return fmt.Errorf("failed to load symbol index: %w", err)
+	}
+	defer symbolStore.Close()
+
+	// Check if index exists
+	stats, err := symbolStore.GetStats(ctx)
+	if err != nil || stats.TotalSymbols == 0 {
+		if traceUI {
+			return showTraceActionCardUIError(
+				fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index"),
+				"Symbol index is empty",
+				"Trace requires symbols extracted by the watcher.",
+				"Run `grepai watch`",
+			)
+		}
+		return fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index")
+	}
+
+	// Lookup symbol
+	symbols, err := symbolStore.LookupSymbol(ctx, symbolName)
+	if err != nil {
+		return fmt.Errorf("failed to lookup symbol: %w", err)
+	}
+
+	if len(symbols) == 0 {
+		emptyResult := trace.TraceResult{Query: symbolName, Mode: traceExtractionMode}
+		return outputTraceResult(emptyResult, traceViewCallers)
+	}
+
+	// Find callers
+	refs, err := symbolStore.LookupCallers(ctx, symbolName)
+	if err != nil {
+		return fmt.Errorf("failed to lookup callers: %w", err)
+	}
+
+	target := trace.PickTargetSymbol(symbols, refs)
+
+	result := trace.TraceResult{
+		Query:  symbolName,
+		Mode:   traceExtractionMode,
+		Symbol: target,
+	}
+
+	// Convert refs to CallerInfo
+	for _, ref := range refs {
+		callerSym := trace.ResolveCallerSymbol(ctx, symbolStore, ref)
+		result.Callers = append(result.Callers, trace.CallerInfo{
+			Symbol: callerSym,
+			CallSite: trace.CallSite{
+				File:    ref.File,
+				Line:    ref.Line,
+				Context: ref.Context,
+			},
+		})
+	}
+
+	// Enrich with RPG feature paths
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		log.Printf("Warning: failed to load config for RPG enrichment: %v", err)
+	}
+	if cfg != nil {
+		enrichTraceWithRPG(projectRoot, cfg, &result)
+	}
+
+	return outputAndRecord(result, traceViewCallers, projectRoot, gstats.TraceCallers, len(result.Callers))
+}
+
+func runTraceCallees(cmd *cobra.Command, args []string) error {
+	symbolName := args[0]
+	ctx := context.Background()
+
+	if err := validateTraceOutputFlags(); err != nil {
+		return err
+	}
+
+	if traceProject != "" && traceWorkspace == "" {
+		return fmt.Errorf("--project requires --workspace")
+	}
+
+	// Workspace mode: aggregate across projects
+	if traceWorkspace != "" {
+		stores, err := trace.LoadWorkspaceSymbolStores(ctx, traceWorkspace, traceProject)
+		if err != nil {
+			return err
+		}
+		defer trace.CloseSymbolStores(stores)
+
+		result := trace.TraceResult{Query: symbolName, Mode: traceExtractionMode}
+		for _, ss := range stores {
+			symbols, err := ss.LookupSymbol(ctx, symbolName)
+			if err != nil {
+				log.Printf("Warning: failed to lookup symbol %q: %v", symbolName, err)
+			}
+			if len(symbols) > 0 && result.Symbol == nil {
+				result.Symbol = &symbols[0]
+			}
+			if len(symbols) > 0 {
+				refs, err := ss.LookupCallees(ctx, symbolName, symbols[0].File)
+				if err != nil {
+					log.Printf("Warning: failed to lookup callees of %q: %v", symbolName, err)
+				}
+				for _, ref := range refs {
+					calleeSyms, err := ss.LookupSymbol(ctx, ref.SymbolName)
+					if err != nil {
+						log.Printf("Warning: failed to lookup callee symbol %q: %v", ref.SymbolName, err)
+					}
+					var calleeSym trace.Symbol
+					if len(calleeSyms) > 0 {
+						calleeSym = calleeSyms[0]
+					} else {
+						calleeSym = trace.Symbol{Name: ref.SymbolName}
+					}
+					result.Callees = append(result.Callees, trace.CalleeInfo{
+						Symbol: calleeSym,
+						CallSite: trace.CallSite{
+							File:    ref.File,
+							Line:    ref.Line,
+							Context: ref.Context,
+						},
+					})
+				}
+			}
+		}
+
+		if result.Symbol == nil {
+			return outputTraceResult(result, traceViewCallees)
+		}
+
+		return outputTraceResult(result, traceViewCallees)
+	}
+
+	projectRoot, err := config.FindProjectRoot()
+	if err != nil {
+		return err
+	}
+
+	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRoot))
+	if err := symbolStore.Load(ctx); err != nil {
+		if traceUI {
+			return showTraceActionCardUIError(
+				fmt.Errorf("failed to load symbol index: %w", err),
+				"Trace unavailable",
+				fmt.Sprintf("Failed to load symbol index: %v", err),
+				"Run `grepai watch` first to build the index",
+			)
+		}
+		return fmt.Errorf("failed to load symbol index: %w", err)
+	}
+	defer symbolStore.Close()
+
+	// Check if index exists
+	stats, err := symbolStore.GetStats(ctx)
+	if err != nil || stats.TotalSymbols == 0 {
+		if traceUI {
+			return showTraceActionCardUIError(
+				fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index"),
+				"Symbol index is empty",
+				"Trace requires symbols extracted by the watcher.",
+				"Run `grepai watch`",
+			)
+		}
+		return fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index")
+	}
+
+	// Lookup symbol
+	symbols, err := symbolStore.LookupSymbol(ctx, symbolName)
+	if err != nil {
+		return fmt.Errorf("failed to lookup symbol: %w", err)
+	}
+
+	if len(symbols) == 0 {
+		emptyResult := trace.TraceResult{Query: symbolName, Mode: traceExtractionMode}
+		return outputTraceResult(emptyResult, traceViewCallees)
+	}
+
+	// Find callees
+	refs, err := symbolStore.LookupCallees(ctx, symbolName, symbols[0].File)
+	if err != nil {
+		return fmt.Errorf("failed to lookup callees: %w", err)
+	}
+
+	result := trace.TraceResult{
+		Query:  symbolName,
+		Mode:   traceExtractionMode,
+		Symbol: &symbols[0],
+	}
+
+	for _, ref := range refs {
+		calleeSyms, err := symbolStore.LookupSymbol(ctx, ref.SymbolName)
+		if err != nil {
+			log.Printf("Warning: failed to lookup callee symbol %q: %v", ref.SymbolName, err)
+		}
+		var calleeSym trace.Symbol
+		if len(calleeSyms) > 0 {
+			calleeSym = calleeSyms[0]
+		} else {
+			calleeSym = trace.Symbol{Name: ref.SymbolName}
+		}
+		result.Callees = append(result.Callees, trace.CalleeInfo{
+			Symbol: calleeSym,
+			CallSite: trace.CallSite{
+				File:    ref.File,
+				Line:    ref.Line,
+				Context: ref.Context,
+			},
+		})
+	}
+
+	// Enrich with RPG feature paths
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		log.Printf("Warning: failed to load config for RPG enrichment: %v", err)
+	}
+	if cfg != nil {
+		enrichTraceWithRPG(projectRoot, cfg, &result)
+	}
+
+	return outputAndRecord(result, traceViewCallees, projectRoot, gstats.TraceCallees, len(result.Callees))
+}
+
+func runTraceGraph(cmd *cobra.Command, args []string) error {
+	symbolName := args[0]
+	ctx := context.Background()
+
+	if err := validateTraceOutputFlags(); err != nil {
+		return err
+	}
+
+	if traceProject != "" && traceWorkspace == "" {
+		return fmt.Errorf("--project requires --workspace")
+	}
+
+	// Workspace mode: aggregate call graphs across projects
+	if traceWorkspace != "" {
+		stores, err := trace.LoadWorkspaceSymbolStores(ctx, traceWorkspace, traceProject)
+		if err != nil {
+			return err
+		}
+		defer trace.CloseSymbolStores(stores)
+
+		// Merge graphs from all project stores
+		merged := &trace.CallGraph{
+			Root:  symbolName,
+			Nodes: make(map[string]trace.Symbol),
+			Edges: []trace.CallEdge{},
+			Depth: traceDepth,
+		}
+		edgeSeen := make(map[string]bool)
+
+		for _, ss := range stores {
+			graph, graphErr := ss.GetCallGraph(ctx, symbolName, traceDepth)
+			if graphErr != nil {
+				continue
+			}
+			for name, sym := range graph.Nodes {
+				if _, exists := merged.Nodes[name]; !exists {
+					merged.Nodes[name] = sym
+				}
+			}
+			for _, edge := range graph.Edges {
+				key := edge.Caller + "->" + edge.Callee
+				if !edgeSeen[key] {
+					merged.Edges = append(merged.Edges, edge)
+					edgeSeen[key] = true
+				}
+			}
+		}
+
+		result := trace.TraceResult{
+			Query: symbolName,
+			Mode:  traceExtractionMode,
+			Graph: merged,
+		}
+
+		return outputTraceResult(result, traceViewGraph)
+	}
+
+	projectRoot, err := config.FindProjectRoot()
+	if err != nil {
+		return err
+	}
+
+	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRoot))
+	if err := symbolStore.Load(ctx); err != nil {
+		if traceUI {
+			return showTraceActionCardUIError(
+				fmt.Errorf("failed to load symbol index: %w", err),
+				"Trace unavailable",
+				fmt.Sprintf("Failed to load symbol index: %v", err),
+				"Run `grepai watch` first to build the index",
+			)
+		}
+		return fmt.Errorf("failed to load symbol index: %w", err)
+	}
+	defer symbolStore.Close()
+
+	// Check if index exists
+	stats, err := symbolStore.GetStats(ctx)
+	if err != nil || stats.TotalSymbols == 0 {
+		if traceUI {
+			return showTraceActionCardUIError(
+				fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index"),
+				"Symbol index is empty",
+				"Call graph data is not available yet.",
+				"Run `grepai watch`",
+			)
+		}
+		return fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index")
+	}
+
+	graph, err := symbolStore.GetCallGraph(ctx, symbolName, traceDepth)
+	if err != nil {
+		return fmt.Errorf("failed to build call graph: %w", err)
+	}
+
+	result := trace.TraceResult{
+		Query: symbolName,
+		Mode:  traceExtractionMode,
+		Graph: graph,
+	}
+
+	// Enrich with RPG feature paths
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		log.Printf("Warning: failed to load config for RPG enrichment: %v", err)
+	}
+	if cfg != nil {
+		enrichTraceWithRPG(projectRoot, cfg, &result)
+	}
+
+	nodeCount := 0
+	if result.Graph != nil {
+		nodeCount = len(result.Graph.Nodes)
+	}
+
+	return outputAndRecord(result, traceViewGraph, projectRoot, gstats.TraceGraph, nodeCount)
+}
+
+func outputAndRecord(result trace.TraceResult, view traceViewKind, projectRoot, commandType string, resultCount int) error {
+	if traceJSON {
+		outputStr := captureJSON(result)
+		if traceCompact {
+			outputStr = captureTraceCompactJSON(result)
+		}
+		fmt.Print(outputStr)
+		recordTraceStats(projectRoot, commandType, resultCount, outputStr)
+		return nil
+	}
+	if traceTOON {
+		var outputStr string
+		var err error
+		if traceCompact {
+			outputStr, err = captureTraceCompactTOON(result)
+		} else {
+			outputStr, err = captureTOON(result)
+		}
+		if err != nil {
+			return err
+		}
+		fmt.Print(outputStr)
+		recordTraceStats(projectRoot, commandType, resultCount, outputStr)
+		return nil
+	}
+	if err := outputTraceResult(result, view); err != nil {
+		return err
+	}
+	recordTraceStats(projectRoot, commandType, resultCount, "")
+	return nil
+}
+
+// enrichTraceWithRPG enriches all symbols in a TraceResult with RPG feature paths.
+func enrichTraceWithRPG(projectRoot string, cfg *config.Config, result *trace.TraceResult) {
+	if !cfg.RPG.Enabled {
+		return
+	}
+
+	ctx := context.Background()
+	rpgStore := rpg.NewGOBRPGStore(config.GetRPGIndexPath(projectRoot))
+	if err := rpgStore.Load(ctx); err != nil {
+		return // best-effort
+	}
+	defer rpgStore.Close()
+
+	graph := rpgStore.GetGraph()
+	qe := rpg.NewQueryEngine(graph)
+
+	lookupFeaturePath := func(sym *trace.Symbol) {
+		if sym == nil || sym.File == "" {
+			return
+		}
+		nodes := graph.GetNodesByFile(sym.File)
+		for _, n := range nodes {
+			if n.Kind == rpg.KindSymbol && n.SymbolName == sym.Name {
+				fetchResult, err := qe.FetchNode(ctx, rpg.FetchNodeRequest{NodeID: n.ID})
+				if err == nil && fetchResult != nil {
+					sym.FeaturePath = fetchResult.FeaturePath
+				}
+				return
+			}
+		}
+	}
+
+	// Enrich the main symbol
+	if result.Symbol != nil {
+		lookupFeaturePath(result.Symbol)
+	}
+
+	// Enrich callers
+	for i := range result.Callers {
+		lookupFeaturePath(&result.Callers[i].Symbol)
+	}
+
+	// Enrich callees
+	for i := range result.Callees {
+		lookupFeaturePath(&result.Callees[i].Symbol)
+	}
+
+	// Enrich graph nodes
+	if result.Graph != nil {
+		for name, sym := range result.Graph.Nodes {
+			lookupFeaturePath(&sym)
+			result.Graph.Nodes[name] = sym
+		}
+	}
+}
+
+type traceViewKind int
+
+const (
+	traceViewCallers traceViewKind = iota
+	traceViewCallees
+	traceViewGraph
+)
+
+func outputTraceResult(result trace.TraceResult, view traceViewKind) error {
+	if traceJSON {
+		if traceCompact {
+			fmt.Print(captureTraceCompactJSON(result))
+			return nil
+		}
+		return outputJSON(result)
+	}
+	if traceTOON {
+		if traceCompact {
+			output, err := captureTraceCompactTOON(result)
+			if err != nil {
+				return err
+			}
+			fmt.Print(output)
+			return nil
+		}
+		return outputTOON(result)
+	}
+	if traceUI {
+		return runTraceResultUI(result, view)
+	}
+
+	if result.Symbol == nil && view != traceViewGraph {
+		fmt.Printf("No symbol found: %s\n", result.Query)
+		return nil
+	}
+
+	switch view {
+	case traceViewCallers:
+		return displayCallersResult(result)
+	case traceViewCallees:
+		return displayCalleesResult(result)
+	case traceViewGraph:
+		return displayGraphResult(result)
+	default:
+		return nil
+	}
+}
+
+func showTraceActionCardUIError(displayErr error, title, why, action string) error {
+	if uiErr := runTraceActionCardUIRunner(title, why, action); uiErr != nil {
+		return fmt.Errorf("%w (failed to render trace UI card: %v)", displayErr, uiErr)
+	}
+	return displayErr
+}
+
+type traceCallSiteCompact struct {
+	File string `json:"file"`
+	Line int    `json:"line"`
+}
+
+type traceCallerInfoCompact struct {
+	Symbol   trace.Symbol         `json:"symbol"`
+	CallSite traceCallSiteCompact `json:"call_site"`
+}
+
+type traceCalleeInfoCompact struct {
+	Symbol   trace.Symbol         `json:"symbol"`
+	CallSite traceCallSiteCompact `json:"call_site"`
+}
+
+type traceResultCompact struct {
+	Query   string                   `json:"query"`
+	Mode    string                   `json:"mode"`
+	Symbol  *trace.Symbol            `json:"symbol,omitempty"`
+	Callers []traceCallerInfoCompact `json:"callers,omitempty"`
+	Callees []traceCalleeInfoCompact `json:"callees,omitempty"`
+	Graph   *trace.CallGraph         `json:"graph,omitempty"`
+}
+
+func compactTraceResult(result trace.TraceResult) traceResultCompact {
+	compact := traceResultCompact{
+		Query:  result.Query,
+		Mode:   result.Mode,
+		Symbol: result.Symbol,
+		Graph:  result.Graph,
+	}
+	if len(result.Callers) > 0 {
+		compact.Callers = make([]traceCallerInfoCompact, 0, len(result.Callers))
+		for _, caller := range result.Callers {
+			compact.Callers = append(compact.Callers, traceCallerInfoCompact{
+				Symbol: caller.Symbol,
+				CallSite: traceCallSiteCompact{
+					File: caller.CallSite.File,
+					Line: caller.CallSite.Line,
+				},
+			})
+		}
+	}
+	if len(result.Callees) > 0 {
+		compact.Callees = make([]traceCalleeInfoCompact, 0, len(result.Callees))
+		for _, callee := range result.Callees {
+			compact.Callees = append(compact.Callees, traceCalleeInfoCompact{
+				Symbol: callee.Symbol,
+				CallSite: traceCallSiteCompact{
+					File: callee.CallSite.File,
+					Line: callee.CallSite.Line,
+				},
+			})
+		}
+	}
+	return compact
+}
+
+func captureTraceCompactJSON(result trace.TraceResult) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(compactTraceResult(result))
+	return buf.String()
+}
+
+func captureTraceCompactTOON(result trace.TraceResult) (string, error) {
+	output, err := toon.Encode(compactTraceResult(result))
+	if err != nil {
+		return "", fmt.Errorf("failed to encode TOON: %w", err)
+	}
+	return output + "\n", nil
+}
+
+// captureJSON serializes a TraceResult to a JSON string without writing to stdout.
+func captureJSON(result trace.TraceResult) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(result)
+	return buf.String()
+}
+
+func outputJSON(result trace.TraceResult) error {
+	fmt.Print(captureJSON(result))
+	return nil
+}
+
+func outputTOON(result trace.TraceResult) error {
+	s, err := captureTOON(result)
+	if err != nil {
+		return err
+	}
+	fmt.Print(s)
+	return nil
+}
+
+// captureTOON serializes a TraceResult to a TOON string without writing to stdout.
+func captureTOON(result trace.TraceResult) (string, error) {
+	output, err := toon.Encode(result)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode TOON: %w", err)
+	}
+	return output + "\n", nil
+}
+
+// recordTraceStats records a stats entry for a trace command.
+func recordTraceStats(projectRoot, commandType string, resultCount int, outputStr string) {
+	entry := gstats.Entry{
+		Timestamp:    time.Now().UTC().Format(time.RFC3339),
+		CommandType:  commandType,
+		OutputMode:   outputModeFromFlags(traceJSON, traceTOON, false),
+		ResultCount:  resultCount,
+		OutputTokens: embedder.EstimateTokens(outputStr),
+		GrepTokens:   gstats.GrepEquivalentTokens(resultCount),
+	}
+	recordStatsEntry(projectRoot, entry)
+}
+
+func displayCallersResult(result trace.TraceResult) error {
+	fmt.Printf("Symbol: %s (%s)\n", result.Symbol.Name, result.Symbol.Kind)
+	fmt.Printf("File: %s:%d\n", result.Symbol.File, result.Symbol.Line)
+	if result.Symbol.FeaturePath != "" {
+		fmt.Printf("Feature: %s\n", result.Symbol.FeaturePath)
+	}
+	fmt.Printf("\nCallers (%d):\n", len(result.Callers))
+	fmt.Println(strings.Repeat("-", 60))
+
+	if len(result.Callers) == 0 {
+		fmt.Println("No callers found.")
+		return nil
+	}
+
+	for i, caller := range result.Callers {
+		fmt.Printf("\n%d. %s\n", i+1, caller.Symbol.Name)
+		if caller.Symbol.File != "" {
+			fmt.Printf("   Defined: %s:%d\n", caller.Symbol.File, caller.Symbol.Line)
+		}
+		if caller.Symbol.FeaturePath != "" {
+			fmt.Printf("   Feature: %s\n", caller.Symbol.FeaturePath)
+		}
+		fmt.Printf("   Calls at: %s:%d\n", caller.CallSite.File, caller.CallSite.Line)
+		if caller.CallSite.Context != "" {
+			fmt.Printf("   Context: %s\n", truncate(caller.CallSite.Context, 80))
+		}
+	}
+
+	return nil
+}
+
+func displayCalleesResult(result trace.TraceResult) error {
+	fmt.Printf("Symbol: %s (%s)\n", result.Symbol.Name, result.Symbol.Kind)
+	fmt.Printf("File: %s:%d\n", result.Symbol.File, result.Symbol.Line)
+	if result.Symbol.FeaturePath != "" {
+		fmt.Printf("Feature: %s\n", result.Symbol.FeaturePath)
+	}
+	fmt.Printf("\nCallees (%d):\n", len(result.Callees))
+	fmt.Println(strings.Repeat("-", 60))
+
+	if len(result.Callees) == 0 {
+		fmt.Println("No callees found.")
+		return nil
+	}
+
+	for i, callee := range result.Callees {
+		fmt.Printf("\n%d. %s\n", i+1, callee.Symbol.Name)
+		if callee.Symbol.File != "" {
+			fmt.Printf("   Defined: %s:%d\n", callee.Symbol.File, callee.Symbol.Line)
+		}
+		if callee.Symbol.FeaturePath != "" {
+			fmt.Printf("   Feature: %s\n", callee.Symbol.FeaturePath)
+		}
+		fmt.Printf("   Called at: %s:%d\n", callee.CallSite.File, callee.CallSite.Line)
+	}
+
+	return nil
+}
+
+func displayGraphResult(result trace.TraceResult) error {
+	fmt.Printf("Call Graph for: %s (depth: %d)\n", result.Query, result.Graph.Depth)
+	fmt.Println(strings.Repeat("=", 60))
+
+	fmt.Printf("\nNodes (%d):\n", len(result.Graph.Nodes))
+	for name, sym := range result.Graph.Nodes {
+		if sym.FeaturePath != "" {
+			fmt.Printf("  - %s (%s) @ %s:%d [%s]\n", name, sym.Kind, sym.File, sym.Line, sym.FeaturePath)
+		} else {
+			fmt.Printf("  - %s (%s) @ %s:%d\n", name, sym.Kind, sym.File, sym.Line)
+		}
+	}
+
+	fmt.Printf("\nEdges (%d):\n", len(result.Graph.Edges))
+	for _, edge := range result.Graph.Edges {
+		fmt.Printf("  %s -> %s [%s:%d]\n", edge.Caller, edge.Callee, edge.File, edge.Line)
+	}
+
+	return nil
+}
+
+func truncate(s string, maxLen int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}

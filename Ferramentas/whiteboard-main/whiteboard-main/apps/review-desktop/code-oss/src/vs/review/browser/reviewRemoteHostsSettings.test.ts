@@ -1,0 +1,53 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) dev.fast. All rights reserved.
+ *  Licensed under the MIT License. See LICENSE in the repository root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { REVIEW_REMOTE_HOSTS_SETTING } from "../common/reviewConfigurationDefaults.js";
+import { reviewRemoteHostsSettings } from "./reviewRemoteHostsSettings.js";
+
+function fixture(values: Record<string, unknown>) {
+	const settings = new Map(Object.entries(values));
+	const writes: unknown[] = [];
+	const retried: string[] = [];
+	const uninstalled: string[] = [];
+	const hosts = reviewRemoteHostsSettings({
+		get: (key) => settings.get(key),
+		update: async (key, value) => {
+			writes.push(value);
+			settings.set(key, value);
+		},
+		connection: {
+			listSshAliases: async () => ["devbox"],
+			readRemoteHosts: async () => [{ alias: "devbox", state: "online" }],
+			retryRemoteHost: async (alias) => { retried.push(alias); },
+			installRemoteHost: async (alias) => { retried.push(`install ${alias}`); },
+			detectRemoteAgents: async () => null,
+			connectRemoteAgents: async () => [],
+			uninstallRemoteHost: async (alias) => { uninstalled.push(alias); },
+		},
+	});
+	return { hosts, writes, retried, uninstalled };
+}
+
+test("reads the hosts setting as main does", () => {
+	assert.deepEqual(fixture({ [REVIEW_REMOTE_HOSTS_SETTING]: ["devbox", 7] }).hosts.configured, ["devbox"]);
+	assert.deepEqual(fixture({ [REVIEW_REMOTE_HOSTS_SETTING]: "devbox" }).hosts.configured, []);
+});
+
+test("refuses an alias the SSH command would refuse, with the reason, and writes nothing", async () => {
+	for (const [alias, reason] of [["-bad", "starts with -"], ["a b", "contains whitespace"], ["a;b", "contains ;"], ["", "is empty"]]) {
+		const { hosts, writes } = fixture({ [REVIEW_REMOTE_HOSTS_SETTING]: ["devbox"] });
+		await assert.rejects(hosts.set(["devbox", alias]), { message: `The SSH alias ${JSON.stringify(alias)} ${reason}.` });
+		assert.deepEqual(writes, []);
+	}
+});
+
+test("writes the aliases once each and answers with the stored list", async () => {
+	const { hosts, writes } = fixture({ [REVIEW_REMOTE_HOSTS_SETTING]: [] });
+	assert.deepEqual(await hosts.set(["devbox", "other", "devbox"]), ["devbox", "other"]);
+	assert.deepEqual(writes, [["devbox", "other"]]);
+});

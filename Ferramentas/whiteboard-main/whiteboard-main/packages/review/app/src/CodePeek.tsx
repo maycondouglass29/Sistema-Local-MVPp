@@ -1,0 +1,491 @@
+import { space } from "@canvas/scale.stylex";
+import type {
+  ReviewDiffSide,
+  ReviewPeekHeightMode,
+  ReviewPeekRange,
+} from "@dev.fast/review-protocol";
+import {
+  type DiffSelection,
+  type FileLineRange,
+  codePeekSource,
+  selectionKey,
+  sourceAnchor,
+} from "@dev.fast/whiteboard-document";
+import * as stylex from "@stylexjs/stylex";
+import { Fragment, useEffect, useMemo, useRef } from "react";
+
+import { DocumentCodeView } from "./DocumentCodeView";
+import { drawStyles } from "./draw-styles";
+import { useReviewSession } from "./host/review-session";
+import { codeInspectorMarker, documentMarker } from "./markers.stylex";
+import { peekResolutionOutcome } from "./peek-telemetry";
+import { type ReviewLensView, useReviewLenses } from "./review-lenses";
+import type { SourcePeekAnchor } from "./review-panel-model";
+import { radius } from "./scale.stylex";
+import { withClass } from "./stylex-props";
+import { tokens } from "./tokens.stylex";
+import { captureUiEvent } from "./ui-telemetry";
+
+/** The software-map inspector's peek input: a range on one diff side. */
+export interface CodePeekProps {
+  file: string;
+  fromLine: number;
+  toLine: number;
+  graph?: "head" | "base";
+  lenses?: ReviewLensView;
+}
+
+export interface CodePeekSubject {
+  title: string;
+  file: string;
+  line: number;
+  endLine: number;
+}
+
+// Internal interactive surface used by the software-map inspector. Authored
+// Review documents receive ReviewCodePeek instead.
+export function CodePeek(props: CodePeekProps) {
+  const source = useMemo(() => codePeekSource(props), [props]);
+
+  return (
+    <FileSnippetCard
+      source={source}
+      heightMode="content"
+      lenses={props.lenses}
+    />
+  );
+}
+
+interface GroupedCodePeek {
+  key: string;
+  file: string;
+  side: ReviewDiffSide;
+  ranges: ReviewPeekRange[];
+  countRanges?: ReviewPeekRange[];
+}
+
+interface AuthoredCodePeekRange extends ReviewPeekRange {
+  side: ReviewDiffSide;
+}
+
+export function CodePeekGroup({
+  peeks,
+  collapsed = false,
+  lenses,
+}: {
+  peeks: readonly FileLineRange[];
+  collapsed?: boolean;
+  lenses?: ReviewLensView;
+}) {
+  const session = useReviewSession();
+
+  const groups = useMemo(() => groupedCodePeeks(peeks), [peeks]);
+
+  return (
+    <>
+      {groups.map((group) => {
+        const primaryRange = group.ranges[0]!;
+
+        return (
+          <section
+            key={group.key}
+            {...withClass("code-peek", styles.peek)}
+            data-code-rendering="inline-editor"
+          >
+            <DocumentCodeView
+              path={group.file}
+              title={group.file}
+              side={group.side}
+              ranges={group.ranges}
+              heightMode="content"
+              countRanges={group.countRanges}
+              active={false}
+              collapsed={collapsed}
+              lenses={lenses}
+              onOpen={() =>
+                session.surface.revealAnchor(
+                  group.file,
+                  {
+                    fromLine: primaryRange.startLine,
+                    toLine: primaryRange.endLine,
+                  },
+                  primaryRange.side ?? group.side,
+                )
+              }
+            />
+          </section>
+        );
+      })}
+    </>
+  );
+}
+
+export function ReviewCodePeek({ anchor }: { anchor: SourcePeekAnchor }) {
+  return <CodePeekCard source={anchor.peek} />;
+}
+
+/** A document peek is an interval of the same alignment used by diff lenses. */
+export function CodePeekCard({
+  source,
+  active = false,
+  heightMode = "capped",
+  onNativeFocus,
+  lenses: lensesOverride,
+  reportOutcome = false,
+  edgeToEdge = false,
+  xstyle,
+}: {
+  source: DiffSelection;
+  active?: boolean;
+  heightMode?: ReviewPeekHeightMode;
+  onNativeFocus?: () => void;
+  lenses?: ReviewLensView;
+  /** Report resolution telemetry. Only the panel the user opened sets this,
+   * so an authored document with many inline peeks sends one event, not N. */
+  reportOutcome?: boolean;
+  /** Run across its column like the Diff panel, not as an inset card. */
+  edgeToEdge?: boolean;
+  /** Call-site styles, applied last. */
+  xstyle?: stylex.StyleXStyles;
+}) {
+  const session = useReviewSession();
+  const contextLenses = useReviewLenses();
+  const lenses = lensesOverride ?? contextLenses;
+  const resolved = lenses?.resolve([source]) ?? [];
+  const anchor = sourceAnchor(source);
+
+  const ranges = resolved.map((range) => ({
+    side: range.side,
+    startLine: range.fromLine,
+    endLine: range.toLine,
+  }));
+
+  const key = selectionKey(source);
+
+  const unavailable = lenses?.progress?.unavailableSelections?.[key];
+
+  const outcome = peekResolutionOutcome({
+    resolvedCount: ranges.length,
+    complete: Boolean(lenses?.progress?.complete),
+    unavailable: Boolean(unavailable),
+    error: Boolean(lenses?.error),
+  });
+
+  const reason = unavailable ?? (lenses?.error ? "error" : "unresolved");
+
+  const reportedKey = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!reportOutcome || outcome === "pending" || reportedKey.current === key)
+      return;
+    reportedKey.current = key;
+
+    if (outcome === "resolved")
+      captureUiEvent(session, "peek_resolved", { root_kind: "range" });
+    else
+      captureUiEvent(session, "peek_resolve_failed", {
+        root_kind: "range",
+        reason,
+      });
+  }, [key, outcome, reason, reportOutcome, session]);
+
+  if (!ranges.length)
+    return (
+      <section
+        {...withClass(
+          "code-peek",
+          styles.peek,
+          edgeToEdge && styles.edgeToEdge,
+          drawStyles.blockChild,
+          xstyle,
+        )}
+        role="status"
+      >
+        {outcome === "failed" ? "Code unavailable" : "Loading code…"}
+      </section>
+    );
+
+  return (
+    <section
+      {...withClass(
+        "code-peek",
+        styles.peek,
+        edgeToEdge && styles.edgeToEdge,
+        drawStyles.blockChild,
+        xstyle,
+      )}
+      data-code-rendering="inline-editor"
+    >
+      <DocumentCodeView
+        path={source.file}
+        title={
+          source.start.side === source.end.side
+            ? codePeekRangeTitle(
+                source.file,
+                source.start.line,
+                source.end.line,
+              )
+            : source.file
+        }
+        side={anchor.side}
+        pins={source.pins}
+        ranges={ranges}
+        countRanges={ranges}
+        heightMode={heightMode}
+        active={active}
+        edgeToEdge={edgeToEdge}
+        onFocus={onNativeFocus}
+        onOpen={() =>
+          session.surface.revealAnchor(
+            anchor.file,
+            { fromLine: anchor.fromLine, toLine: anchor.toLine },
+            anchor.side,
+            source.pins,
+          )
+        }
+      />
+    </section>
+  );
+}
+
+/** A peek's or tour stop's code: one ordinary card per range, in order. A
+ * step with several ranges, even in one file, gets a card for each. */
+export function SourceCodePeek({
+  sources,
+  active,
+  onNativeFocus,
+  lenses,
+  reportOutcome,
+}: {
+  sources: readonly DiffSelection[];
+  active?: boolean;
+  onNativeFocus?: () => void;
+  lenses?: ReviewLensView;
+  reportOutcome?: boolean;
+}) {
+  return sources.map((source, index) => (
+    <Fragment key={selectionKey(source)}>
+      {index > 0 && (
+        <div
+          {...withClass("code-peek-gap", styles.cardGap)}
+          aria-hidden="true"
+        />
+      )}
+      <CodePeekCard
+        source={source}
+        active={active}
+        heightMode="content"
+        edgeToEdge
+        onNativeFocus={onNativeFocus}
+        lenses={lenses}
+        reportOutcome={reportOutcome && index === 0}
+      />
+    </Fragment>
+  ));
+}
+
+function FileSnippetCard({
+  source,
+  active = false,
+  heightMode = "capped",
+  onNativeFocus,
+  lenses,
+}: {
+  source: FileLineRange;
+  active?: boolean;
+  heightMode?: ReviewPeekHeightMode;
+  onNativeFocus?: () => void;
+  lenses?: ReviewLensView;
+}) {
+  const session = useReviewSession();
+
+  const subject = useMemo(() => codePeekSubject(source), [source]);
+
+  const onNativeFocusRef = useRef(onNativeFocus);
+  onNativeFocusRef.current = onNativeFocus;
+
+  return (
+    <section
+      {...withClass("code-peek", styles.peek, drawStyles.blockChild)}
+      data-code-rendering="inline-editor"
+    >
+      <DocumentCodeView
+        path={subject.file}
+        title={subject.title}
+        side={source.side}
+        pins={source.pins}
+        ranges={[{ startLine: subject.line, endLine: subject.endLine }]}
+        heightMode={heightMode}
+        active={active}
+        lenses={lenses}
+        onFocus={() => onNativeFocusRef.current?.()}
+        onOpen={() =>
+          session.surface.revealAnchor(
+            subject.file,
+            { fromLine: subject.line, toLine: subject.endLine },
+            source.side,
+            source.pins,
+          )
+        }
+      />
+    </section>
+  );
+}
+
+export function codePeekSubject(source: FileLineRange): CodePeekSubject {
+  return {
+    title: codePeekRangeTitle(source.file, source.fromLine, source.toLine),
+    file: source.file,
+    line: source.fromLine,
+    endLine: source.toLine,
+  };
+}
+
+// The card header prints one label, and it elides from the left. So give it the
+// whole path. A narrow card then keeps the deepest folders and the file name.
+function codePeekRangeTitle(
+  file: string,
+  fromLine: number,
+  toLine: number,
+): string {
+  const range = fromLine === toLine ? `${fromLine}` : `${fromLine}-${toLine}`;
+
+  return `${file}:${range}`;
+}
+
+function groupedCodePeeks(peeks: readonly FileLineRange[]): GroupedCodePeek[] {
+  const groups = new Map<
+    string,
+    Omit<GroupedCodePeek, "ranges"> & {
+      ranges: AuthoredCodePeekRange[];
+    }
+  >();
+
+  for (const peek of peeks) {
+    const key = peek.file;
+    let group = groups.get(key);
+
+    if (!group) {
+      group = {
+        key,
+        file: peek.file,
+        side: peek.side,
+        ranges: [],
+      };
+      groups.set(key, group);
+    } else if (peek.side === "head") {
+      group.side = "head";
+    }
+
+    group.ranges.push({
+      startLine: peek.fromLine,
+      endLine: peek.toLine,
+      side: peek.side,
+    });
+  }
+
+  return [...groups.values()].map((group) => ({
+    ...group,
+    countRanges: group.ranges,
+    ranges: mergedCodePeekRanges(group.ranges, group.side),
+  }));
+}
+
+function mergedCodePeekRanges(
+  ranges: readonly AuthoredCodePeekRange[],
+  defaultSide: ReviewDiffSide,
+): ReviewPeekRange[] {
+  const merged: ReviewPeekRange[] = [];
+
+  const sides: readonly ReviewDiffSide[] =
+    defaultSide === "head" ? ["head", "base"] : ["base", "head"];
+
+  for (const side of sides) {
+    const sideRanges = ranges
+      .filter((range) => range.side === side)
+      .sort((left, right) => left.startLine - right.startLine);
+
+    const mergedForSide: AuthoredCodePeekRange[] = [];
+
+    for (const range of sideRanges) {
+      const previous = mergedForSide.at(-1);
+
+      if (!previous || range.startLine > previous.endLine + 1) {
+        mergedForSide.push({ ...range });
+      } else {
+        previous.endLine = Math.max(previous.endLine, range.endLine);
+      }
+    }
+
+    for (const range of mergedForSide) {
+      const compactRange: ReviewPeekRange = {
+        startLine: range.startLine,
+        endLine: range.endLine,
+      };
+
+      if (side !== defaultSide) compactRange.side = side;
+      merged.push(compactRange);
+    }
+  }
+
+  return merged;
+}
+
+const inDocument = () => stylex.when.ancestor(":is(*)", documentMarker);
+
+// A block in a Review document shares the prose column.
+const inDocumentBlock = () => `${inDocument()}:is([data-review-node-id] > *)`;
+
+const inMapInspector = () =>
+  stylex.when.ancestor(":is(*)", codeInspectorMarker);
+
+// Peeks keep the `code-peek` class: document-embed-scroll.ts finds embeds by it.
+const styles = stylex.create({
+  peek: {
+    // Its card's corners, so the editor's selection ring follows them.
+    borderRadius: radius.control,
+    width: {
+      default: null,
+      [inDocumentBlock()]: `min(100%, ${tokens.reviewBlockMaxWidth})`,
+    },
+    minWidth: 0,
+    maxWidth: {
+      default: "100%",
+      [inDocumentBlock()]: `calc(100cqi - 2 * ${tokens.reviewDocumentPaddingInline})`,
+    },
+    marginInline: { default: null, [inDocumentBlock()]: "auto" },
+    marginBlock: { default: space.s24, [inMapInspector()]: 0 },
+    overflow: { default: null, [inMapInspector()]: "visible" },
+    padding: {
+      default: null,
+      [inMapInspector()]: {
+        default: 0,
+        [stylex.env.narrow]: `0 ${space.s8} ${space.s8}`,
+      },
+    },
+    overscrollBehavior: {
+      default: null,
+      [inMapInspector()]: { default: null, [stylex.env.narrow]: "contain" },
+    },
+    color: tokens.ink,
+    fontFamily: tokens.fontMono,
+  },
+  edgeToEdge: {
+    marginBlock: 0,
+  },
+  // Between a step's cards, sized by --review-code-card-gap (unset outside a
+  // tour step) with the tour rail running faintly through it.
+  cardGap: {
+    position: "relative",
+    height: "var(--review-code-card-gap, 0px)",
+    "::before": {
+      position: "absolute",
+      top: 0,
+      bottom: 0,
+      left: "var(--review-tour-rail-x)",
+      width: "2px",
+      backgroundColor: `color-mix(in srgb, ${tokens.ruleSoft} 70%, transparent)`,
+      content: "''",
+    },
+  },
+});

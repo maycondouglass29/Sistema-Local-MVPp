@@ -1,0 +1,786 @@
+import type { ReviewDiffProgress, ReviewDiffProgressFile, ReviewDiffLens, ReviewDiffViewSpec } from "../common/reviewProtocol.js";
+import { Range } from "../../editor/common/core/range.js";
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) dev.fast. All rights reserved.
+ *  Licensed under the MIT License. See LICENSE in the repository root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import "../browser/media/review.css";
+import { $, addDisposableListener, append, Dimension, getWindow, isAncestorOfActiveElement, scheduleAtNextAnimationFrame } from "../../base/browser/dom.js";
+import { Orientation, SplitView } from "../../base/browser/ui/splitview/splitview.js";
+import { disposableTimeout } from "../../base/common/async.js";
+import { Emitter, Event } from "../../base/common/event.js";
+import { Disposable, DisposableStore, MutableDisposable, toDisposable } from "../../base/common/lifecycle.js";
+import { autorun, observableFromEvent, observableValue, type ISettableObservable } from "../../base/common/observable.js";
+import { isEqual } from "../../base/common/resources.js";
+import { URI } from "../../base/common/uri.js";
+import { ElementSizeObserver } from "../../editor/browser/config/elementSizeObserver.js";
+import { isDiffEditor, type IDiffEditor } from "../../editor/browser/editorBrowser.js";
+import { DiffEditorViewModel } from "../../editor/browser/widget/diffEditor/diffEditorViewModel.js";
+import { MultiDiffEditorViewModel } from "../../editor/browser/widget/multiDiffEditor/multiDiffEditorViewModel.js";
+import { MultiDiffEditorWidget, type RevealOptions } from "../../editor/browser/widget/multiDiffEditor/multiDiffEditorWidget.js";
+import type { IMultiDiffEditorViewState } from "../../editor/browser/widget/multiDiffEditor/multiDiffEditorWidgetImpl.js";
+import { IDiffEditorOptions } from "../../editor/common/config/editorOptions.js";
+import { TrackedRangeStickiness } from "../../editor/common/model.js";
+import { ITextModelService } from "../../editor/common/services/resolverService.js";
+import { ITextResourceConfigurationService } from "../../editor/common/services/textResourceConfiguration.js";
+import { IHoverService } from "../../platform/hover/browser/hover.js";
+import { IInstantiationService } from "../../platform/instantiation/common/instantiation.js";
+import { MultiDiffEditorInput } from "../../workbench/contrib/multiDiffEditor/browser/multiDiffEditorInput.js";
+import {
+	IMultiDiffSourceResolverService,
+	MultiDiffEditorItem,
+} from "../../workbench/contrib/multiDiffEditor/browser/multiDiffSourceResolverService.js";
+import { IEditorGroupsService } from "../../workbench/services/editor/common/editorGroupsService.js";
+import { IEditorService } from "../../workbench/services/editor/common/editorService.js";
+import { ITextFileService } from "../../workbench/services/textfile/common/textfiles.js";
+import { ReviewChangedFilesTree } from "../browser/reviewChangedFilesTree.js";
+import { REVIEW_COUNTS_PENDING_TOOLTIP, reviewChangesTooltip, reviewCountsTooltip, ReviewTooltip, type ReviewTooltipContent } from "../browser/reviewTooltip.js";
+import { type ReviewDiffFileWire } from "../common/reviewProtocol.js";
+import { binarySizeLabel, isBinaryCounts, type ReviewFileCounts } from "../common/reviewStructuralDiff.js";
+import type { DiffFindFolds } from "./reviewDiffFind.js";
+import type { ReviewDiffLayoutSetting } from "./reviewDiffLayout.js";
+import { reviewMultiDiffLabelUris, ReviewMultiDiffUIElementFactory } from "./reviewMultiDiff.js";
+import type { StructuralDiffSession } from "./reviewStructuralDiffSession.js";
+
+const FILE_TREE_MINIMUM_WIDTH = 180;
+const DIFF_MINIMUM_WIDTH = 320;
+const FILE_TREE_COLLAPSE_WIDTH = FILE_TREE_MINIMUM_WIDTH + DIFF_MINIMUM_WIDTH;
+const REVIEW_FILES_DIFF_EDITOR_OPTIONS = {
+	hideUnchangedRegions: { enabled: true },
+	originalEditable: false,
+	readOnly: true,
+	// Ask pins.
+	glyphMargin: true,
+	lineNumbersMinChars: 3,
+	// A peek or diff on the page is read until it is clicked into; the current
+	// line highlight belongs to the cursor, not to the first revealed line.
+	renderLineHighlightOnlyWhenFocus: true,
+} satisfies IDiffEditorOptions;
+
+export interface ReviewFilesEditorEntry {
+	readonly sectionId?: string;
+	readonly sectionStart?: boolean;
+	readonly file: ReviewDiffFileWire;
+	readonly original: URI | undefined;
+	readonly modified: URI | undefined;
+	readonly goToFileResource: URI;
+}
+
+export class ReviewFilesEditorInput extends MultiDiffEditorInput {
+	static override readonly ID = "workbench.input.devfast.reviewFiles";
+	static readonly EDITOR_ID = "workbench.editor.devfast.reviewFiles";
+
+	private readonly updateResources: (paths: ReadonlySet<string>, loading: boolean) => void;
+
+	setReadyFiles(paths: ReadonlySet<string>, loading: boolean): void {
+		this.updateResources(paths, loading);
+	}
+
+	constructor(
+		source: URI,
+		readonly entries: readonly ReviewFilesEditorEntry[],
+		structural: StructuralDiffSession,
+		compactPinLane: boolean,
+		@ITextModelService textModelService: ITextModelService,
+		@ITextResourceConfigurationService
+		textResourceConfigurationService: ITextResourceConfigurationService,
+		@IInstantiationService instantiationService: IInstantiationService,
+		@IMultiDiffSourceResolverService
+		multiDiffSourceResolverService: IMultiDiffSourceResolverService,
+		@ITextFileService textFileService: ITextFileService,
+	) {
+		const items = new Map<ReviewFilesEditorEntry, MultiDiffEditorItem>();
+		// Wait for streamed roots before binding their collapse state.
+		const itemFor = (entry: ReviewFilesEditorEntry) => {
+			let item = items.get(entry);
+			if (!item) {
+				item = new MultiDiffEditorItem(
+					entry.original,
+					entry.modified,
+					entry.goToFileResource,
+					entry.file.status !== "unchanged" && structural.getTextDiff(entry.file.path)
+						? structural.fileCollapse(entry.file.path)
+						: observableValue("collapsed", false),
+					undefined,
+					undefined,
+					reviewMultiDiffLabelUris(entry.file),
+					// Use diffr's child folds; the file header controls the root.
+					{
+						...REVIEW_FILES_DIFF_EDITOR_OPTIONS,
+						glyphMarginWidth: compactPinLane ? 0 : -1,
+						hideOriginalLineNumbers: entry.file.status === "added" || entry.file.status === "unchanged",
+						hideUnchangedRegions: {
+							enabled: true,
+							minimumLineCount: 1,
+							contextLineCount: 0,
+						},
+						folding: false,
+						// Structural rails use one geometry through code, folds and deleted rows.
+						guides: { indentation: false, bracketPairs: false },
+						// Fold controls follow the line numbers, with breathing room before code.
+						lineDecorationsWidth: 24,
+						experimental: { useTrueInlineView: false },
+					},
+				);
+				items.set(entry, item);
+			}
+			return item;
+		};
+		const changes = new Emitter<void>();
+		let current: readonly MultiDiffEditorItem[] = [];
+		let loading = entries.length > 0;
+		const streamSource = {
+			isLoading: { get value() { return loading; }, onDidChange: changes.event },
+			resources: {
+				get value() {
+					return current;
+				},
+				onDidChange: changes.event,
+			},
+		};
+		super(
+			source,
+			"Files",
+			undefined,
+			true,
+			textModelService,
+			textResourceConfigurationService,
+			instantiationService,
+			{
+				_serviceBrand: undefined,
+				registerResolver: (resolver) =>
+					multiDiffSourceResolverService.registerResolver(resolver),
+				resolve: async () => streamSource,
+			},
+			textFileService,
+		);
+		this._register(changes);
+		this.updateResources = (paths, pending) => {
+			loading = pending; current = entries.filter(entry => paths.has(entry.file.path)).map(itemFor);
+			changes.fire();
+		};
+	}
+
+	override get typeId(): string {
+		return ReviewFilesEditorInput.ID;
+	}
+
+	override get editorId(): string {
+		return ReviewFilesEditorInput.EDITOR_ID;
+	}
+}
+
+/**
+ * The changed-files diff UI — a file list beside a multi-diff widget — as a
+ * plain widget. It owns no editor pane, so the Review canvas can mount it into
+ * a container the app supplies. The container's size drives the layout: the
+ * canvas gives the host element its bounds through CSS, not through a pane
+ * layout call.
+ */
+export class ReviewFilesDiffView extends Disposable {
+	private readonly _onDidChangeActiveControl = this._register(new Emitter<void>());
+	readonly onDidChangeActiveControl = this._onDidChangeActiveControl.event;
+	private readonly _onDidScroll = this._register(new Emitter<void>());
+	/** The list scrolled or its topmost file changed. */
+	readonly onDidScroll = this._onDidScroll.event;
+	private readonly diffContainer: HTMLElement;
+
+	private readonly root: HTMLElement;
+	private readonly fileTree: HTMLElement;
+	private readonly splitView: SplitView<number>;
+	private readonly changedFilesTree: ReviewChangedFilesTree | undefined;
+	private readonly widget: MultiDiffEditorWidget;
+	private pendingViewState: IMultiDiffEditorViewState | undefined;
+	private viewModel: MultiDiffEditorViewModel | undefined;
+	private input: ReviewFilesEditorInput | undefined;
+	private readonly readyFiles = new Set<string>();
+	private readonly loadingFiles = new Set<string>();
+	private readonly failedFiles = new Map<string, string>();
+	private readonly settleHold = this._register(new MutableDisposable<DisposableStore>());
+	private readonly documentLayout = this._register(new MutableDisposable());
+	/** Full structural counts for views without persisted coverage. */
+	private readonly streamStats = new Map<
+		string,
+		{ counts: ReviewFileCounts; tooltip?: ReviewTooltipContent }
+	>();
+	private readonly headerFactory: ReviewMultiDiffUIElementFactory;
+	private readonly summary: HTMLElement;
+	private readonly summaryTooltip: ReviewTooltip;
+	/** Files the stream says start hidden, with the reason shown in their header. */
+	private readonly hiddenFiles = new Map<string, string>();
+	private pendingPath: string | undefined;
+	private pendingSectionId: string | undefined;
+	private pendingSource: ReviewDiffLens["ranges"][number] | undefined;
+	private pendingReveal: RevealSourceOptions | undefined;
+	private progress: ReviewDiffProgress | undefined;
+	private progressFiles = new Map<string, ReviewDiffProgressFile>();
+	private documentCollapsed = false;
+	private readonly initializedDocumentItems = new WeakSet<object>();
+	private readonly viewedApplied = new Map<string, string>();
+	private readonly streamStatus: HTMLElement;
+	private offscreen = false;
+	private layoutDeferred = false;
+	viewedScope: 'lens' | undefined;
+
+	constructor(
+		private readonly container: HTMLElement,
+		overflowWidgetsDomNode: HTMLElement | undefined,
+		private readonly diffLayout: ReviewDiffLayoutSetting,
+		private readonly fileTreeContainer: HTMLElement | undefined,
+		private readonly onToggleViewed: ((path: string, sectionId?: string) => void) | undefined,
+		private readonly onToggleSection: ((id: string) => void) | undefined,
+		private readonly document: ReviewDiffViewSpec["document"],
+		openFile: boolean,
+		private readonly onscreen: ISettableObservable<boolean> | undefined,
+		@IInstantiationService
+		private readonly reviewInstantiationService: IInstantiationService,
+		@IEditorService private readonly editorService: IEditorService,
+		@IEditorGroupsService
+		private readonly editorGroupService: IEditorGroupsService,
+		@IHoverService hoverService: IHoverService,
+	) {
+		super();
+		this.root = append(container, $(".review-files-editor"));
+		const fileTree = this.fileTree = document ? container.ownerDocument.createElement("div") : append(this.fileTreeContainer ?? this.root, $(".review-files-editor-tree"));
+		const diffContainer = append(this.root, $(".review-files-editor-diffs"));
+		this.diffContainer = diffContainer;
+		if (document) fileTree.hidden = true;
+		// The Diff tab takes `review.diffColorTheme`; diff blocks keep the board's theme.
+		else this.root.classList.add("review-files-editor-tab");
+
+		const factory = this.reviewInstantiationService.createInstance(
+			ReviewMultiDiffUIElementFactory,
+			() =>
+				this.input
+					? this.input.entries.map((entry) => ({
+							original: entry.original,
+							modified: entry.modified,
+							additions: entry.file.status === "unchanged" || this.isBinary(entry) ? undefined : this.entryProgress(entry)?.remaining.additions ?? (this.fileTreeContainer || this.document ? undefined : this.lineCounts(entry.file.path)?.added),
+							deletions: entry.file.status === "unchanged" || this.isBinary(entry) ? undefined : this.entryProgress(entry)?.remaining.deletions ?? (this.fileTreeContainer || this.document ? undefined : this.lineCounts(entry.file.path)?.removed),
+							collapseLocked: this.isBinary(entry) || this.failedFiles.has(entry.file.path),
+						countsTooltip: this.progressTooltip(entry) ?? this.streamStats.get(entry.file.path)?.tooltip,
+						viewedState: this.entryProgress(entry)?.state,
+						viewedScope: this.viewedScope,
+						onToggleViewed: entry.file.status !== "unchanged" && this.onToggleViewed ? () => this.onToggleViewed!(entry.file.path, entry.sectionId) : undefined,
+						sectionId: entry.sectionId,
+						sectionCollapsed: !!entry.sectionId && this.collapsedSections.has(entry.sectionId),
+						onToggleSectionCollapsed: () => { if (entry.sectionId) { if (this.collapsedSections.has(entry.sectionId)) this.collapsedSections.delete(entry.sectionId); else this.collapsedSections.add(entry.sectionId); this.headerFactory.refreshHeaders(); } },
+						section: entry.sectionStart ? this.progress?.sections?.find(section => section.id === entry.sectionId) : undefined,
+						onToggleSection: () => entry.sectionId && this.onToggleSection?.(entry.sectionId),
+						// A binary is folded like a hidden file, with its size as the reason.
+						note: this.failedFiles.get(entry.file.path) ?? (entry.file.status === "unchanged" ? (this.document ? undefined : "Unchanged") : this.isBinary(entry) ? this.binaryNote(entry.file.path) : this.hiddenFiles.get(entry.file.path)),
+						noteTooltip: this.failedFiles.has(entry.file.path) ? { label: this.failedFiles.get(entry.file.path)! } : this.isBinary(entry) ? { label: "No text to show · binary files stay folded" } : undefined,
+						failed: this.failedFiles.has(entry.file.path),
+						commit: document?.commit,
+							// A binary has no text to open.
+							onDidOpen: this.isBinary(entry) || !(document ? document.onDidOpen : openFile) ? undefined : () => {
+								if (document?.onDidOpen) { document.onDidOpen(); return; }
+								const target = this.widget.tryGetCodeEditor(entry.goToFileResource);
+								const change = isDiffEditor(target?.diffEditor) ? target.diffEditor.getDiffComputationResult()?.changes2[0] : undefined;
+								const line = change && (entry.modified ? change.modified : change.original).startLineNumber;
+								const selection = line === undefined ? undefined : target?.editor.getModel()?.validateRange(new Range(line, 1, line, 1));
+								void this.editorService.openEditor(
+									{
+										resource: entry.goToFileResource,
+										options: { pinned: true, revealIfVisible: true, selection },
+									},
+									this.editorGroupService.mainPart.activeGroup,
+								);
+							},
+						}))
+					: [],
+			"auto",
+			// Hover and definition widgets must escape the canvas root, whose
+			// container-query containment clips position: fixed descendants.
+			overflowWidgetsDomNode,
+			false,
+			undefined,
+		);
+		factory.alwaysShowScrollbars = Boolean(document);
+		// A document embed shows one file, so its header stays pinned at the top.
+		factory.scrollbarBelowResourceHeader = Boolean(document);
+		if (document) factory.bottomScrollPadding = 0;
+		this.headerFactory = factory;
+
+		this.widget = this._register(
+			this.reviewInstantiationService.createInstance(MultiDiffEditorWidget, diffContainer, factory, undefined),
+		);
+		// The widget's own switch, not the per-item option refresh: it pins the
+		// width heuristic off, so the chosen layout is what renders at any width.
+		const applyLayout = () => this.widget.setRenderSideBySide(this.diffLayout.get() === "split");
+		if (!document) this._register(this.diffLayout.onDidChange(applyLayout));
+		applyLayout();
+		if (document) {
+			this._register(this.widget.onDidChangeContentHeight(() => {
+				const height = Math.max(40, this.widget.getContentHeight());
+				document.onDidChangeHeight(document.heightMode === "capped" ? Math.min(400, height) : height);
+			}));
+		}
+		this.streamStatus = append(diffContainer,
+			$(".review-structural-stream-status"));
+		this.streamStatus.setAttribute("role", "status");
+		this.streamStatus.hidden = true;
+		this._register(this.widget.onDidChangeActiveControl(() => this._onDidChangeActiveControl.fire()));
+		this._register(this.widget.onDidScroll(() => this._onDidScroll.fire()));
+		this._register(this.widget.onDidChangeActiveItem(() => this.syncFileSelectionFromWidget()));
+		this.summary = append(fileTree, $(".review-files-editor-summary"));
+		this.summary.hidden = true;
+		this.summaryTooltip = this._register(new ReviewTooltip(hoverService, this.summary));
+		this.changedFilesTree = document ? undefined : this._register(
+			this.reviewInstantiationService.createInstance(ReviewChangedFilesTree, fileTree),
+		);
+		if (this.changedFilesTree) this._register(
+			this.changedFilesTree.onDidOpenFile((file) => this.revealFile(file.path)),
+		);
+		this.splitView = this._register(
+			new SplitView<number>(this.root, {
+				orientation: Orientation.HORIZONTAL,
+				proportionalLayout: true,
+			}),
+		);
+		if (!this.fileTreeContainer && !document) this.splitView.addView(
+			{
+				element: fileTree,
+				layout: (width, _offset, height) => {
+					fileTree.style.width = `${width}px`;
+					this.changedFilesTree?.layout((height ?? 0) -
+						(this.summary.hidden ? 0 : this.summary.offsetHeight), width,
+					);
+				},
+				maximumSize: 380,
+				minimumSize: FILE_TREE_MINIMUM_WIDTH,
+				onDidChange: Event.None,
+			},
+			260,
+		);
+		this.splitView.addView(
+			{
+				element: diffContainer,
+				layout: (width, _offset, height) => {
+					diffContainer.style.width = `${width}px`;
+					this.widget.layout(new Dimension(width, height ?? 0));
+				},
+				maximumSize: Number.POSITIVE_INFINITY,
+				minimumSize: DIFF_MINIMUM_WIDTH,
+				onDidChange: Event.None,
+			},
+			740,
+		);
+
+		if (this.fileTreeContainer) {
+			const treeSize = this._register(new ElementSizeObserver(this.fileTreeContainer, undefined));
+			this._register(treeSize.onDidChange(() => this.layout()));
+			treeSize.startObserving();
+			this._register(toDisposable(() => fileTree.remove()));
+		}
+		if (document) {
+			const visibility = new IntersectionObserver(([entry]) => {
+				this.offscreen = !entry.isIntersecting;
+				this.onscreen?.set(entry.isIntersecting, undefined);
+				if (!this.offscreen && this.layoutDeferred) this.layout();
+			}, { rootMargin: "200px 0px" });
+			visibility.observe(container);
+			this._register(toDisposable(() => visibility.disconnect()));
+		}
+		const sizeObserver = this._register(new ElementSizeObserver(this.container, undefined));
+		this._register(sizeObserver.onDidChange(() => this.layout()));
+		sizeObserver.startObserving();
+		this.layout();
+		// Registered last so it runs last: the widgets above tear their own DOM
+		// down, and they must do that while the tree is still attached.
+		this._register(toDisposable(() => this.root.remove()));
+	}
+
+	async setInput(input: ReviewFilesEditorInput, viewState: IMultiDiffEditorViewState | undefined): Promise<void> {
+		this.settleHold.clear();
+		this.documentLayout.clear();
+		this.pendingViewState = viewState;
+		this.input = input;
+		this.changedFilesTree?.setFiles(Array.from(new Map(input.entries.map(entry => [entry.file.path, entry.file])).values()));
+		const viewModel = await input.getViewModel();
+		if (this._store.isDisposed) return;
+		this.viewModel = viewModel;
+		if (this.document) {
+			const preference = observableFromEvent(this.diffLayout.onDidChange, () => this.diffLayout.get());
+			// Unchanged and one-sided files, and completed identical comparisons, override the user's layout.
+			this.documentLayout.value = autorun(reader => {
+				const items = viewModel.items.read(reader);
+				const onePane = items.length > 0 && items.every(item => {
+					const entry = input.entries.find(entry => sameResource(item.originalUri, entry.original) && sameResource(item.modifiedUri, entry.modified));
+					if (!entry || entry.file.binary) return false;
+					if (entry.file.status === "added" || entry.file.status === "deleted" || entry.file.status === "unchanged") return true;
+					const comparison = item.diffEditorViewModel;
+					if (!(comparison instanceof DiffEditorViewModel)) return false;
+					const diff = comparison.diff.read(reader);
+					return comparison.isDiffUpToDate.read(reader) && diff?.identical === true && !diff.quitEarly;
+				});
+				this.widget.setRenderSideBySide(preference.read(reader) === "split" && !onePane);
+			});
+		}
+		// The canvas mounts this view without a user gesture, so the widget's
+		// first-change navigation must never take keyboard focus.
+		this.widget.setViewModel(viewModel, { preserveFocus: true, viewState, initialScrollPosition: this.document ? "top" : "firstChange" });
+		if (viewState) this.restoreViewState(viewState);
+		this.changedFilesTree?.setFiles(Array.from(new Map(input.entries.map(entry => [entry.file.path, entry.file])).values()));
+		this.syncFileSelectionFromWidget();
+		this._register(
+			autorun((reader) => {
+				const items = viewModel.items.read(reader);
+				if (this.document) for (const item of items) {
+					if (this.initializedDocumentItems.has(item)) continue;
+					this.initializedDocumentItems.add(item);
+					item.collapsed.set(this.documentCollapsed, undefined);
+				}
+				this.applyViewedFiles();
+				const entry = this.input?.entries.find(
+					(e) => e.file.path === this.pendingPath,
+				);
+				if (!entry || !this.readyFiles.has(entry.file.path)) return;
+				if (
+					!items.some(
+						(item) =>
+							sameResource(item.originalUri, entry.original) &&
+							sameResource(item.modifiedUri, entry.modified),
+					)
+				)
+					return;
+				this.pendingPath = undefined;
+				this.showStreamStatus();
+				queueMicrotask(() => {
+					if (!this._store.isDisposed) { if (this.pendingSource) this.revealSource(this.pendingSource, this.pendingSectionId, this.pendingReveal); else this.reveal(entry); }
+				});
+			}),
+		);
+	}
+
+	/** Keeps the line at the top of the viewport in place while edits above it change heights. */
+	holdPlace(): void {
+		const top = this.diffContainer.getBoundingClientRect().top;
+		const editorFor = (uri: URI) => this.widget.tryGetCodeEditor(uri)?.editor;
+		for (const { modified } of this.input?.entries ?? []) {
+			const editor = modified && editorFor(modified);
+			const model = editor?.getModel();
+			const node = editor?.getDomNode();
+			if (!modified || !editor || !model || !node) continue;
+			const y = node.getBoundingClientRect().top - editor.getScrollTop();
+			const line = editor.getVisibleRanges().flatMap(range => Array.from({ length: range.endLineNumber - range.startLineNumber + 1 }, (_, i) => range.startLineNumber + i))
+				.find(line => y + editor.getTopForLineNumber(line) >= top);
+			if (!line) continue;
+			const [id] = model.deltaDecorations([], [{ range: new Range(line, 1, line, 1), options: { description: "review-reader-place", stickiness: TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges } }]);
+			const position = () => {
+				const editor = editorFor(modified), at = model.getDecorationRange(id)?.startLineNumber;
+				return editor && at ? editor.getDomNode()!.getBoundingClientRect().top + editor.getTopForLineNumber(at) - editor.getScrollTop() : undefined;
+			};
+			const before = position()!;
+			const hold = this.settle(() => {
+				const now = position();
+				if (now !== undefined && Math.abs(now - before) >= 1) this.widget.setScrollTop(this.widget.getScrollTop() + now - before);
+			});
+			hold.add(toDisposable(() => model.deltaDecorations([id], [])));
+			return;
+		}
+	}
+
+	restoreViewState(viewState: IMultiDiffEditorViewState): void {
+		// Replacing a hold clears its state, so set this one's after.
+		const hold = this.settle(() => {
+			this.widget.setViewState(viewState);
+			this.syncFileSelectionFromWidget();
+		});
+		this.pendingViewState = viewState;
+		hold.add(toDisposable(() => {
+			this.pendingViewState = undefined;
+			this.widget.clearPendingRestorationState();
+		}));
+	}
+
+	startLoading(entries: readonly ReviewFilesEditorEntry[]): void {
+		this.changedFilesTree?.setFiles(Array.from(new Map(entries.map(entry => [entry.file.path, entry.file])).values()));
+		for (const entry of entries) {
+			this.loadingFiles.add(entry.file.path);
+			this.changedFilesTree?.setFileState(entry.file.path, "loading");
+		}
+		this.showStreamStatus();
+	}
+
+	fileLoaded(
+		path: string,
+		error?: string,
+	): void {
+		// A failed file still gets a section, so the tree can reveal its error.
+		this.loadingFiles.delete(path);
+		this.readyFiles.add(path);
+		if (error) this.failedFiles.set(path, error);
+		else this.failedFiles.delete(path);
+		this.changedFilesTree?.setFileState(path, error ? "error" : undefined, error);
+		this.input?.setReadyFiles(this.readyFiles, this.loadingFiles.size > 0);
+		this.showStreamStatus();
+	}
+
+	refreshHeaders(): void { this.headerFactory.refreshHeaders(); }
+
+	/** Coverage counts are independent of fold state. */
+	fileCounts(path: string, counts: ReviewFileCounts): void {
+		this.streamStats.set(path, {
+			counts,
+			// A binary's header shows no counts, so it has no counts tooltip.
+			tooltip: isBinaryCounts(counts) ? undefined : reviewChangesTooltip(counts.added, counts.removed),
+		});
+		// Coverage owns line counts in a hosted tree; a binary's size has no other source.
+		if (!this.fileTreeContainer || isBinaryCounts(counts)) this.changedFilesTree?.setCounts(path, counts);
+		this.headerFactory.refreshHeaders();
+		this.renderSummary();
+	}
+
+	private lineCounts(path: string) {
+		const counts = this.streamStats.get(path)?.counts;
+		return isBinaryCounts(counts) ? undefined : counts;
+	}
+
+	private isBinary(entry: ReviewFilesEditorEntry): boolean {
+		return !!entry.file.binary || isBinaryCounts(this.streamStats.get(entry.file.path)?.counts);
+	}
+
+	private binaryNote(path: string): string {
+		const counts = this.streamStats.get(path)?.counts;
+		const size = isBinaryCounts(counts) ? binarySizeLabel(counts) : undefined;
+		return size ? `Binary file · ${size}` : "Binary file";
+	}
+
+	private renderSummary(): void {
+		if (this.fileTreeContainer) return;
+		const paths = new Set((this.input?.entries ?? []).map(entry => entry.file.path));
+		const complete = [...paths].every(path => this.streamStats.has(path));
+		const total = { added: 0, removed: 0 };
+		for (const path of paths) {
+			const counts = this.lineCounts(path);
+			if (counts) { total.added += counts.added; total.removed += counts.removed; }
+		}
+		this.summary.replaceChildren();
+		const files = append(this.summary, $("span.review-files-editor-summary-files"));
+		files.textContent = `${paths.size} files`;
+		if (complete) {
+			const format = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
+			append(this.summary, $("span.review-files-editor-summary-added")).textContent = `+${format.format(total.added).toLowerCase()}`;
+			append(this.summary, $("span.review-files-editor-summary-removed")).textContent = `−${format.format(total.removed).toLowerCase()}`;
+		} else append(this.summary, $("span")).textContent = "Counting changes…";
+		this.summaryTooltip.content = complete ? reviewChangesTooltip(total.added, total.removed) : REVIEW_COUNTS_PENDING_TOOLTIP;
+		const wasHidden = this.summary.hidden;
+		this.summary.hidden = false;
+		if (wasHidden) this.layout();
+	}
+
+	/** The root's default-collapse reason, displayed on its file header. */
+	hideFile(path: string, label: string): void {
+		this.hiddenFiles.set(path, label);
+		this.headerFactory.refreshHeaders();
+	}
+
+	private readonly collapsedSections = new Set<string>();
+	private readonly sectionViewed = new Map<string, string>();
+	private entryProgress(entry: ReviewFilesEditorEntry) {
+		return this.progressFiles.get(`${entry.sectionId ?? ''}:${entry.file.path}`);
+	}
+	private progressTooltip(entry: ReviewFilesEditorEntry): ReviewTooltipContent | undefined {
+		const file = this.entryProgress(entry);
+		return file ? reviewCountsTooltip(file) : undefined;
+	}
+	setProgress(progress: ReviewDiffProgress): void {
+		this.progress = progress;
+		this.progressFiles = new Map([
+			...progress.files.map(file => [`:${file.path}`, file] as const),
+			...(progress.sections ?? []).flatMap(section => (section.files ?? []).map(file => [`${section.id}:${file.path}`, file] as const)),
+		]);
+		for (const section of progress.sections ?? []) {
+			const previous = this.sectionViewed.get(section.id);
+			if (section.state === 'viewed' && previous !== 'viewed') this.collapsedSections.add(section.id);
+			else if (previous === 'viewed' && section.state !== 'viewed') this.collapsedSections.delete(section.id);
+			this.sectionViewed.set(section.id, section.state);
+		}
+
+		this.changedFilesTree?.setProgressFiles(progress.files);
+		this.headerFactory.refreshHeaders();
+		this.applyViewedFiles();
+	}
+	private applyViewedFiles(): void {
+		for (const entry of this.input?.entries ?? []) {
+			const file = this.entryProgress(entry);
+			if (!file) continue;
+			const key = `${entry.sectionId ?? ''}:${file.path}`;
+			const previous = this.viewedApplied.get(key);
+			if (previous === file.state) continue;
+			const item = this.itemFor(entry);
+			if (!item) continue;
+			// Embedded code starts open, even when its first progress snapshot is viewed.
+			if (file.state === 'viewed' && (!this.document || previous !== undefined)) item.collapsed.set(true, undefined);
+			else if (previous === 'viewed' || this.progress?.changedPaths?.includes(file.path)) item.collapsed.set(false, undefined);
+			this.viewedApplied.set(key, file.state);
+		}
+	}
+	revealSource(source: ReviewDiffLens['ranges'][number], sectionId?: string, options?: RevealSourceOptions): void {
+		this.settleHold.clear();
+		const entry = this.input?.entries.find(entry => (!sectionId || entry.sectionId === sectionId) && (!entry.sectionId || this.progress?.sections?.find(section => section.id === entry.sectionId)?.sources.some(range => range.file === source.file && range.side === source.side && range.fromLine <= source.fromLine && range.toLine >= source.fromLine)) && source.file === (source.side === 'base' ? entry.file.previousPath ?? entry.file.path : entry.file.path));
+		if (!entry) return;
+		if (entry.sectionId && this.collapsedSections.delete(entry.sectionId)) this.headerFactory.refreshHeaders();
+		this.pendingSource = source; this.pendingSectionId = sectionId; this.pendingReveal = options;
+		if (this.loadingFiles.has(entry.file.path)) { this.pendingPath = entry.file.path; return; }
+		this.itemFor(entry)?.collapsed.set(false, undefined);
+		this.reveal(entry, { highlight: true, side: source.side === 'base' && entry.file.status !== 'unchanged' ? 'original' : 'modified', range: options?.range ?? new Range(source.fromLine, 1, source.toLine, 1), select: options?.select });
+		this.pendingSource = undefined; this.pendingReveal = undefined;
+	}
+
+	/** Collapsed files and hidden lines, for skip-folded find. */
+	folds(): DiffFindFolds {
+		return {
+			itemCollapsed: entry => this.documentCollapsed || (!!entry.sectionId && this.collapsedSections.has(entry.sectionId)) || (this.itemFor(entry)?.collapsed.get() ?? false),
+			// The view model outlives its editor.
+			hiddenLines: async (entry, side) => {
+				const comparison = this.itemFor(entry)?.diffEditorViewModel;
+				if (!(comparison instanceof DiffEditorViewModel)) return [];
+				await comparison.waitForDiff();
+				return comparison.unchangedRegions.get().map(region => {
+					const range = side === 'base' ? region.getHiddenOriginalRange(undefined) : region.getHiddenModifiedRange(undefined);
+					return { from: range.startLineNumber, to: range.endLineNumberExclusive - 1 };
+				}).filter(span => span.to >= span.from);
+			},
+		};
+	}
+
+	/** Scroll to a file, or to it once its diff has loaded. */
+	revealFile(path: string): void {
+		this.settleHold.clear();
+		const entry = this.input?.entries.find((entry) => entry.file.path === path);
+		if (!entry) return;
+		this.pendingPath = this.loadingFiles.has(path) ? path : undefined;
+		this.showStreamStatus();
+		if (!this.pendingPath) this.reveal(entry);
+	}
+
+	setStaged(staged: boolean): void {
+		this.root.classList.toggle("review-files-editor-staged", staged);
+		if (this.fileTreeContainer) this.fileTree.hidden = staged;
+		if (!staged) this.layout();
+	}
+
+	get entries(): readonly ReviewFilesEditorEntry[] { return this.input?.entries ?? []; }
+
+	hasFocus(): boolean {
+		return isAncestorOfActiveElement(this.root);
+	}
+
+	loadingFailed(message: string): void {
+		for (const path of this.loadingFiles) this.fileLoaded(path, message);
+		this.showStreamStatus();
+	}
+
+	private showStreamStatus(): void {
+		const loading = this.loadingFiles.size > 0;
+		const pending = this.pendingPath && this.loadingFiles.has(this.pendingPath) ? this.pendingPath : undefined;
+		this.streamStatus.hidden = !loading || (!pending && this.readyFiles.size > 0);
+		this.streamStatus.textContent = pending
+			? `${pending}: Loading diff…`
+			: this.readyFiles.size === 0 ? "Loading diff…" : "";
+		this.streamStatus.classList.toggle("loading", loading);
+	}
+
+	getViewState(): IMultiDiffEditorViewState | undefined {
+		return this.pendingViewState ?? (this.viewModel ? this.widget.getViewState() : undefined);
+	}
+
+	getActiveControl(): IDiffEditor | undefined {
+		return this.widget.getActiveControl();
+	}
+
+	setCollapsed(collapsed: boolean): void {
+		this.settleHold.clear();
+		this.documentCollapsed = collapsed;
+		for (const item of this.viewModel?.items.get() ?? []) item.collapsed.set(collapsed, undefined);
+	}
+
+	focus(): void {
+		this.widget.getActiveControl()?.focus();
+	}
+
+	layout(): void {
+		this.layoutDeferred = this.offscreen;
+		if (this.offscreen) return;
+		const width = this.container.clientWidth;
+		const height = this.container.clientHeight;
+		if (width <= 0 || height <= 0) return;
+
+		const fileTreeVisible = !this.fileTreeContainer && width >= FILE_TREE_COLLAPSE_WIDTH;
+		if (!this.fileTreeContainer && !this.document && this.splitView.isViewVisible(0) !== fileTreeVisible) {
+			this.splitView.setViewVisible(0, fileTreeVisible);
+		}
+
+		this.splitView.layout(width, height);
+		if (this.fileTreeContainer) this.changedFilesTree?.layout(this.fileTreeContainer.clientHeight, this.fileTreeContainer.clientWidth);
+	}
+	private reveal(resource: { original: URI | undefined; modified: URI | undefined }, options: RevealOptions & { select?: boolean } = { highlight: true }): void {
+		const show = (highlight: boolean) => {
+			this.widget.reveal(resource, { ...options, highlight });
+			if (options.select && options.range) this.select(resource, options.side ?? 'modified', options.range);
+		};
+		show(options.highlight);
+		this.settle(() => {
+			if (this.itemFor(resource)) show(false);
+		});
+	}
+
+	/** A selection makes the diff editor unfold the line, as the single-file find does. */
+	private select(resource: { original: URI | undefined; modified: URI | undefined }, side: 'original' | 'modified', range: Range): void {
+		const uri = side === 'original' ? resource.original : resource.modified;
+		const target = uri && this.widget.tryGetCodeEditor(uri);
+		if (!target) return;
+		const editor = side === 'original' ? target.diffEditor.getOriginalEditor() : target.diffEditor.getModifiedEditor();
+		if (!editor.getSelection()?.equalsRange(range)) editor.setSelection(range);
+		editor.revealRangeInCenter(range);
+	}
+
+	/**
+	 * Streamed files and lazy editor measurements move content after the widget
+	 * first scrolls; re-apply `apply` as heights settle, until the reader takes
+	 * over, another reveal or input replaces it, or 30s pass.
+	 */
+	private settle(apply: () => void): DisposableStore {
+		const hold = this.settleHold.value = new DisposableStore();
+		const frame = hold.add(new MutableDisposable());
+		const schedule = () => {
+			if (frame.value) return;
+			frame.value = scheduleAtNextAnimationFrame(getWindow(this.root), () => {
+				apply();
+				frame.clear();
+			});
+		};
+		hold.add(this.widget.onDidChangeContentHeight(schedule));
+		for (const type of ["wheel", "pointerdown", "keydown", "touchstart"])
+			hold.add(addDisposableListener(this.diffContainer, type, () => this.settleHold.clear(), { capture: true, passive: true }));
+		hold.add(disposableTimeout(() => this.settleHold.clear(), 30_000));
+		schedule();
+		return hold;
+	}
+
+	private itemFor(resource: { original: URI | undefined; modified: URI | undefined }) {
+		return this.viewModel?.items.get().find(item => sameResource(item.originalUri, resource.original) && sameResource(item.modifiedUri, resource.modified));
+	}
+
+	private syncFileSelectionFromWidget(): void {
+		const resource = this.widget.getActiveItem();
+		const input = this.input;
+		if (!resource || !input || this.pendingPath) return;
+		const index = input.entries.findIndex(
+			(entry) => sameResource(entry.original, resource.original) && sameResource(entry.modified, resource.modified),
+		);
+		if (index === -1) return;
+		this.changedFilesTree?.setActiveFile(input.entries[index].file.path);
+	}
+}
+export interface RevealSourceOptions {
+	range?: Range;
+	select?: boolean;
+}
+
+function sameResource(left: URI | undefined, right: URI | undefined): boolean {
+	return left === undefined ? right === undefined : !!right && isEqual(left, right);
+}

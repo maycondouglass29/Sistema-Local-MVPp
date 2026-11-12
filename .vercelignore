@@ -1,0 +1,13 @@
+# Vercel Ignore File
+backend/
+Ferramentas/
+laya-main/
+dist_electron/
+*.exe
+*.tmp
+*.log
+.git
+.gemini
+node_modules
+.vscode
+.idea

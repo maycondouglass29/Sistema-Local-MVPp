@@ -1,0 +1,504 @@
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+import * as diffr from "@dev.fast/diffr";
+import type { JsonValue } from "@dev.fast/json";
+import { STRUCTURAL_DIFF_WIRE_VERSION } from "@dev.fast/review-protocol";
+import { afterEach, expect, test, vi } from "vitest";
+
+import { type StructuralDiffRequest, structuralDiff } from "./structural-diff";
+
+const roots: string[] = [];
+
+afterEach(async () => {
+  vi.useRealTimers();
+  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
+  await Promise.all(
+    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
+  );
+});
+
+async function executable(script: string) {
+  const root = await mkdtemp(path.join(tmpdir(), "review-diffr-test-"));
+  roots.push(root);
+  const file = path.join(root, "diffr");
+  await writeFile(file, `#!${process.execPath}\n${script}`, { mode: 0o755 });
+  vi.spyOn(diffr, "diffrBinaryPath").mockReturnValue(file);
+  vi.stubEnv("XDG_CONFIG_HOME", path.join(root, "config"));
+
+  return root;
+}
+
+const START = {
+  type: "start",
+  version: STRUCTURAL_DIFF_WIRE_VERSION,
+  lhs: { type: "revision", rev: "base" },
+  rhs: { type: "revision", rev: "head" },
+  files: [
+    {
+      file: { rhs: { path: "a.ts", oid: "2", mode: "100644" } },
+      status: "added",
+    },
+  ],
+};
+
+const FILE = { rhs: { path: "a.ts", oid: "2", mode: "100644" } };
+
+const BINARY = {
+  type: "file",
+  file: FILE,
+  diff: { type: "binary", rhs: { size: 2 } },
+};
+
+const UPDATE = {
+  type: "update",
+  file: FILE,
+  regions: [{ id: 1, collapsed: true, label: "Sums" }],
+  visible: { added: 0, removed: 0 },
+};
+
+const COMPLETE = { type: "complete", succeeded: 1, failed: 0 };
+
+const emit = (event: JsonValue) =>
+  `console.log(${JSON.stringify(JSON.stringify(event))});`;
+
+const request = (
+  root: string,
+  overrides: Partial<StructuralDiffRequest> = {},
+): StructuralDiffRequest => ({
+  repositoryPath: root,
+  comparison: { kind: "trees", base: "base", head: "head" },
+  signal: new AbortController().signal,
+  ...overrides,
+});
+
+async function collect(input: StructuralDiffRequest) {
+  const events = [];
+
+  for await (const event of structuralDiff(input)) events.push(event);
+
+  return events;
+}
+
+test.each(["trees", "merge-base"] as const)(
+  "passes %s comparison and paths without shell interpretation",
+  async (kind) => {
+    const root = await executable(`
+    require('node:fs').writeFileSync('args.json', JSON.stringify(process.argv.slice(2)));
+    ${emit(START)} ${emit(COMPLETE)}
+  `);
+
+    await collect(
+      request(root, {
+        comparison: { kind, base: "base", head: "head" },
+        paths: ["space name.ts"],
+      }),
+    );
+    expect(
+      JSON.parse(await readFile(path.join(root, "args.json"), "utf8")),
+    ).toEqual([
+      "--repo",
+      root,
+      "--format",
+      "ndjson",
+      ...(kind === "trees" ? ["base", "head"] : ["base...head"]),
+      "--defer",
+      "--",
+      "space name.ts",
+    ]);
+  },
+);
+
+test("yields records before process completion and joins split chunks", async () => {
+  const root = await executable(`
+    ${emit(START)}
+    process.stdout.write(${JSON.stringify(JSON.stringify(BINARY).slice(0, 20))});
+    setTimeout(() => { process.stdout.write(${JSON.stringify(JSON.stringify(BINARY).slice(20) + "\n")}); }, 5);
+    const timer = setInterval(() => { if(require('node:fs').existsSync('continue')) { clearInterval(timer); ${emit(COMPLETE)} } }, 10);
+  `);
+
+  const iterator = structuralDiff(request(root));
+  expect((await iterator.next()).value?.type).toBe("start");
+  expect((await iterator.next()).value).toEqual(BINARY);
+  await writeFile(path.join(root, "continue"), "");
+  expect((await iterator.next()).value).toEqual(COMPLETE);
+  expect((await iterator.next()).done).toBe(true);
+});
+
+test("yields file errors and continues to successful files, accepting exit 2", async () => {
+  const error = {
+    type: "file",
+    file: FILE,
+    error: { code: "read_failed", message: "unreadable" },
+  };
+
+  const root = await executable(
+    `${emit(START)} ${emit(error)} ${emit(BINARY)} ${emit({ ...COMPLETE, failed: 1 })} process.exitCode = 2;`,
+  );
+
+  expect(await collect(request(root))).toEqual([
+    START,
+    error,
+    BINARY,
+    { ...COMPLETE, failed: 1 },
+  ]);
+});
+
+test("yields an aborted completion without discarding prior files", async () => {
+  const complete = {
+    ...COMPLETE,
+    aborted: { code: "hook_failed", message: "summarizer down" },
+  };
+
+  const root = await executable(
+    `${emit(START)} ${emit(BINARY)} ${emit(complete)} process.exitCode = 2;`,
+  );
+
+  expect(await collect(request(root))).toEqual([START, BINARY, complete]);
+});
+
+test.each([
+  [emit({ ...START, version: 1 }), "Unsupported diffr stream protocol"],
+  [emit(START), "before completion"],
+  [
+    `${emit(START)} ${emit({ type: "file", file: FILE })}`,
+    "Malformed diffr protocol record",
+  ],
+  [`${emit(START)} ${emit(COMPLETE)} ${emit(BINARY)}`, "after completion"],
+  [`${emit(START)} ${emit(START)}`, "Unexpected diffr event"],
+  [`${emit(START)} ${emit(COMPLETE)} process.exitCode = 2;`, "exited with 2"],
+])("rejects invalid or incomplete streams", async (script, message) => {
+  const root = await executable(script);
+  await expect(collect(request(root))).rejects.toThrow(message);
+});
+
+test("passes an update after its file", async () => {
+  const root = await executable(
+    `${emit(START)} ${emit(BINARY)} ${emit(UPDATE)} ${emit(COMPLETE)}`,
+  );
+
+  expect(await collect(request(root))).toEqual([
+    START,
+    BINARY,
+    UPDATE,
+    COMPLETE,
+  ]);
+});
+
+test("rejects an update before its file", async () => {
+  const root = await executable(
+    `${emit(START)} ${emit(UPDATE)} ${emit(BINARY)} ${emit(COMPLETE)}`,
+  );
+
+  await expect(collect(request(root))).rejects.toThrow(
+    "Unexpected diffr event: update",
+  );
+});
+
+test("rejects an update after completion", async () => {
+  const root = await executable(
+    `${emit(START)} ${emit(BINARY)} ${emit(COMPLETE)} ${emit(UPDATE)}`,
+  );
+
+  await expect(collect(request(root))).rejects.toThrow("after completion");
+});
+
+test("replays updates to a reader that joins after the run", async () => {
+  const { StructuralComparisons } = await import("./structural-comparisons.js");
+
+  const root = await executable(
+    `${emit(START)} ${emit(BINARY)} ${emit(UPDATE)} ${emit(COMPLETE)}`,
+  );
+
+  const cache = new StructuralComparisons();
+
+  try {
+    for await (const _event of cache.stream(request(root))) {
+      /* drain */
+    }
+
+    const replay = [];
+
+    for await (const event of cache.stream(request(root))) replay.push(event);
+    expect(replay).toEqual([START, BINARY, UPDATE, COMPLETE]);
+  } finally {
+    cache.close();
+  }
+});
+
+test("reports launch failures", async () => {
+  const root = await executable("");
+  vi.spyOn(diffr, "diffrBinaryPath").mockReturnValue(
+    path.join(root, "missing"),
+  );
+  await expect(collect(request(root))).rejects.toThrow(
+    "The bundled diffr executable is missing",
+  );
+});
+
+test("streams a large comparison without treating accumulated file bytes as one record", async () => {
+  const root = await executable(`
+    const { once } = require('node:events');
+    async function write(event) {
+      if (!process.stdout.write(JSON.stringify(event) + '\\n'))
+        await once(process.stdout, 'drain');
+    }
+    (async () => {
+      const files = Array.from({ length: 65 }, (_, i) => ({
+        file: { rhs: { path: i + '.txt', oid: String(i), mode: '100644' } },
+        status: 'added',
+      }));
+      await write({ ...${JSON.stringify(START)}, files });
+      for (const { file } of files) await write({
+        type: 'file', file,
+        diff: {
+          type: 'text', rhs: { text: 'x'.repeat(1024 * 1024), root: {kind:'leaf',id:1,fold_state_id:1,alignment_id:1,start:{line:0,column:0},end:{line:0,column:1024*1024}} },
+          structural_changes: { base: [], head: [[0, 1]] },
+          stats: { textual: { added: 1, removed: 0 }, visible: { added: 1, removed: 0 } },
+        },
+      });
+      await write({ type: 'complete', succeeded: files.length, failed: 0 });
+    })().catch(error => { console.error(error); process.exitCode = 1; });
+  `);
+
+  let files = 0;
+  let textBytes = 0;
+  let complete = false;
+
+  for await (const event of structuralDiff(request(root))) {
+    if (event.type === "file") {
+      files++;
+
+      if (event.diff?.type === "text")
+        textBytes += event.diff.rhs?.text.length ?? 0;
+    }
+
+    if (event.type === "complete") complete = event.succeeded === files;
+  }
+
+  expect(files).toBe(65);
+  expect(textBytes).toBe(65 * 1024 * 1024);
+  expect(complete).toBe(true);
+});
+
+test("accepts a generated-parser-sized individual record", async () => {
+  const root = await executable(`
+    ${emit(START)}
+    process.stdout.write(JSON.stringify({
+      ...${JSON.stringify(BINARY)}, padding: 'x'.repeat(80 * 1024 * 1024),
+    }) + '\\n');
+    ${emit(COMPLETE)}
+  `);
+
+  expect(await collect(request(root))).toEqual([START, BINARY, COMPLETE]);
+});
+
+test("rejects an oversized individual record", async () => {
+  const root = await executable(`
+    ${emit(START)}
+    process.stdout.write(JSON.stringify({
+      ...${JSON.stringify(BINARY)}, oversized: 'x'.repeat(97 * 1024 * 1024),
+    }) + '\\n');
+  `);
+
+  await expect(collect(request(root))).rejects.toThrow(
+    "Structural diff record exceeded 96 MiB",
+  );
+});
+
+test("cancellation terminates the subprocess", async () => {
+  const root = await executable(`setInterval(() => {}, 1000);`);
+  await expect(
+    collect(request(root, { signal: AbortSignal.timeout(50) })),
+  ).rejects.toThrow(/abort|exited/i);
+});
+
+test("lets a started comparison finish a slow plugin without an output deadline", async () => {
+  const root = await executable(`
+    ${emit(START)}
+    const timer = setInterval(() => {
+      if (require('node:fs').existsSync('continue')) {
+        clearInterval(timer);
+        ${emit(BINARY)} ${emit(COMPLETE)}
+      }
+    }, 10);
+  `);
+
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const iterator = structuralDiff(request(root));
+
+  try {
+    expect((await iterator.next()).value?.type).toBe("start");
+    const pending = iterator.next();
+    void pending.catch(() => {});
+
+    vi.advanceTimersByTime(600_000);
+    await writeFile(path.join(root, "continue"), "");
+    expect((await pending).value).toEqual(BINARY);
+    expect((await iterator.next()).value).toEqual(COMPLETE);
+    expect((await iterator.next()).done).toBe(true);
+  } finally {
+    await iterator.return(undefined);
+  }
+});
+
+test("cancellation still terminates a comparison after its manifest arrives", async () => {
+  const root = await executable(`${emit(START)} setInterval(() => {}, 1000);`);
+  const abort = new AbortController();
+  const iterator = structuralDiff(request(root, { signal: abort.signal }));
+
+  try {
+    expect((await iterator.next()).value?.type).toBe("start");
+    const pending = iterator.next();
+    void pending.catch(() => {});
+    abort.abort();
+    await expect(pending).rejects.toThrow(/abort|exited/i);
+  } finally {
+    await iterator.return(undefined);
+  }
+});
+
+test("breaking iteration terminates a producer that has not finished", async () => {
+  const root = await executable(`${emit(START)} setInterval(() => {}, 1000);`);
+
+  for await (const event of structuralDiff(request(root))) {
+    expect(event.type).toBe("start");
+    break;
+  }
+});
+
+test("rendering and coverage share a stream; cancelling one reader preserves the other and completion is replayed", async () => {
+  const { StructuralComparisons, invalidateStructuralComparisons } =
+    await import("./structural-comparisons.js");
+
+  const root = await executable(`
+    require('node:fs').appendFileSync('runs', 'x');
+    ${emit(START)}
+    setTimeout(() => { ${emit(BINARY)} ${emit(COMPLETE)} }, 80);
+  `);
+
+  const cache = new StructuralComparisons();
+  const abort = new AbortController();
+  const first = cache.stream(request(root, { signal: abort.signal }));
+  const second = cache.stream(request(root));
+
+  try {
+    const [a, b] = await Promise.all([first.next(), second.next()]);
+    expect(a.value).toEqual(START);
+    expect(b.value).toEqual(START);
+    abort.abort();
+    await expect(first.next()).rejects.toThrow("aborted");
+    const tail = [];
+
+    for await (const event of second) tail.push(event);
+    expect(tail).toEqual([BINARY, COMPLETE]);
+    const replay = [];
+
+    for await (const event of cache.stream(request(root))) replay.push(event);
+    expect(replay).toEqual([START, BINARY, COMPLETE]);
+    expect(await readFile(path.join(root, "runs"), "utf8")).toBe("x");
+    invalidateStructuralComparisons();
+
+    for await (const _event of cache.stream(request(root))) {
+      /* drain changed settings */
+    }
+
+    expect(await readFile(path.join(root, "runs"), "utf8")).toBe("xx");
+  } finally {
+    cache.close();
+  }
+});
+
+test("stops a comparison whose last reader leaves before diffr completes", async () => {
+  const { StructuralComparisons } = await import("./structural-comparisons.js");
+
+  const root = await executable(`
+    require('node:fs').writeFileSync('pid', String(process.pid));
+    ${emit(START)} ${emit(BINARY)}
+    setInterval(() => {}, 1000);
+  `);
+
+  const cache = new StructuralComparisons();
+
+  try {
+    for await (const event of cache.stream(request(root, { paths: ["a.ts"] })))
+      if (event.type === "file") break;
+
+    const pid = Number(await readFile(path.join(root, "pid"), "utf8"));
+
+    await vi.waitFor(() => expect(() => process.kill(pid, 0)).toThrow("ESRCH"));
+  } finally {
+    cache.close();
+  }
+});
+
+test("keeps the ten most recently read idle comparisons", async () => {
+  const { StructuralComparisons } = await import("./structural-comparisons.js");
+
+  const root = await executable(`
+    require('node:fs').appendFileSync('runs', 'x');
+    ${emit(START)} ${emit(BINARY)} ${emit(COMPLETE)}
+  `);
+
+  const cache = new StructuralComparisons();
+
+  const read = async (head: string) => {
+    for await (const _event of cache.stream(
+      request(root, { comparison: { kind: "trees", base: "base", head } }),
+    )) {
+      /* drain */
+    }
+  };
+
+  const runs = async () =>
+    (await readFile(path.join(root, "runs"), "utf8")).length;
+
+  try {
+    for (let index = 0; index <= 10; index++) await read(`head-${index}`);
+    expect(await runs()).toBe(11);
+    await read("head-1");
+    expect(await runs()).toBe(11);
+    await read("head-0");
+    expect(await runs()).toBe(12);
+  } finally {
+    cache.close();
+  }
+});
+
+test.each([
+  ".git/info/attributes",
+  ".gitattributes",
+  "config/diffr/config.toml",
+])("editing %s reclassifies a cached comparison", async (file) => {
+  const { StructuralComparisons } = await import("./structural-comparisons.js");
+
+  const root = await executable(`
+      require('node:fs').appendFileSync('runs', 'x');
+      ${emit(START)} ${emit(BINARY)} ${emit(COMPLETE)}
+    `);
+
+  execFileSync("git", ["init", "-q", root]);
+  const cache = new StructuralComparisons();
+
+  const read = async () => {
+    for await (const _event of cache.stream(request(root))) {
+      /* drain */
+    }
+
+    return (await readFile(path.join(root, "runs"), "utf8")).length;
+  };
+
+  try {
+    expect(await read()).toBe(1);
+    expect(await read()).toBe(1);
+    await mkdir(path.dirname(path.join(root, file)), { recursive: true });
+    await writeFile(path.join(root, file), "edited\n");
+    expect(await read()).toBe(2);
+    expect(await read()).toBe(2);
+  } finally {
+    cache.close();
+  }
+});

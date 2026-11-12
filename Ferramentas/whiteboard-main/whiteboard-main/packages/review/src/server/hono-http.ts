@@ -1,0 +1,209 @@
+import crypto from "node:crypto";
+
+import {
+  type JsonValue,
+  REVIEW_HOST_HEADER,
+  parseJsonText,
+} from "@dev.fast/review-protocol";
+import {
+  type Http2Bindings,
+  type HttpBindings,
+  getRequestListener,
+} from "@hono/node-server";
+import { REVIEW_PERSON_HEADER } from "@review/review-api/request-origin";
+import { REVIEW_APP_SESSION_ID_HEADER } from "@review/ui-telemetry-events";
+import type { Hono } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+
+import { StreamLimitError, readBoundedStream } from "./bounded-stream.js";
+import { DEFAULT_MAX_REQUEST_BYTES, HttpJsonError } from "./http-json";
+
+export type ReviewHonoEnv = {
+  Bindings: HttpBindings | Http2Bindings;
+};
+
+// HTTP/2 rejects connection-specific headers, such as streamSSE's chunked framing.
+const H2_FORBIDDEN_HEADERS = [
+  "connection",
+  "keep-alive",
+  "proxy-connection",
+  "transfer-encoding",
+  "upgrade",
+];
+
+export function createNodeRequestListener(
+  app: Hono<ReviewHonoEnv>,
+): ReturnType<typeof getRequestListener> {
+  return getRequestListener(async (request, env) => {
+    const response = await app.fetch(request, env);
+
+    if (
+      env.incoming.httpVersionMajor !== 2 ||
+      !H2_FORBIDDEN_HEADERS.some((name) => response.headers.has(name))
+    )
+      return response;
+
+    const stripped = new Response(response.body, response);
+
+    for (const name of H2_FORBIDDEN_HEADERS) stripped.headers.delete(name);
+
+    return stripped;
+  });
+}
+
+export function jsonResponse<T>(
+  body: T,
+  status: ContentfulStatusCode,
+  options: {
+    cacheControl?: string;
+    contentType?: string;
+    newline?: boolean;
+  } = {},
+): Response {
+  const headers = new Headers({
+    "content-type": options.contentType ?? "application/json; charset=utf-8",
+  });
+
+  if (options.cacheControl) {
+    headers.set("cache-control", options.cacheControl);
+  }
+
+  const serialized = JSON.stringify(body);
+
+  return new Response(
+    options.newline === false ? serialized : `${serialized}\n`,
+    {
+      status,
+      headers,
+    },
+  );
+}
+
+export function applyCorsHeaders(
+  request: Request,
+  response: Response,
+): Response {
+  const origin = request.headers.get("origin");
+
+  if (origin) {
+    response.headers.set("access-control-allow-origin", origin);
+    const vary = response.headers.get("vary");
+
+    const varyFields = vary
+      ?.split(",")
+      .map((field) => field.trim().toLowerCase());
+
+    if (!varyFields?.includes("*") && !varyFields?.includes("origin")) {
+      response.headers.set("vary", vary ? `${vary}, Origin` : "Origin");
+    }
+  }
+
+  response.headers.set(
+    "access-control-allow-headers",
+    `content-type, x-review-token, ${REVIEW_PERSON_HEADER}, ${REVIEW_APP_SESSION_ID_HEADER}`,
+  );
+  response.headers.set(
+    "access-control-allow-methods",
+    "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+  );
+  response.headers.set("access-control-allow-private-network", "true");
+  response.headers.set("access-control-expose-headers", REVIEW_HOST_HEADER);
+
+  return response;
+}
+
+/** The allowed origin, headers and methods hold for the server's lifetime, so
+ * the client may reuse a preflight. Chromium otherwise keeps one for 5 s, and
+ * nearly every request paid a second round trip. Two hours is Chromium's cap. */
+const PREFLIGHT_MAX_AGE_SECONDS = 7200;
+
+export function corsPreflightResponse(request: Request): Response {
+  const response = applyCorsHeaders(
+    request,
+    new Response(null, { status: 204 }),
+  );
+
+  response.headers.set(
+    "access-control-max-age",
+    String(PREFLIGHT_MAX_AGE_SECONDS),
+  );
+
+  return response;
+}
+
+export function isAuthorizedRequest(
+  request: Request,
+  expectedToken: string,
+): boolean {
+  const supplied =
+    request.headers.get("x-review-token") ??
+    new URL(request.url).searchParams.get("token");
+
+  if (!supplied) return false;
+  const expected = Buffer.from(expectedToken);
+  const actual = Buffer.from(supplied);
+
+  return (
+    expected.length === actual.length &&
+    crypto.timingSafeEqual(expected, actual)
+  );
+}
+
+export async function readBoundedRequestJson(
+  request: Request,
+  maxBytes = DEFAULT_MAX_REQUEST_BYTES,
+  emptyValue?: JsonValue,
+  options: { allowTextPlain?: boolean } = {},
+): Promise<JsonValue> {
+  assertJsonContentType(request, options);
+  const contentLength = Number(request.headers.get("content-length"));
+
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    throw requestTooLarge(maxBytes);
+  }
+
+  let body: string;
+
+  try {
+    body = request.body
+      ? (await readBoundedStream(request.body, maxBytes)).toString("utf8")
+      : "";
+  } catch (error) {
+    if (error instanceof StreamLimitError) throw requestTooLarge(maxBytes);
+    throw error;
+  }
+
+  if (!body && emptyValue !== undefined) return emptyValue;
+
+  try {
+    return parseJsonText(body);
+  } catch {
+    throw new HttpJsonError("Invalid JSON body.", 400);
+  }
+}
+
+function assertJsonContentType(
+  request: Request,
+  options: { allowTextPlain?: boolean },
+): void {
+  const mediaType = request.headers
+    .get("content-type")
+    ?.split(";", 1)[0]
+    ?.trim()
+    .toLowerCase();
+
+  if (
+    mediaType !== "application/json" &&
+    !mediaType?.endsWith("+json") &&
+    !(options.allowTextPlain && mediaType === "text/plain")
+  ) {
+    throw new HttpJsonError("Content-Type must be application/json.", 415);
+  }
+}
+
+function requestTooLarge(maxBytes: number): HttpJsonError {
+  return new HttpJsonError(
+    `Request body exceeds ${maxBytes === DEFAULT_MAX_REQUEST_BYTES ? "1 MiB" : `${maxBytes} bytes`}.`,
+    413,
+  );
+}

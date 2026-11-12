@@ -1,0 +1,817 @@
+# Review Desktop Code OSS provenance
+
+Repository: https://github.com/microsoft/vscode.git
+Upstream commit: 8a7abeba6e03ea3af87bfbce9a1b7e48fed567b8
+Serialization tag: code-oss-upstream-8a7abeba
+
+## Post-vendor security and reliability backports
+
+Review applies these focused VS Code changes without changing the source pin:
+
+- Electron 43.8.6 (Node 24.22.1), ahead of upstream's 43.8.3
+  (`d6e20fdc01`, checked 2026-11-02) for the Chromium security backports in
+  43.8.5–43.8.6; do not downgrade to upstream's version when syncing:
+  `4ae4d96052c5a986fe84974ed9d7b220234670b4`, `0d9ade07b6`, `d2fe6d3bf9`,
+  plus the 42.10.0 authentication type update
+  `28cf0a82a08a5f8e9288d19b4218ec1eb5ee46a6`. Linux dependency-list files
+  are upstream's at `d2fe6d3bf9` (43.7.5). Review is ahead of upstream on the
+  patch version: Electron 43.7.0 through 43.7.5 break wasm exception handling
+  after tier-up (electron/electron#54235, fixed in 43.7.6), which aborts the
+  software map's libavoid router. Version, `cgmanifest.json` and
+  `electron.txt` are for 43.8.6; `electron.txt` is the official `v43.8.6`
+  `SHASUMS256.txt`. From `4ae4d960` Review takes the
+  `enableWebSQL` removals, the Linux window-controls title bar, and the file
+  dialog default path (Electron 43 otherwise opens dialogs in Downloads).
+  It leaves out:
+  the `protocol.handle` migration (Electron 43 still supports the deprecated
+  `register*Protocol`/`interceptFileProtocol` APIs, and upstream's change
+  targets a protocol module refactored after the pin; port it when a major
+  removes them); the `linuxDesktopName` rename, which would rename the
+  `.desktop` files in Review's Linux packages; and the GCC < 13
+  `build/npm/gyp/custom-headers/v8config.h` overlay with its `preinstall.ts`
+  hunk, since Review's Linux builder has GCC 13+ and macOS and Windows use
+  clang and MSVC.
+- Applicable security hardening from
+  `06a2bc84d0555f4c7ebd176809673e61fa49c6ff`. Review includes environment
+  sanitization, owned transfer buffers, production extension-development
+  restrictions, extension URL confirmation ordering, and invalid terminal
+  working-directory termination. Review excludes the workspace trust hunk and
+  changes for pruned subsystems. This covers CVE-2026-47285, CVE-2026-70336,
+  CVE-2026-69320, and the `extensionUrlHandler` part of CVE-2026-59113. It
+  leaves CVE-2026-69306 (network filter) and the `webPageLoader` part of
+  CVE-2026-59113 inert (see below), and CVE-2026-69278 and CVE-2026-58650
+  unaddressed with the excluded terminal trust hunk.
+- Native event buffering: `876ce72e199704eb7f85b92ed580a3413e9c9f42`.
+- Listener leak instrumentation: `0e03962871113c2b3c525ede47dcf8197915f10a`.
+- Main-thread editor disposal: `b5f99abe4c3ca01cd5271bbeb562c1c508341f43`.
+- Code action disposal: `507a5a0f09e914160a9e8d45e6d1dd1f25329d5a`.
+- Disposed multi-diff guard: `9302a9e943f45090b8f89f59c9e83362bb973b92`.
+- Destroyed Electron frame guards: `1058ac0ced09b96d5745c379cdfd50f855f57036`.
+- Retry after failed Oniguruma loads: `5c7bf1f5abd4b51d290f4d9861d5d00ecdcb2de0`.
+- `@vscode/proxy-agent` 0.45.0 in the root and `remote/` manifests:
+  `ca90419648a3785c1c73d59dacad43c9726d9b67`. Review moves from 0.43.0, so
+  the lockfiles are regenerated rather than patched.
+- `node-pty` 1.2.0-beta.15 in the root and `remote/` manifests (ConPTY handle
+  leaks and deadlock, macOS kqueue fd leak, Windows spawn exceptions):
+  `012f594c44`.
+- `@xterm/*` at upstream's `8014e6a02f` (`@xterm/xterm` 6.1.0-beta.304) in the
+  root, `remote/` and `remote/web/` manifests, through `c840e22106`,
+  `4fd51574d3`, `f44c690a25` and `768c8ceba7`. Manifest-only upstream; stop
+  at these betas when syncing.
+- JSON, CSS and HTML language servers on `vscode-languageserver`/
+  `vscode-languageclient` 10.1.1 with upstream's `main` language-service
+  versions and the CSS server's `vscode-languageserver-types` 3.18.3
+  override: `49715cfcdb`, `f3fa55c39d`, `d693278c84`, `041d1b6643` (with its
+  `languageModelCache.ts` import). Locks are upstream's less the hoisted
+  `@vscode/extension-telemetry`.
+- `@vscode/windows-registry` 1.3.0 (`e6c5367ae8`) and, in `remote/` only,
+  `@vscode/windows-process-tree` 0.8.0 (`94aab9d0f4`).
+
+October 2026 leak, race, and crash fixes, verbatim without test hunks:
+
+- Startup: built-in extension manifest cache never hit (`47aa3e98`).
+- Detached DOM and window leaks: editor widgets, message, sticky scroll,
+  modifier keys, `Delayer`, and per-window animation frame, font and pixel
+  ratio caches (`b5faf951`, `ee778616`, `e1821592`, `2a4734ba`, `d912aa0e`,
+  `86a5159b`, `9d4555ee`, `44854867`). Review adds the `markAsSingleton`
+  import to `dom.ts` by hand; upstream already had it.
+- Extension host: leaks on cancelled requests (semantic tokens, signature
+  help, workspace symbols, hierarchies, drop edits, tree views) and stale RPC
+  cancel handlers (`0d3c47e1`, `78283637`, `ece3c56d`, `1ead63ee`, `5aa09546`,
+  `9f1fd52e`, `a8fee700`); one shared semantic token theme listener
+  (`46ce39e3`); invalid semantic token edits (`400d86be`).
+- Diff and editors: deferred diff model references, moved block actions,
+  multi-diff tab listeners, the References view, reentrant autoclose
+  decorations (`e3ce07e8`, `1b2f2558`, `8636777c`, `3c95df8b`, `3df2a01b`).
+- Modal editor: creation race, memento growth, Escape capture (`b8d3a33d`,
+  `21e3d6f5`, `e25abd16`); the fork's `editorCommands.ts` weight (below)
+  stays.
+- IPC and async: empty MessagePort frames, unhandled rejections
+  (`07be0760`, `4064a18e`, `453caa8c`, `21aca566`).
+- Lists and toolbars: inverted range clamp, batched width measurement,
+  responsive toolbar relayout (`0f7b8aef`, `5616258b`, `30751f11`).
+- Destroyed window notification cleanup (`36dc839d`); TypeScript signature
+  help active overload (`69e459e4`).
+
+Late October 2026 leak, race, and crash fixes, without test hunks:
+
+- Multi-diff editor: undo native scrolling of the virtualized content, which
+  clipped headers and the viewport bottom (`bc1a5d12`). Hand-ported into the
+  fork's `multiDiffEditorWidgetImpl.ts`; upstream moved the scroll view out.
+- Extension host leaks: language selection registry listeners, paste edits,
+  hidden status bar commands, output channel listeners, cancelled tree drags,
+  pending quick picks, custom documents (`12dc71b3`, `3126b774`, `9fcc9a12`,
+  `48573218`, `e29d8355`, `76f9f309`, `80a9a6b6`); serialized unexpected
+  errors (`487a93be`).
+- Workbench leaks: native context menu, input focus tracker, search editor,
+  composite drag and drop (`a8fe2685`, `ef46e22f`, `e6aaa2ac`, `bef11baa`).
+- Custom editors forget failed documents (`c25cf167`). Hand-ported: the
+  `disposeAllModelsForResource` hunk targets a post-pin method.
+- List measurement rows update their index (`d53580f2`). Single-row path
+  only; the batched path is post-pin.
+- Search retries without `--follow` after too many ripgrep symlink loops
+  (`1b92929b`). Hand-ported around import drift and without upstream's
+  per-walker `killCmds`.
+- Editor: measured monospace detection with ligatures (`4a82da11`), undo
+  stop before multi-character autoclose (`0ae67aea`).
+- Platform: managed port-forward truncation (`6bb4ac7c`), Parcel watch
+  request dedup (`5063c553`), URI userinfo and JSON edit fixes
+  (`922ce6a4`), Windows rename retry and in-use errors (`41c470f7`).
+- Left out: the webview resource-cancellation and find-teardown fixes
+  (`2f1fe6ea`, `0185f13b`) need post-pin webview refactors.
+
+### September 2026 advisories (all fixed upstream in 1.136.2)
+
+Microsoft published ten advisories on 2026-09-08. Each GitHub advisory cites its
+fix commit, so these are cherry-picked by reference like the entries above.
+Review applies four of them, covering four CVEs:
+
+- Restricted Mode and Workspace Trust bypass via nested configuration objects
+  (CVE-2026-81376, critical; CVE-2026-70334, high):
+  `0684cb5905a3f23156f45a28135326e09310ff4d`. Applied verbatim. Leaf
+  configuration properties now route through a recursive `filterProperty`
+  helper that validates nested objects against the registry by dotted path.
+- Webview resource path containment bypass (CVE-2026-81383, high):
+  `461bd99584a70d51f079dda93353b4b880c9d56d`. Superseded by the October
+  fixes below: `b0240f4c` removes its backslash rewrite in `containsResource`,
+  and the dual POSIX/Windows check in `resources.ts` from `e28ec757` keeps a
+  backslash `..` from escaping a webview root.
+- MCP gallery metadata path traversal (CVE-2026-81377, moderate):
+  `6a88486bf4f0033dfc5c7ff1e305d34ed200aed4`. Applied verbatim. `getLocation`
+  rejects resolved paths that escape the MCP storage directory, and `uninstall`
+  refuses a server whose recorded location does not match its derived one.
+- Remote image fetch in agent-generated markdown (CVE-2026-81380, moderate):
+  `88e44fa0e00b08f7758b4f6d05632e4fd5e4df6f`. Media sources are validated
+  during DOM sanitization through the new `mediaSourceIsAllowed` hook, rather
+  than after the `src` attribute has already been attached. Review adds the
+  `isUNC` import by hand because the surrounding import block predates
+  upstream's `isPortableLinkTarget`; the rest is verbatim.
+
+#### Not applicable at this pin
+
+- Azure DevOps access token disclosure (CVE-2026-81381, moderate):
+  `f94e10bbe33d0fa05ed03e1c25397b0625a93ce2` touches only
+  `extensions/copilot/`, excluded at vendor time.
+- Remote code execution through workspace-configured remote agent host
+  connections (CVE-2026-78462, high):
+  `4321a67576d0d63e46d94af88d554b6cbe0193e4` patches
+  `src/vs/workbench/services/agentHost/common/agentHostResourceService.ts` and
+  `src/vs/sessions/contrib/providers/remoteAgentHost/`, neither of which exists
+  here, and `readWebSocketRemoteAgentHostEntries`, which this pin predates.
+  `RemoteAgentHostsSettingId` and `AgentHostLocalFilePermissionsSettingId` are
+  declared but have no read sites in this tree, so there is no path that reads a
+  remote agent host address or a persisted file-permission grant from workspace
+  configuration.
+- Trusted URL validation (CVE-2026-81356):
+  `e5c58adb0bafaff3e2265e7d1153139f1b784f61` hardens `isURLDomainTrusted` and
+  chat URL fetching patterns. Inert here: the only caller of
+  `isURLDomainTrusted` is `webContentExtractorService.ts`, which Review never
+  registers, and Review loads no chat contributions.
+
+#### Not remediated, by decision
+
+The three Agent Network Filter bypasses — CVE-2026-81378, CVE-2026-81357, and
+CVE-2026-81379 (all high), fixed upstream in
+`256500f4e96be525a26814260a5e815a137c1eff`,
+`8a19bab00bd06be92dbdcf470d24e369496ae1d1`, and
+`d804f2b57392655df446901dd9bdab2685ed5ad4` — are not backported. They harden
+`src/vs/platform/networkFilter/common/`, a control that is inert in Review:
+
+- `AgentNetworkFilterService.isUriAllowed` returns `true` unconditionally unless
+  `chat.agent.networkFilter` is enabled. That setting defaults to `false`, and
+  Review neither sets it nor ships a settings editor that could.
+- Its enforcement points are the chat fetch-page tool, the browser-view tools,
+  and the agent-host sandbox terminal. Review registers no chat, browser-view,
+  or agent contributions; `IChatWidgetService` is bound to an inert stub in
+  `src/vs/review/review.common.main.ts`. The extension-host `browser` API is
+  gated on the `browser` proposed API, and `product.json` declares no
+  `extensionEnabledApiProposals`.
+- Upstream rewrote this module after the vendored commit. Its fixes target
+  `normalizeDomainPattern`, `normalizeBareIpv6`, and `normalizeUriAuthority`,
+  none of which exist here; our copy is byte-identical to the vendor pin.
+  Backporting would mean carrying a large, permanent divergence in a file that
+  currently has none.
+
+Review instead stops registering the services and IPC channels that would reach
+this code at all; see the `app.ts`, `sharedProcessMain.ts`, and
+`build/.moduleignore` entries below. Should a future Review surface ever drive
+agent network requests, re-sync `src/vs/platform/networkFilter/common/` from
+upstream wholesale rather than porting these three commits individually.
+
+Review also keeps `@anthropic-ai/sdk` as a development-only type dependency.
+It must not appear in the packaged production dependency set.
+
+### October 2026 advisories (fixed upstream in 1.141.x)
+
+Review applies these, by reference as above:
+
+- Path traversal and Workspace Trust bypass (CVE-2026-102238, critical) and
+  remote webview resource path traversal (CVE-2026-102229, moderate): release
+  commits `e28ec75752e6eede19b0a0f47546e59099a0e4ac` and
+  `b0240f4c8e1416e866c2932f71ed4383d5bc19fa`, taken as main's roll-up
+  `0695d91131628a77143182333b5bf2a7a57245f4` for `resources.ts`, `strings.ts`,
+  `resourceLoading.ts` and the Electron `webviewElement.ts`, plus the
+  mixed-case authority follow-up `6750fe27325d65a39711ff6db88df23bb297db3b`.
+  Non-file `isEqualOrParent` also checks containment with Windows semantics;
+  webviews normalize `vscode-remote` requests and roots for the host's OS and
+  deny them when it is unknown. The browser `webviewElement.ts` hunks are
+  ported by hand (its import block predates `MutableDisposable`). Review
+  adds one fallback there: when the window's own connection does not own the
+  authority, `reviewRemoteOS` returns the OS that Home's `ReviewRemoteSession`
+  recorded for that host, so remote extension webviews in Home keep loading.
+  `0695d911`'s agent host, MCP, chat, sandbox and terminal hunks are left out;
+  they target code pruned here or covered by `2381ffb2`.
+- Webview resource loading defense in depth:
+  `9ea28e299ee1c206c25b1c6d9369d2554dd3cfbe`. Applied verbatim. Windows
+  `file` requests with a `.. ` (trailing-space) segment are denied.
+- `__proto__` prototype pollution in JSON parsing:
+  `33c90c65c7d39ba204f76023bf953a16af71dff4`. Applied verbatim, except the
+  chat `languageModelsConfigurationService.ts` hunk; that file is pruned.
+- JSON schema URLs are canonicalized before trusted-domain checks and
+  requests: `fb20064c0f4bda98ede67f594727503329370d1f`. Applied verbatim to
+  `json-language-features/client/src/jsonClient.ts` and `utils/urlMatch.ts`;
+  test and integration-script hunks are left out.
+- Workspace Trust bypass via `terminal.integrated.allowedLinkSchemes`
+  (CVE-2026-102234, high): `2381ffb2918c91b1f2084fa6defa8345dbcf3797`. Only
+  `restricted: true`; the `export` it adds is for upstream's test. Inert here
+  because Review loads no terminal contribution.
+- Command links in notification text (CVE-2026-69370, GHSA-xf67-g42g-pg73;
+  fixed upstream in 1.141.1): `fab0e01e6b774f8510123e6e22cca268254ba938`,
+  the same commit on `main` and `release/1.141`. Plain string and `Error`
+  notification and progress messages now render literally; links need
+  `NotificationText` (`notificationMessage.ts`). Only the extension API
+  bridges (`mainThreadMessageService.ts`, `mainThreadProgress.ts`) keep
+  `[label](href)` parsing, through `notificationLegacy.ts`. Non-test hunks
+  apply verbatim except `notificationAccessibleView.ts`, where Review takes
+  only the new `getActionsFromNotification` (copied actions plus link
+  actions opened through `IOpenerService`). Its provider rework depends on
+  upstream's listener-lifetime change `65e01167db`, which Review lacks.
+  Upstream's own caller migrations cover every core caller Review reaches:
+  `codeEditorWidget.ts` (cursor limit), `extensionsActions.ts` (install
+  failure log link), and `remoteExplorer.ts` (forwarded ports link). The
+  `markdown-language-features` and `typescript-language-features` hunks drop
+  reflected text that contains link syntax. Review's own notifications in
+  `src/vs/review/` carry no links, so canvas, error, and remote-host text
+  now render as literal text. Skipped: the `code-no-legacy-notification-parsing`
+  lint rule and its `eslint.config.js` entry (the fork's ESLint config does
+  not load: it imports the pruned `extensions/copilot` plugin),
+  the pruned `copilot`, `git`, `npm`, `php-language-features`, and
+  `microsoft-authentication` extensions, and the absent `editSessions`,
+  `remoteTunnel`, `userDataSync`, and `workspaces` contributions.
+
+#### Not applicable at this pin
+
+- Security feature bypass via notebooks (CVE-2026-78461):
+  `7422e06ada979320fbd4551013b9924f3f2a0f25` is an ancestor of the pin.
+- RCE via skipped Workspace Trust (CVE-2026-70098):
+  `010ee1aa74f8c8f0a12072f4766853ad71bc4014` patches `src/vs/sessions/`,
+  which is deleted.
+- Shared MCP sandbox permission approvals (CVE-2026-102851):
+  `34329e2f696c2ee2f0c66db9b1e56cf3e7d2e4fb`; Review registers no MCP
+  services.
+- Azure DevOps code search endpoint override (CVE-2026-102231):
+  `e57527e158f6b18cc9fa3985fd535fdc2ce49b5a` touches only
+  `extensions/copilot/`, excluded at vendor time.
+- Terminal relaunch and reuse trust bypass (CVE-2026-102233):
+  `1c89ae435d71fa27df437bbc628ed3072007eb46`; the terminal contribution is
+  not loaded.
+- RCE via terminal notifications (CVE-2026-102235):
+  `79ba0f2d5a72cbbdcb91a1067f50a9e3f48a05bc` patches
+  `terminalContrib/notification/browser/terminalNotificationHandler.ts`, which
+  is absent.
+- Custom hook edits in the Copilot harness (CVE-2026-102232):
+  `fffc9bc6481f32dc2cccca7d8760f72feea2416b` and
+  `a5af62a0330a29a2b40dad77d7435ae5569bbdce` patch the agent host; its
+  `node/` code, `src/vs/sessions/` and the chat agent sessions are deleted.
+
+## Vendor-time exclusions
+
+The following upstream paths were excluded before the vendor commit was
+created. They have never existed in the monorepo history:
+
+- `.git/`
+- `.github/`
+- `.vscode/`
+- `build/azure-pipelines/`
+- `extensions/copilot/`
+- `extensions/**/.vscode/`
+- `extensions/emmet/test-workspace/` (contains only excluded `.vscode/` data)
+- `extensions/vscode-colorize-perf-tests/`
+- `extensions/vscode-colorize-tests/`
+- `test/monaco/dist/` (all of `test/monaco/` was later pruned; see below)
+
+The `.vscode/` trees and Monaco `dist/` fixture are upstream development-only
+files ignored by the vendored tree's own ignore rules; they are not required
+to build or run Review Desktop. Their dangling postinstall targets are removed
+from `build/npm/dirs.ts`, and their dangling TypeScript compilations are
+removed from `build/gulpfile.extensions.ts`. Review keeps the remote source
+while omitting its unused package installs. Unused upstream test tooling is
+pruned as documented below.
+
+## Pruned built-in extensions
+
+The following upstream extensions are deleted from `extensions/` because
+Review Desktop never activates them. Their entries are removed from
+`build/gulpfile.extensions.ts` (`compilations`), `build/npm/dirs.ts`, and —
+for ipynb, mermaid-markdown-features, and notebook-renderers — from
+`esbuildMediaScripts` in `build/lib/extensions.ts`:
+
+- `debug-auto-launch`
+- `debug-server-ready`
+- `emmet`
+- `extension-editing`
+- `github-authentication`
+- `grunt`
+- `gulp`
+- `ipynb`
+- `jake`
+- `mermaid-markdown-features`
+- `microsoft-authentication`
+- `notebook-renderers`
+- `php-language-features`
+- `terminal-suggest`
+- `tunnel-forwarding`
+- `markdown-math` (its prebuilt `notebook-out/` KaTeX payload may be staged
+  separately; `licenses/katex.txt` carries the KaTeX notice)
+- `vscode-api-tests`
+- `vscode-test-resolver`
+
+To restore one: `git checkout code-oss-upstream-8a7abeba -- apps/review-desktop/code-oss/extensions/<name>`
+and re-add its lines to the three build files above. In a checkout without
+that tag (the standalone open-source repository), take the extension from
+`microsoft/vscode` at the upstream commit recorded above instead.
+
+## Pruned upstream tooling
+
+Review deletes these upstream development and release tools. It never builds
+or runs them, and their lockfiles only produced Dependabot alerts:
+
+- `cli/` (the Rust `code` CLI) and `build/gulpfile.cli.ts`
+- `test/automation/`, `test/smoke/`, `test/mcp/`
+- `test/sanity/`, `test/monaco/`, `test/componentFixtures/`
+- `test/integration/browser/` and `scripts/test-web-integration.sh` / `.bat`.
+  Whiteboard never runs this upstream extension API browser harness. Its
+  package and lockfile are removed rather than merely skipping installation.
+  Whiteboard's own browser and packaged-app tests are retained.
+- `scripts/chat-simulation/`, `scripts/mock-policy-server/`
+
+Their npm scripts, ESLint import rules, hygiene filters and ignore entries are
+removed with them. Restore them from the upstream tag the same way as the
+extensions above.
+
+## Vendored TypeScript 7 client
+
+`extensions/typescript-native/` is `_extension/` from `microsoft/typescript-go`
+at tag `typescript/v7.0.2` (`2bd066d87f5bafd315be9f40889d0a60b9e58e0b`).
+Review changes:
+
+- adds in-tree build files and rewrites the `package.json` build fields;
+- installs the server binary per target with `scripts/typescript-native.mjs`;
+- `src/util.ts` `getUseTsgo`: falls back to the default value;
+- `src/extension.ts` `warnAboutTsServerPlugins`: returns when no setting is
+  explicit;
+- `package.json`: `trace.server` defaults to `off`.
+
+To update, copy a newer tag and bump the pins in the script together.
+
+## Pruned Agents window
+
+Review deletes all 605 upstream files under `src/vs/sessions/` and the Agents
+window boot plumbing. Review never opens this window, but every packaged build
+compiled and shipped it.
+
+Review owns its configuration and workspace services under `src/vs/review`.
+It uses the stock editor parts and a small, inert pane-composite service. A
+Review canvas service registers the hidden layout placeholder. Shared agent
+theme tokens now live under `src/vs/workbench/common`. Shared chat styles use
+the existing platform font sizes. The agent-host MCP server type now lives
+under `src/vs/platform/agentHost/common`.
+
+## Pruned upstream agent host
+
+Whiteboard Ask launches the reviewer's own agent CLI, directly or through an
+ACP adapter, from `packages/review/src/ask/agents.ts`. It communicates over
+stdio using `@agentclientprotocol/sdk`; it does not use VS Code's agent host.
+
+Review removes the upstream execution and distribution paths:
+
+- `src/vs/platform/agentHost/node/` and `electron-main/`, including the agent
+  host and diff-worker entry points, Claude/Codex/Copilot backends, SDK
+  downloader, and local/SSH/WSL/tunnel host implementations.
+- The agent-host process manager in `src/vs/code/electron-main/app.ts` and
+  the agent-host services and IPC channels in the shared process.
+- The agent-host and diff-worker bundles in `build/next/index.ts` and
+  `build/buildfile.ts`, plus SDK product metadata in `build/gulpfile.vscode.ts`
+  and `src/vs/base/common/product.ts`.
+- `build/agent-sdk/`, `build/codex/`, `scripts/sync-agent-host-protocol.ts`,
+  and `build/lib/test/agentHostDependencies.test.ts`. Their build-test targets,
+  protocol scripts, generated-source filters, and runtime import exceptions
+  are removed too.
+- `inspect-agenthost` and `inspect-brk-agenthost` CLI options and the unused
+  `parseAgentHostDebugPort` helper. The upstream launch skill no longer
+  allocates or passes an agent-host debugger port, emits `agentHostPort`, or
+  documents attaching to the deleted host.
+- Root development dependencies `@anthropic-ai/claude-agent-sdk`,
+  `@anthropic-ai/sdk`, and `@openai/codex`; remote dependencies
+  `@github/copilot`, `@github/copilot-sdk`, and `@vscode/copilot-api`.
+  Their orphaned lockfile entries are removed. The unused Copilot SDK and
+  Copilot API declarations and TypeScript alias are removed as well.
+
+Only the dependency closure of `src/vs/platform/agentHost/common/` imported
+by retained upstream chat/editor source remains. These shared interfaces,
+URI helpers, and state/protocol definitions have no agent process startup or
+SDK imports. Unreferenced common modules, host configuration registration,
+and the agent-host mock TypeScript root are removed. The generated protocol
+files in this retained closure are frozen at the upstream pin. The retained
+common files are unchanged by this pruning.
+
+For an upstream refresh, exclude the removed execution and tooling directories
+listed above and preserve the small startup, entry-point, configuration, and
+manifest diffs. Do not exclude the whole `agentHost/` tree: retain the common
+module dependency closure needed by the refreshed chat/editor source, then
+type-check and bundle to catch new dependencies. The pruning commit records
+the exact selectively deleted common files for comparison.
+
+Whiteboard's ACP adapters, agent discovery, permissions, and session handling
+are unchanged. Restore the removed implementation from the recorded upstream
+commit and restore its build/startup wiring before enabling VS Code agent hosts.
+
+## Restored extension webview API
+
+The vendored tree shipped the webview, webview panel, and webview view
+contributions but not the extension-host bridge that drives them, so the
+Markdown preview, extension webviews, and custom editors failed in the native
+source window with `Unknown actor MainThreadWebviews`. These files were absent
+without an entry here; they are now restored byte-for-byte from the upstream
+commit above, so they are not a fork divergence:
+
+- `src/vs/workbench/api/browser/`: `mainThreadWebviewManager.ts`,
+  `mainThreadWebviews.ts`, `mainThreadWebviewPanels.ts`,
+  `mainThreadWebviewViews.ts`, `mainThreadCustomEditors.ts`, and
+  `mainThreadChatOutputRenderer.ts` (the manager constructs it).
+- `src/vs/workbench/contrib/customEditor/`: `browser/customEditor.contribution.ts`,
+  `browser/customEditors.ts`, `browser/customEditorDiffInput.ts`,
+  `browser/customEditorInputFactory.ts`, `browser/media/customEditor.css`,
+  `common/contributedCustomEditors.ts`, `common/customEditorModelManager.ts`,
+  `common/customTextEditorModel.ts`, and `common/extensionPoint.ts`.
+- `src/vs/workbench/contrib/webviewView/browser/webviewView.contribution.ts`.
+
+Review's own manifests wire them up: `reviewExtensionHost.contribution.ts`
+imports the manager, and `editor.common.main.ts` imports the two contributions
+and registers upstream's `ChatOutputRendererService`, which upstream registers
+from the chat contribution Review does not load. Both windows load these.
+Webview resources still resolve only through
+`contrib/webview/browser/resourceLoading.ts`, so the webview containment fixes
+above still apply, and every webview still loads through the `pre/index.html` host
+described below.
+
+## Intentional fork divergence
+
+- `src/vs/editor/browser/controller/editContext/native/nativeEditContextUtils.ts`:
+  prevent browser scrolling when the native editor input gains focus.
+- `src/vs/platform/log/node/spdlogLog.ts`: without `@vscode/spdlog`, append
+  to the log file with `fs` instead of dropping every message. The remote
+  runtime bundle leaves spdlog out; Desktop has it.
+- `src/vs/workbench/api/browser/mainThreadMessageService.ts`: drop extension
+  messages that `vs/review/common/reviewSuppressedExtensionMessages.ts`
+  matches (ty's Python environment prompt).
+
+Compare a fresh checkout of the upstream commit with `code-oss/`, ignoring the
+vendor-time exclusions above. Every remaining difference must be covered by
+one of these entries:
+
+- `README.md`: fork orientation and npm-only build rule.
+- `package.json` and `package-lock.json`: omit tasks and runtime dependencies
+  for the excluded Copilot extension. Also removes dependencies whose features Review never
+  reaches: `@vscode/windows-process-tree`, `windows-foreground-love`,
+  `kerberos`, `@vscode/policy-watcher`, `@vscode/fs-copyfile`,
+  `@microsoft/mxc-sdk`, `@vscode/l10n-dev`, `@vscode/test-web`, and
+  `@vscode/telemetry-extractor`. Their import sites typecheck against
+  `src/typings/removed-native-modules.d.ts`. `@vscode/windows-registry`,
+  `native-is-elevated`, and the optional `@vscode/windows-mutex` were removed
+  too, then restored by the Windows build (#590) because the main process
+  imports them there; their ambient declarations remain.
+  The lockfile also advances Undici, Hono, its Node adapter, `ip-address`, and
+  `body-parser` within their declared ranges to releases that clear their
+  applicable security advisories.
+- `build/package.json` and `build/package-lock.json`: drop unreferenced
+  packaging/publishing tooling (`@azure/*`, `tree-sitter`,
+  `tree-sitter-typescript`, the duplicate `@vscode/ripgrep-universal`). The
+  lockfile carries patched `brace-expansion`, `js-yaml`, and `linkify-it`
+  releases within the existing manifest ranges.
+- `build/npm/gyp/package-lock.json`: advance patched `brace-expansion` and
+  `ip-address` releases within the existing manifest ranges.
+- `build/lib/i18n.ts`: local l10n types and a lazy `@vscode/l10n-dev` import
+  so the module loads without the package installed.
+- `src/typings/removed-native-modules.d.ts`: ambient declarations replacing
+  the typings of removed native dependencies.
+- `extensions/markdown-language-features/src/languageFeatures/copyFiles/snippets.ts`:
+  parse snippet variables linearly instead of using an ambiguous regular
+  expression that can backtrack exponentially on a short workspace setting.
+- `extensions/configuration-editing/` (`package.json`, `tsconfig.json`,
+  `src/configurationEditingMain.ts`, and the deleted
+  `src/importExportProfiles.ts`) and
+  `src/vs/workbench/api/common/extHostProfileContentHandler.ts` (with its
+  constructor call in `extHost.api.impl.ts`): Review has no profiles UI and
+  no `MainThreadProfileContentHandlers`, so the GitHub gist profile handler is
+  removed and `registerProfileContentHandler` returns an inert disposable
+  instead of calling the missing actor.
+- `src/vs/platform/terminal/common/terminalEnvironment.ts`: quote complete path
+  arguments with each shell's native rules instead of stripping metacharacters
+  and emitting invalid POSIX quoting for apostrophes.
+- `src/vs/platform/remote/common/remoteAgentConnection.ts`: a permanent
+  failure ends only its own connection. Upstream's permanent failure is one
+  static flag that ends every connection in the window; with several remotes
+  per window a failed remote must end only its own connection. A failed
+  connection also sets upstream's never-written per-instance flag so it does
+  not reconnect again. A Management connection's reconnection failure is not
+  fatal either: it ends that connection only. Isolation is unconditional, so a
+  remote Source window gets no upstream reload dialog; it reconnects through
+  the fork's resolver and shows its host state in the status bar.
+- `src/vs/platform/window/common/window.ts` and
+  `src/vs/platform/native/electron-main/nativeHostMainService.ts`: the
+  `openWindow` option `reviewReferencesToShow` runs Find References in the
+  opened window.
+- `extensions/package.json` and the extension `package.json`/`package-lock.json`
+  files: `@vscode/extension-telemetry` is hoisted to the shared extensions
+  install (github keeps its own ^1.0.0 copy; the shared copy is ^0.9.8). The
+  CSS, HTML, JSON, and Markdown extension locks also advance security-patched
+  transitive packages without widening their manifest ranges.
+- `product.json`: also carries `reviewVersion`, Review's own release number.
+  `version` stays the Code OSS base version because the curated extensions
+  match their `engines.vscode` range against it, so the release number needs a
+  field of its own. The About panel reads it, the release workflow writes it,
+  and `scripts/product-hardening.test.mjs` fails when it drifts from
+  `apps/review-desktop/package.json`. Beyond that: Review product identity, VSCodium-derived telemetry,
+  experiment, crash-reporting, edit-statistics, and natural-language-search
+  opt-out defaults; stable updates from `update.dev.fast` rather than
+  Microsoft's update service; no extension gallery; no unused debugger
+  built-in downloads; and removal of safely optional Microsoft service
+  endpoints. The coupled default chat-agent metadata remains until its
+  startup consumers can also be removed or guarded. Review also claims the
+  install identities that would otherwise collide with a real Code OSS or
+  VS Code install on the same machine: `sharedDataFolderName` (live on macOS —
+  it locates the `sharedStorage` database), the Windows singleton and tunnel
+  mutex names, `win32AppUserModelId`, and all four Inno Setup app ids, which
+  were regenerated rather than kept at the stock Code OSS GUIDs.
+  Two identity gaps remain deliberately: `serverApplicationName`,
+  `serverDataFolderName`, and `tunnelApplicationName` still hold their upstream
+  values because the agent-host stack uses those names to locate a server on
+  *remote* hosts. The fork does ship a trimmed remote server (below), but its
+  launcher (`whiteboard remote attach`) always passes `--server-data-dir`, so the
+  `serverDataFolderName` default is never used; and `darwinProfileUUID` /
+  `darwinProfilePayloadUUID` are untouched upstream values kept only because
+  `build/lib/policies/policyGenerator.ts` hard-throws without them, on a path
+  nothing in this tree invokes.
+- `build/lib/electron.ts`: stamp dev.fast company, copyright, and display-name
+  metadata into packaged applications.
+- `src/vs/platform/update/electron-main/updateService.darwin.ts`:
+  `doDownloadUpdate` re-checks the feed with the installed commit instead of
+  the target commit; the dev.fast update Worker keys 204/200 off the caller's
+  commit, so sending the target commit would read as "up to date" and no-op
+  the explicit download.
+- `build/darwin/entitlements/` and `build/darwin/sign.ts`: restore the exact
+  upstream macOS hardened-runtime entitlements under a retained path and use
+  them for Developer ID signing without the excluded Azure build tree.
+- `build/darwin/distribution.provisionprofile`: deleted. It carries Microsoft's
+  team `UBF8T346G9` and `com.microsoft.VSCodeInsiders`, and upstream embeds it
+  only from the excluded Azure signing job. `sign.ts` sets
+  `preEmbedProvisioningProfile: false`, so nothing here ever consumed it.
+- `scripts/notarize-macos.sh` (fork-owned): accepts `APPLE_SIGN_IDENTITY` as an
+  alias for the `CODESIGN_IDENTITY` that upstream's `sign.ts` reads, so the
+  signing identity can live with the rest of the Apple credentials.
+- `build/.moduleignore`: also drops `playwright-core` from packaged builds. It is
+  a production dependency (~12 MB) loaded only by
+  `src/vs/platform/browserView/node/playwrightService.ts` through a dynamic
+  import, on a path nothing constructs once the `playwright` channel is
+  unregistered.
+  It also drops the 1DS/Application Insights telemetry SDKs (Review sets no
+  `product.aiConfig`, and the built-in extensions bundle their own copies),
+  root `katex` (chat only), `@vscode/tree-sitter-wasm` (Review stubs
+  `ITreeSitterLibraryService`; highlighting is behind experimental settings it
+  never enables), and tsserver's translated diagnostics.
+- `build/darwin/create-universal-app.ts`
+- `build/darwin/verify-macho.ts`
+- `build/lib/i18n.resources.json`
+- `build/lib/policies/policyData.jsonc`
+- `build/lib/test/fixtures/policies/darwin/fr-fr/com.visualstudio.code.oss.plist`
+- `build/lib/test/fixtures/policies/win32/fr-fr/CodeOSS.adml`
+- `build/lib/test/policyConversion.test.ts`
+- `build/rspack/workbench-rspack.html`
+- `build/vite/workbench-vite.html`
+
+  These files remove packaging, localization, policy, fixture, and trusted
+  extension references owned by the excluded Copilot extension and runtime.
+- `build/buildfile.ts`
+- `build/filters.ts`
+- `build/gulpfile.ts`: drop the advisory `monaco-typecheck` pass from the
+  `compile` task (the task itself remains runnable on demand).
+- `build/gulpfile.extensions.ts` (also compiles `typescript-native`)
+- `build/gulpfile.hygiene.ts`
+- `build/gulpfile.reh.ts`
+- `build/gulpfile.vscode.ts` and `build/next/index.ts`: also skip the welcome
+  walkthrough media, the PSReadLine terminal module, and the tree-sitter query
+  files, none of which Review loads.
+  `gulpfile.vscode.ts` also keeps only Chromium's English UI translations
+  (`locales/en-*.pak`, `en*.lproj`), since Review's UI is English only.
+- `build/hygiene.ts`
+- `build/lib/extensions.ts` (also excludes the curated built-in extensions,
+  which are staged from prebuilt VSIXes rather than packaged from source)
+- `build/lib/compilation.ts`
+- `build/lib/runtimePlatform.ts`
+- `build/next/index.ts`: Review desktop entry points, review CSS bundle, and
+  the plugin that inlines Review's browser dependencies (zod,
+  eventsource-parser).
+- `build/npm/dirs.ts`: also drops the `build/rspack` and `build/vite`
+  dev-server experiment installs; run `npm install` in those directories
+  manually to use them. Adds `extensions/typescript-native`.
+- `build/npm/postinstall.ts`
+- `build/copilot-migrate-pr.ts` (deleted)
+- `build/lib/copilot.ts` (deleted)
+- `build/lib/test/copilot.test.ts` (deleted)
+- `src/tsconfig.json`: the normal Review build excludes upstream
+  `vs/**/test/**` directories while retaining their source. The former
+  Copilot SDK type alias and agent-host mock root are removed with the host
+  implementation (see Pruned upstream agent host above).
+- `src/vs/code/electron-browser/workbench/workbench.ts`: load the native code
+  navigator entry for workspace windows and the Review entry for empty windows,
+  with the matching stylesheet. Both entries share the curated editor services.
+- `src/vs/platform/menubar/electron-main/menubar.ts`: expose `install` and
+  `windowsMainService` to the fork's subclass so native menus install only while
+  a workspace window is active; Review windows keep their application menu.
+- `src/main.ts`: import VS Code-family settings and keybindings into Review's
+  user-data profile before the configuration service starts, expose the
+  explicit re-import IPC handler, and record a crash that happens before
+  `startup()` finishes. These are the fork's only additions to the
+  pre-`bootstrapESM()` import graph, so they are held to that window's rules.
+  The first reaches only `vs/review/node/reviewUserConfigImport.ts`, which reads
+  setting keys from the import-free
+  `vs/review/common/reviewConfigurationDefaults.ts` and never touches the
+  configuration registry. The second reaches only
+  `vs/review/node/reviewBootstrapBreadcrumb.ts`, which imports node built-ins
+  and nothing else; `scripts/main-bootstrap-imports.test.mjs` asserts that. It
+  appends one JSON line under the user-data directory, which the next launch
+  reports through the normal opted-in telemetry path and deletes. See "The
+  main-process pre-bootstrap window" in `README.md`.
+- `src/vs/code/electron-browser/workbench/workbench.html` and
+  `workbench-dev.html`: allow the local Review session connection and the
+  canvas Trusted Types policies in built and development launches.
+- `src/vs/base/common/product.ts`: declares the `reviewVersion` field described
+  above, so the About panel can read it typed, and `whiteboardRemote`, the
+  per-arch remote tarballs that release builds pin for remote installs.
+- `src/vs/code/electron-main/app.ts`: own the embedded Review server lifecycle
+  and register the Review connection channel that hands the renderer the server
+  endpoint the main process validated. Also swaps two update- and menu-related
+  registrations, because Review's workbench drives neither surface:
+  `ReviewMenubarMainService` replaces `MenubarMainService` (the stock service
+  builds its menu from data the renderer never sends, and reinstalls that empty
+  menu on window focus and count changes), and `ReviewUpdateDialog` replaces
+  `NotAvailableUpdateDialog` (the stock dialog defers to a workbench
+  `UpdateContribution` that Review does not load).
+  Finally, it does not register `IAgentNetworkFilterService`,
+  `IWebContentExtractorService`, or the `webContentExtractor` IPC channel. No
+  Review surface reaches them, and leaving the channel registered exposes a
+  service with no consumer. Nor does it register `ILocalPtyService` (the
+  `PtyHostService` and its `ElectronPtyHostStarter`) or the `localPty` IPC
+  channel: Review's workbench loads no terminal contribution, so nothing would
+  ever request a pty host connection.
+- `src/vs/code/electron-utility/sharedProcess/sharedProcessMain.ts`: does not
+  register `ISharedWebContentExtractorService`, the `sharedWebContentExtractor`
+  channel, or the `playwright` channel and the network filter it is constructed
+  with. The only consumers of the shared web content extractor are three chat
+  renderer classes (`chatDragAndDrop`, `chatInputPart`, `chatAttachmentModel`)
+  that Review never instantiates, and nothing binds the service in Review's
+  renderer either. The browser-view stack behind the `playwright` channel is
+  reachable from no Review surface: Review registers no chat, browser-view, or
+  agent contributions, and the extension-host `browser` API is gated on a
+  proposed API that `product.json` does not enable.
+- `src/vs/workbench/contrib/webview/browser/pre/index.html`: guard a transient
+  missing iframe body while polling active webview focus. The page's
+  `script-src` pins its inline script by hash, so the same edit replaces
+  upstream's `sha256-nXjt…` with the edited script's hash; the policy is
+  otherwise upstream's. Before that, the host script was blocked and every
+  webview stayed blank. `scripts/product-hardening.test.mjs` checks the hash.
+- `src/vs/workbench/electron-browser/parts/dialogs/dialog.contribution.ts`:
+  append Review's PostHog install ID to the native About details and copied
+  details after the embedded server announces its stored identity.
+- `src/vs/workbench/services/layout/browser/layoutService.ts`: alias the Review
+  canvas to the sessions part, and add the board sidebar part
+  (`REVIEW_SIDEBAR_PART`, which replaces `REVIEW_EXPLORER_PART`) and the
+  column right of the board (`REVIEW_ASK_PART`).
+- `src/vs/workbench/common/editor.ts`, `src/vs/workbench/common/contextkeys.ts`,
+  `src/vs/workbench/services/editor/common/editorGroupsService.ts`, and
+  `src/vs/workbench/browser/parts/editor/` (`editor.ts`,
+  `editor.contribution.ts`, `editorActions.ts`, `editorGroupView.ts`,
+  `editorPart.ts`, `auxiliaryEditorPart.ts`, `editorTabsControl.ts`,
+  `multiEditorTabsControl.ts`, `singleEditorTabsControl.ts`): verbatim backport
+  of upstream's `EditorInputCapabilities.CannotClose` feature (enum entries
+  `ExcludeFromEditorLimit = 1 << 12` and `CannotClose = 1 << 13`, the
+  `ActiveEditorCannotCloseContext` key, tab-control and close-path guards, the
+  `force` close options, and the Close menu `when` clauses), which upstream
+  added after the vendored commit. The Review Home tab declares `CannotClose`.
+  Every hunk copies current upstream text, so an upstream refresh that includes
+  the feature absorbs these files with no net difference. `ExcludeFromEditorLimit`
+  is enum-only here; the fork neither sets nor honors it yet.
+  Two hunks go beyond upstream and survive a refresh as intentional diffs:
+  `editorGroupView.ts` `doStickEditor` refuses to unstick a `CannotClose`
+  editor (the compact icon-only Home rendering depends on stickiness), and
+  the `editor.contribution.ts` Unpin tab-context item is hidden for
+  `CannotClose` editors so the menu does not offer a dead action.
+- `src/vs/editor/browser/widget/multiDiffEditor/` (`diffEditorItemTemplate.ts`,
+  `multiDiffEditorResourceHeader.ts`, `multiDiffEditorViewModel.ts`,
+  `multiDiffEditorWidget.ts`, `multiDiffEditorWidgetImpl.ts`,
+  `workbenchUIElementFactory.ts`, `style.css`),
+  `src/vs/editor/browser/widget/diffEditor/` (`diffEditorWidget.ts`,
+  `diffEditorViewModel.ts`, `utils.ts`, `style.css`,
+  `features/hideUnchangedRegionsFeature.ts`, `components/diffEditorDecorations.ts`,
+  `components/diffEditorEditors.ts`, and `components/diffEditorViewZones/`
+  `diffEditorViewZones.ts`, `inlineDiffDeletedCodeMargin.ts`, `renderLines.ts`),
+  `src/vs/editor/common/diff/documentDiffProvider.ts`, the fork-added
+  `src/vs/editor/common/diff/sourceLineAlignment.ts`, and
+  `src/vs/workbench/contrib/multiDiffEditor/browser/` (`multiDiffEditorInput.ts`,
+  `multiDiffSourceResolverService.ts`): Review's Diff view. Unified and
+  structural diffs, stable keys for progressive loading, folded binary entries,
+  Dock-sized bottom scroll space, persisted view state, no restyling while
+  scrolling, and horizontal scrolling in inline entries (862110bb8, 0b9d0ac08,
+  9af69be21, 51b1a4061, a43ec7425, 96fd6fa84, 9c152358d, 5ca7aa1fe, b1be23513,
+  3c14a9e64, da9b3b546).
+- `src/vs/editor/common/config/editorOptions.ts`: an internal
+  `glyphMarginWidth` override lets compact Whiteboard editors animate the Ask
+  pin lane using real Monaco layout. Other editors retain the upstream
+  line-height-based glyph margin.
+- `src/vs/base/browser/ui/scrollbar/` (`scrollableElement.ts`,
+  `scrollableElementOptions.ts`, `scrollbarState.ts`, `verticalScrollbar.ts`):
+  let document scrolling pass over embedded diagrams and code peeks
+  (9c152358d).
+- `src/vs/workbench/browser/parts/editor/editorCommands.ts`: the modal editor's
+  list/tree Escape arm sits at `WorkbenchContrib + 51`, above the References
+  peek's own rule, so one Escape closes the modal (b837f01aa).
+- `src/vs/workbench/browser/parts/editor/` (`editor.contribution.ts`,
+  `editorActions.ts`, `editorCommands.ts`, `editorParts.ts`,
+  `editorTabsControl.ts`, `modalEditorPart.ts`) and
+  `src/vs/workbench/contrib/output/browser/output.contribution.ts`: remove
+  every way to open a detached editor window, which Review's status bar
+  service cannot host (0748d87db).
+- `.gitignore`: ignore the curated built-in extension payloads that
+  `scripts/curated-extensions.mjs` materializes under `extensions/`.
+- `src/vs/review/`: Review-owned workbench, protocol, and tests. These files
+  carry a dev.fast copyright header rather than Microsoft's.
+- `src/vs/platform/notification/common/notification.ts`,
+  `src/vs/workbench/common/notifications.ts`, and
+  `src/vs/workbench/browser/parts/notifications/notificationsViewer.ts`:
+  allow the default notification action to appear after the other buttons.
+- `src/vs/platform/agentHost/` planning documents (deleted): the upstream
+  commit vendored internal phase plans and design notes
+  (`node/claude/phase*-plan.md`, `roadmap.md`, `smoke.md`, `CONTEXT.md`,
+  `MULTI_CHAT_ARCHITECTURE.md`, `OTEL.md`). They serve no build purpose and
+  are removed; source-code comments may still cite them.
+- extension `package.json` files: the `aiKey` Application Insights field is
+  removed from the five language extensions that carried it. Telemetry is
+  force-disabled product-wide; the key was inert.
+- `licenses/`: fork-added third-party notices (eventsource-parser, zod,
+  elkjs, libavoid-js, KaTeX, @vscode/codicons). `build/gulpfile.vscode.ts`
+  copies this directory into packaged builds.
+- The remote server: a trimmed copy of upstream's server starts the stock
+  extension host on a remote machine, so remote reviews get language features
+  from the same extensions. `scripts/build-remote-runtime.mjs` bundles it.
+  Restored from the upstream commit above, unmodified: `src/server-main.ts`,
+  `src/bootstrap-server.ts`, and in `src/vs/server/node/`:
+  `extensionHostConnection.ts`, `extensionHostStatusService.ts`,
+  `extensionsScannerService.ts`, `remoteAgentEnvironmentImpl.ts`,
+  `remoteExtensionManagement.ts`, `remoteFileSystemProviderServer.ts`,
+  `remoteLanguagePacks.ts`, `serverConnectionToken.ts`,
+  `serverEnvironmentService.ts`, `serverLifetimeService.ts`; and
+  `src/vs/platform/telemetry/node/errorTelemetry.ts`.
+  Restored and trimmed, each trim marked with a `Whiteboard:` comment:
+  - `serverServices.ts`: keeps the logger, file, configuration, user data
+    profile, extension host status, lifetime and extensions scanner services,
+    and the `logger`, `userDataProfiles`, `remoteextensionsenvironment`,
+    `remoteExtensionsScanner`, `remoteFilesystem` and extension host debug
+    broadcast channels. `telemetry` is a no-op channel, `extensions` and
+    `extensionGalleryManifest` list no extensions, and `ITelemetryService`
+    is `NullTelemetryService`. Cuts requests, telemetry appenders and machine
+    ids, the gallery and extension installs, language packs, terminals, the
+    agent host, MCP and the sandbox helper.
+  - `remoteExtensionsScanner.ts`: scans only; install-on-start, the gallery and
+    language pack installs are cut.
+  - `remoteExtensionHostAgentServer.ts`: the web client and
+    `/vscode-remote-resource` are cut, with a local `serveError`.
+  - `server.main.ts`: `spawnCli` reports that the extension management CLI is
+    not included.
+  The rest of `src/vs/server/` and `src/server-cli.ts` stay deleted.
+  `src/vs/server/node/reviewServerHandshake.test.ts` is fork-owned. The
+  bundle writes an empty `out/nls.messages.json`; its `localize` calls stay
+  unbuilt, so the table is never read.
+
+## Serialize the fork
+
+From the monorepo root:
+
+```sh
+git diff code-oss-upstream-8a7abeba..HEAD -- apps/review-desktop/code-oss
+```
+
+For an upstream refresh, clone the recorded commit into a fresh temporary
+directory, apply the same vendor-time exclusions, and compare it recursively
+with `code-oss/`. The only remaining differences must be the paths enumerated
+above. Update this file whenever that inventory changes.

@@ -1,0 +1,975 @@
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
+	"github.com/yoanbernabeu/grepai/config"
+	"github.com/yoanbernabeu/grepai/store"
+	"github.com/yoanbernabeu/grepai/trace"
+)
+
+// TestServerCreateEmbedder_AppliesConfiguredDimensions verifies that createEmbedder
+// passes configured dimension into each embedder constructor.
+func TestServerCreateEmbedder_AppliesConfiguredDimensions(t *testing.T) {
+	tests := []struct {
+		name       string
+		provider   string
+		dimensions int
+		apiKey     string
+	}{
+		{name: "ollama", provider: "ollama", dimensions: 768},
+		{name: "lmstudio", provider: "lmstudio", dimensions: 768},
+		{name: "openai-1536", provider: "openai", dimensions: 1536, apiKey: "sk-test"},
+		{name: "openai-3072", provider: "openai", dimensions: 3072, apiKey: "sk-test"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{}
+			cfg := config.DefaultConfig()
+			cfg.Embedder.Provider = tt.provider
+			cfg.Embedder.Dimensions = &tt.dimensions
+			cfg.Embedder.APIKey = tt.apiKey
+
+			emb, err := s.createEmbedder(cfg)
+			if err != nil {
+				t.Fatalf("createEmbedder returned error: %v", err)
+			}
+
+			if emb.Dimensions() != tt.dimensions {
+				t.Fatalf("expected dimensions %d, got %d", tt.dimensions, emb.Dimensions())
+			}
+		})
+	}
+}
+
+// TestCompactStructDefinitions verifies compact struct definitions.
+func TestCompactStructDefinitions(t *testing.T) {
+	t.Run("SearchResultCompact has no Content field", func(t *testing.T) {
+		compact := SearchResultCompact{
+			FilePath:  "test.go",
+			StartLine: 10,
+			EndLine:   20,
+			Score:     0.95,
+		}
+
+		jsonBytes, err := json.Marshal(compact)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+
+		jsonStr := string(jsonBytes)
+		if strings.Contains(jsonStr, "content") {
+			t.Errorf("Compact struct should not contain 'content' field, got: %s", jsonStr)
+		}
+		if !strings.Contains(jsonStr, "file_path") {
+			t.Errorf("Compact struct should contain 'file_path' field, got: %s", jsonStr)
+		}
+	})
+
+	t.Run("CallSiteCompact has no Context field", func(t *testing.T) {
+		compact := CallSiteCompact{
+			File: "test.go",
+			Line: 10,
+		}
+
+		jsonBytes, err := json.Marshal(compact)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+
+		jsonStr := string(jsonBytes)
+		if strings.Contains(jsonStr, "context") {
+			t.Errorf("Compact struct should not contain 'context' field, got: %s", jsonStr)
+		}
+		if !strings.Contains(jsonStr, "file") {
+			t.Errorf("Compact struct should contain 'file' field, got: %s", jsonStr)
+		}
+	})
+}
+
+// TestCompactStructMarshaling verifies JSON marshaling of compact structs.
+func TestCompactStructMarshaling(t *testing.T) {
+	t.Run("SearchResult vs SearchResultCompact", func(t *testing.T) {
+		full := SearchResult{
+			FilePath:  "test.go",
+			StartLine: 10,
+			EndLine:   20,
+			Score:     0.95,
+			Content:   "line 1\nline 2\nline 3",
+		}
+
+		compact := SearchResultCompact{
+			FilePath:  "test.go",
+			StartLine: 10,
+			EndLine:   20,
+			Score:     0.95,
+		}
+
+		fullJSON, err := json.Marshal(full)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+
+		compactJSON, err := json.Marshal(compact)
+		if err != nil {
+			t.Fatalf("Marshal failed: %v", err)
+		}
+
+		if len(compactJSON) >= len(fullJSON) {
+			t.Errorf("Compact JSON should be shorter than full JSON, got compact=%d, full=%d", len(compactJSON), len(fullJSON))
+		}
+
+		if !strings.Contains(string(fullJSON), "content") {
+			t.Errorf("Full JSON should contain 'content' field")
+		}
+
+		if strings.Contains(string(compactJSON), "content") {
+			t.Errorf("Compact JSON should not contain 'content' field")
+		}
+	})
+}
+
+// TestNonCompactSearchResult verifies that the full SearchResult struct
+// includes all expected fields when NOT in compact mode.
+func TestNonCompactSearchResult(t *testing.T) {
+	result := SearchResult{
+		FilePath:  "example/test.go",
+		StartLine: 42,
+		EndLine:   50,
+		Score:     0.87,
+		Content:   "func example() {\n\treturn true\n}",
+	}
+
+	jsonBytes, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+
+	jsonStr := string(jsonBytes)
+
+	// Verify all required fields are present
+	expectedFields := []string{
+		"file_path",
+		"start_line",
+		"end_line",
+		"score",
+		"content",
+	}
+
+	for _, field := range expectedFields {
+		if !strings.Contains(jsonStr, field) {
+			t.Errorf("Non-compact JSON should contain '%s' field, got: %s", field, jsonStr)
+		}
+	}
+
+	// Verify content field has correct value
+	if !strings.Contains(jsonStr, "func example()") {
+		t.Errorf("Non-compact JSON should contain full content, got: %s", jsonStr)
+	}
+
+	// Verify score is present and non-zero
+	if !strings.Contains(jsonStr, "0.87") {
+		t.Errorf("Non-compact JSON should contain score value, got: %s", jsonStr)
+	}
+}
+
+// TestServerCreateStore_GOBBackend tests createStore with gob backend
+func TestServerCreateStore_GOBBackend(t *testing.T) {
+	s := &Server{
+		projectRoot: "/tmp/test-project",
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.Store.Backend = "gob"
+
+	ctx := context.Background()
+	store, err := s.createStore(ctx, cfg)
+
+	if err != nil {
+		t.Fatalf("createStore returned error: %v", err)
+	}
+
+	if store == nil {
+		t.Error("expected non-nil store")
+	}
+
+	_ = store.Close()
+}
+
+// TestServerCreateStore_UnknownBackend tests that createStore returns error for unknown backend
+func TestServerCreateStore_UnknownBackend(t *testing.T) {
+	s := &Server{
+		projectRoot: "/tmp/test-project",
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.Store.Backend = "unknown-backend"
+
+	ctx := context.Background()
+	_, err := s.createStore(ctx, cfg)
+
+	if err == nil {
+		t.Fatal("expected error for unknown backend, got nil")
+	}
+
+	expected := "unknown storage backend: unknown-backend"
+	if err.Error() != expected {
+		t.Errorf("expected error message %s, got %s", expected, err.Error())
+	}
+}
+
+// TestRegisterTools_IndexStatusSchema verifies that the grepai_index_status tool
+// is registered with a non-empty schema (regression for empty schema error).
+func TestRegisterTools_IndexStatusSchema(t *testing.T) {
+	s := &Server{
+		projectRoot: "/tmp/test-project",
+	}
+
+	// initialize minimal MCP server like NewServer would
+	s.mcpServer = server.NewMCPServer("grepai-test", "1.0.0")
+
+	s.registerTools()
+
+	tools := s.mcpServer.ListTools()
+	indexStatus, ok := tools["grepai_index_status"]
+	if !ok {
+		t.Fatalf("grepai_index_status tool not registered")
+	}
+
+	schema := indexStatus.Tool.InputSchema
+	if schema.Type != "object" {
+		t.Fatalf("expected schema type object, got %q", schema.Type)
+	}
+
+	prop, ok := schema.Properties["verbose"]
+	if !ok {
+		t.Fatalf("expected verbose property in schema")
+	}
+
+	propMap, ok := prop.(map[string]any)
+	if !ok {
+		t.Fatalf("verbose property is not an object, got %T", prop)
+	}
+
+	if propMap["type"] != "boolean" {
+		t.Fatalf("expected verbose type boolean, got %v", propMap["type"])
+	}
+}
+
+func TestNewServerWithWorkspace(t *testing.T) {
+	t.Run("creates_server_with_workspace", func(t *testing.T) {
+		srv, err := NewServerWithWorkspace("", "test")
+		if err != nil {
+			t.Fatalf("NewServerWithWorkspace error: %v", err)
+		}
+		if srv.workspaceName != "test" {
+			t.Errorf("expected workspace test, got %s", srv.workspaceName)
+		}
+		if srv.projectRoot != "" {
+			t.Errorf("expected empty projectRoot, got %s", srv.projectRoot)
+		}
+	})
+
+	t.Run("creates_server_with_project_and_workspace", func(t *testing.T) {
+		srv, err := NewServerWithWorkspace("/tmp/project", "test")
+		if err != nil {
+			t.Fatalf("NewServerWithWorkspace error: %v", err)
+		}
+		if srv.workspaceName != "test" {
+			t.Errorf("expected workspace test, got %s", srv.workspaceName)
+		}
+		if srv.projectRoot != "/tmp/project" {
+			t.Errorf("expected project /tmp/project, got %s", srv.projectRoot)
+		}
+	})
+}
+
+// TestResolveWorkspace_should_return_explicit_workspace_when_provided verifies that
+// resolveWorkspace returns the explicit workspace parameter when it is non-empty.
+func TestResolveWorkspace_should_return_explicit_workspace_when_provided(t *testing.T) {
+	s := &Server{workspaceName: "default"}
+
+	got := s.resolveWorkspace("explicit")
+	if got != "explicit" {
+		t.Errorf("expected 'explicit', got %q", got)
+	}
+}
+
+// TestResolveWorkspace_should_fallback_to_server_workspace_when_empty verifies that
+// resolveWorkspace falls back to the server's workspaceName when the parameter is empty.
+func TestResolveWorkspace_should_fallback_to_server_workspace_when_empty(t *testing.T) {
+	s := &Server{workspaceName: "default"}
+
+	got := s.resolveWorkspace("")
+	if got != "default" {
+		t.Errorf("expected 'default', got %q", got)
+	}
+}
+
+// TestResolveWorkspace_should_return_empty_when_both_empty verifies that
+// resolveWorkspace returns empty string when both parameter and server workspace are empty.
+func TestResolveWorkspace_should_return_empty_when_both_empty(t *testing.T) {
+	s := &Server{workspaceName: ""}
+
+	got := s.resolveWorkspace("")
+	if got != "" {
+		t.Errorf("expected empty string, got %q", got)
+	}
+}
+
+// helperGetToolSchemaProperties returns the properties map for a registered tool.
+func helperGetToolSchemaProperties(t *testing.T, toolName string) map[string]any {
+	t.Helper()
+
+	s := &Server{projectRoot: "/tmp/test-project"}
+	s.mcpServer = server.NewMCPServer("grepai-test", "1.0.0")
+	s.registerTools()
+
+	tools := s.mcpServer.ListTools()
+	tool, ok := tools[toolName]
+	if !ok {
+		t.Fatalf("tool %q not registered", toolName)
+	}
+
+	schema := tool.Tool.InputSchema
+	if schema.Type != "object" {
+		t.Fatalf("expected schema type object, got %q", schema.Type)
+	}
+
+	props := make(map[string]any, len(schema.Properties))
+	for k, v := range schema.Properties {
+		props[k] = v
+	}
+	return props
+}
+
+// TestRegisterTools_should_include_workspace_param_on_trace_callers verifies that
+// grepai_trace_callers has workspace and project properties in its schema.
+func TestRegisterTools_should_include_workspace_param_on_trace_callers(t *testing.T) {
+	props := helperGetToolSchemaProperties(t, "grepai_trace_callers")
+
+	if _, ok := props["workspace"]; !ok {
+		t.Error("expected 'workspace' property in grepai_trace_callers schema")
+	}
+	if _, ok := props["project"]; !ok {
+		t.Error("expected 'project' property in grepai_trace_callers schema")
+	}
+}
+
+// TestRegisterTools_should_include_workspace_param_on_trace_callees verifies that
+// grepai_trace_callees has workspace and project properties in its schema.
+func TestRegisterTools_should_include_workspace_param_on_trace_callees(t *testing.T) {
+	props := helperGetToolSchemaProperties(t, "grepai_trace_callees")
+
+	if _, ok := props["workspace"]; !ok {
+		t.Error("expected 'workspace' property in grepai_trace_callees schema")
+	}
+	if _, ok := props["project"]; !ok {
+		t.Error("expected 'project' property in grepai_trace_callees schema")
+	}
+}
+
+// TestRegisterTools_should_include_workspace_param_on_trace_graph verifies that
+// grepai_trace_graph has workspace and project properties in its schema.
+func TestRegisterTools_should_include_workspace_param_on_trace_graph(t *testing.T) {
+	props := helperGetToolSchemaProperties(t, "grepai_trace_graph")
+
+	if _, ok := props["workspace"]; !ok {
+		t.Error("expected 'workspace' property in grepai_trace_graph schema")
+	}
+	if _, ok := props["project"]; !ok {
+		t.Error("expected 'project' property in grepai_trace_graph schema")
+	}
+}
+
+func TestRegisterTools_should_include_workspace_param_on_refs_readers(t *testing.T) {
+	props := helperGetToolSchemaProperties(t, "grepai_refs_readers")
+
+	if _, ok := props["workspace"]; !ok {
+		t.Error("expected 'workspace' property in grepai_refs_readers schema")
+	}
+	if _, ok := props["project"]; !ok {
+		t.Error("expected 'project' property in grepai_refs_readers schema")
+	}
+}
+
+func TestRegisterTools_should_include_workspace_param_on_refs_writers(t *testing.T) {
+	props := helperGetToolSchemaProperties(t, "grepai_refs_writers")
+
+	if _, ok := props["workspace"]; !ok {
+		t.Error("expected 'workspace' property in grepai_refs_writers schema")
+	}
+	if _, ok := props["project"]; !ok {
+		t.Error("expected 'project' property in grepai_refs_writers schema")
+	}
+}
+
+func TestRegisterTools_should_include_workspace_param_on_refs_graph(t *testing.T) {
+	props := helperGetToolSchemaProperties(t, "grepai_refs_graph")
+
+	if _, ok := props["workspace"]; !ok {
+		t.Error("expected 'workspace' property in grepai_refs_graph schema")
+	}
+	if _, ok := props["project"]; !ok {
+		t.Error("expected 'project' property in grepai_refs_graph schema")
+	}
+}
+
+// TestRegisterTools_should_include_workspace_param_on_index_status verifies that
+// grepai_index_status has a workspace property in its schema.
+func TestRegisterTools_should_include_workspace_param_on_index_status(t *testing.T) {
+	props := helperGetToolSchemaProperties(t, "grepai_index_status")
+
+	if _, ok := props["workspace"]; !ok {
+		t.Error("expected 'workspace' property in grepai_index_status schema")
+	}
+}
+
+func TestRegisterTools_should_document_search_path_scope_and_examples(t *testing.T) {
+	s := &Server{projectRoot: "/tmp/test-project"}
+	s.mcpServer = server.NewMCPServer("grepai-test", "1.0.0")
+	s.registerTools()
+
+	tools := s.mcpServer.ListTools()
+	searchTool, ok := tools["grepai_search"]
+	if !ok {
+		t.Fatalf("tool %q not registered", "grepai_search")
+	}
+
+	desc := searchTool.Tool.Description
+	if !strings.Contains(desc, "path starts with the project name") {
+		t.Fatalf("search tool description missing whole-workspace example: %q", desc)
+	}
+	if !strings.Contains(desc, "path relative to that project") {
+		t.Fatalf("search tool description missing single-project example: %q", desc)
+	}
+
+	pathPropRaw, ok := searchTool.Tool.InputSchema.Properties["path"]
+	if !ok {
+		t.Fatalf("path property missing from grepai_search schema")
+	}
+	pathProp, ok := pathPropRaw.(map[string]any)
+	if !ok {
+		t.Fatalf("path property is not object, got %T", pathPropRaw)
+	}
+	pathDesc, _ := pathProp["description"].(string)
+	if !strings.Contains(pathDesc, "relative to that project root") {
+		t.Fatalf("path description missing single-project guidance: %q", pathDesc)
+	}
+	if !strings.Contains(pathDesc, "must start with the project name") {
+		t.Fatalf("path description missing whole-workspace guidance: %q", pathDesc)
+	}
+}
+
+// Without exactly one project, a workspace path starts with the project name,
+// like the CLI (stored paths are <workspace>/<project>/<path>).
+func TestValidateWorkspacePathForProjects_requires_project_prefix_without_single_project(t *testing.T) {
+	ws := &config.Workspace{
+		Name: "acme",
+		Projects: []config.ProjectEntry{
+			{Name: "backend", Path: t.TempDir()},
+			{Name: "frontend", Path: t.TempDir()},
+		},
+	}
+
+	for _, tc := range []struct {
+		path     string
+		projects []string
+		wantOK   bool
+	}{
+		{"backend/src", nil, true},
+		{"frontend", nil, true},
+		{"src", nil, false},
+		{"backend/src", []string{"backend", "frontend"}, true},
+		{"frontend/app", []string{"backend", "shared"}, false},
+	} {
+		errMsg := validateWorkspacePathForProjects(tc.path, ws, tc.projects)
+		if (errMsg == "") != tc.wantOK {
+			t.Errorf("validate(%q, %v): got error %q, want ok=%v", tc.path, tc.projects, errMsg, tc.wantOK)
+		}
+	}
+}
+
+// A single-project path is not rejected when the project root does not exist
+// on the machine serving MCP (index built elsewhere).
+func TestValidateWorkspacePathForProjects_skips_missing_local_root(t *testing.T) {
+	ws := &config.Workspace{
+		Name:     "acme",
+		Projects: []config.ProjectEntry{{Name: "backend", Path: "/does/not/exist/backend"}},
+	}
+	if errMsg := validateWorkspacePathForProjects("src", ws, []string{"backend"}); errMsg != "" {
+		t.Fatalf("expected no error for a root missing on this host, got: %s", errMsg)
+	}
+}
+
+func refsTestRequest(args map[string]any) mcp.CallToolRequest {
+	return mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Arguments: args,
+		},
+	}
+}
+
+func textResultPayload(t *testing.T, result *mcp.CallToolResult) string {
+	t.Helper()
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if len(result.Content) == 0 {
+		t.Fatal("expected non-empty MCP content")
+	}
+	textContent, ok := result.Content[0].(mcp.TextContent)
+	if !ok {
+		t.Fatalf("expected text content, got %T", result.Content[0])
+	}
+	return textContent.Text
+}
+
+func seedRefsTestStore(t *testing.T) string {
+	t.Helper()
+
+	projectRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projectRoot, config.ConfigDir), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+
+	ctx := context.Background()
+	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRoot))
+	if err := symbolStore.SaveFile(ctx, "src/store.ts",
+		[]trace.Symbol{
+			{Name: "uidConsumer", Kind: trace.KindFunction, File: "src/store.ts", Line: 10},
+		},
+		[]trace.Reference{
+			{SymbolName: "uid", Kind: trace.RefKindRead, File: "src/store.ts", Line: 12, Context: "const current = state.uid", CallerName: "uidConsumer", CallerFile: "src/store.ts", CallerLine: 10},
+			{SymbolName: "uid", Kind: trace.RefKindWrite, File: "src/store.ts", Line: 13, Context: "state.uid = next", CallerName: "uidConsumer", CallerFile: "src/store.ts", CallerLine: 10},
+		},
+	); err != nil {
+		t.Fatalf("SaveFile failed: %v", err)
+	}
+	if err := symbolStore.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	return projectRoot
+}
+
+func TestHandleRefsReaders_requires_symbol(t *testing.T) {
+	s := &Server{}
+
+	result, err := s.handleRefsReaders(context.Background(), refsTestRequest(map[string]any{"format": "json"}))
+	if err != nil {
+		t.Fatalf("handleRefsReaders returned error: %v", err)
+	}
+
+	if got := textResultPayload(t, result); !strings.Contains(got, "symbol parameter is required") {
+		t.Fatalf("expected missing symbol error, got %q", got)
+	}
+}
+
+func TestHandleRefsGraph_rejects_invalid_format(t *testing.T) {
+	s := &Server{}
+
+	result, err := s.handleRefsGraph(context.Background(), refsTestRequest(map[string]any{
+		"symbol": "uid",
+		"format": "xml",
+	}))
+	if err != nil {
+		t.Fatalf("handleRefsGraph returned error: %v", err)
+	}
+
+	if got := textResultPayload(t, result); !strings.Contains(got, "format must be 'json' or 'toon'") {
+		t.Fatalf("expected invalid format error, got %q", got)
+	}
+}
+
+func TestHandleRefsTools_return_expected_readers_and_graph(t *testing.T) {
+	projectRoot := seedRefsTestStore(t)
+	s := &Server{projectRoot: projectRoot}
+
+	readersResult, err := s.handleRefsReaders(context.Background(), refsTestRequest(map[string]any{
+		"symbol": "uid",
+		"format": "json",
+	}))
+	if err != nil {
+		t.Fatalf("handleRefsReaders returned error: %v", err)
+	}
+
+	var readersPayload struct {
+		Query   string     `json:"query"`
+		Readers []RefUsage `json:"readers"`
+	}
+	if err := json.Unmarshal([]byte(textResultPayload(t, readersResult)), &readersPayload); err != nil {
+		t.Fatalf("failed to decode readers payload: %v", err)
+	}
+	if readersPayload.Query != "uid" {
+		t.Fatalf("query = %q, want uid", readersPayload.Query)
+	}
+	if len(readersPayload.Readers) != 1 {
+		t.Fatalf("expected 1 reader, got %d", len(readersPayload.Readers))
+	}
+	if readersPayload.Readers[0].Access != trace.RefKindRead {
+		t.Fatalf("reader access = %q, want %q", readersPayload.Readers[0].Access, trace.RefKindRead)
+	}
+	if readersPayload.Readers[0].Symbol.Name != "uidConsumer" {
+		t.Fatalf("reader symbol = %q, want uidConsumer", readersPayload.Readers[0].Symbol.Name)
+	}
+
+	graphResult, err := s.handleRefsGraph(context.Background(), refsTestRequest(map[string]any{
+		"symbol": "uid",
+		"format": "json",
+	}))
+	if err != nil {
+		t.Fatalf("handleRefsGraph returned error: %v", err)
+	}
+
+	var graphPayload struct {
+		Query   string     `json:"query"`
+		Readers []RefUsage `json:"readers"`
+		Writers []RefUsage `json:"writers"`
+	}
+	if err := json.Unmarshal([]byte(textResultPayload(t, graphResult)), &graphPayload); err != nil {
+		t.Fatalf("failed to decode graph payload: %v", err)
+	}
+	if len(graphPayload.Readers) != 1 || len(graphPayload.Writers) != 1 {
+		t.Fatalf("expected 1 reader and 1 writer, got %d/%d", len(graphPayload.Readers), len(graphPayload.Writers))
+	}
+	if graphPayload.Writers[0].Access != trace.RefKindWrite {
+		t.Fatalf("writer access = %q, want %q", graphPayload.Writers[0].Access, trace.RefKindWrite)
+	}
+}
+
+func TestValidateWorkspacePathForProjects_should_return_structured_hint_for_invalid_path(t *testing.T) {
+	projectRoot := filepath.Join(t.TempDir(), "ubermap_agent")
+	if err := os.MkdirAll(filepath.Join(projectRoot, "MM32", "src"), 0755); err != nil {
+		t.Fatalf("failed to create MM32/src: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(projectRoot, "src"), 0755); err != nil {
+		t.Fatalf("failed to create src: %v", err)
+	}
+
+	ws := &config.Workspace{
+		Name: "ws",
+		Projects: []config.ProjectEntry{
+			{Name: "ubermap_agent", Path: projectRoot},
+		},
+	}
+
+	errMsg := validateWorkspacePathForProjects("_agent_work/ubermap_agent/MM32/src", ws, []string{"ubermap_agent"})
+	if errMsg == "" {
+		t.Fatal("expected structured validation error, got empty string")
+	}
+
+	var hint map[string]any
+	if err := json.Unmarshal([]byte(errMsg), &hint); err != nil {
+		t.Fatalf("expected JSON structured hint, got parse error: %v, message: %s", err, errMsg)
+	}
+
+	if got := hint["reason"]; got != "path_not_within_selected_project" {
+		t.Fatalf("expected reason path_not_within_selected_project, got %v", got)
+	}
+
+	roots, ok := hint["selected_project_roots"].([]any)
+	if !ok || len(roots) == 0 {
+		t.Fatalf("expected non-empty selected_project_roots, got %#v", hint["selected_project_roots"])
+	}
+	foundRoot := false
+	for _, r := range roots {
+		if root, ok := r.(string); ok && root == projectRoot {
+			foundRoot = true
+			break
+		}
+	}
+	if !foundRoot {
+		t.Fatalf("expected selected_project_roots to include %q, got %#v", projectRoot, roots)
+	}
+
+	examples, ok := hint["example_valid_paths"].([]any)
+	if !ok || len(examples) == 0 {
+		t.Fatalf("expected non-empty example_valid_paths, got %#v", hint["example_valid_paths"])
+	}
+	hasMM32Src := false
+	for _, e := range examples {
+		if example, ok := e.(string); ok && example == "MM32/src" {
+			hasMM32Src = true
+			break
+		}
+	}
+	if !hasMM32Src {
+		t.Fatalf("expected MM32/src in example_valid_paths, got %#v", examples)
+	}
+}
+
+func TestValidateWorkspacePathForProjects_should_accept_valid_project_relative_path(t *testing.T) {
+	projectRoot := filepath.Join(t.TempDir(), "ubermap_agent")
+	if err := os.MkdirAll(filepath.Join(projectRoot, "MM32", "src"), 0755); err != nil {
+		t.Fatalf("failed to create MM32/src: %v", err)
+	}
+
+	ws := &config.Workspace{
+		Name: "ws",
+		Projects: []config.ProjectEntry{
+			{Name: "ubermap_agent", Path: projectRoot},
+		},
+	}
+
+	errMsg := validateWorkspacePathForProjects("MM32/src", ws, []string{"ubermap_agent"})
+	if errMsg != "" {
+		t.Fatalf("expected valid path without error, got: %s", errMsg)
+	}
+}
+
+func TestWorkspacePathHasIndexedFiles_should_detect_matching_paths(t *testing.T) {
+	ctx := context.Background()
+	mockStore := NewMockMCPStore()
+	if err := mockStore.SaveChunks(ctx, []store.Chunk{
+		{
+			ID:       "1",
+			FilePath: "tymemud/tymemud/MM32/src/a.go",
+		},
+		{
+			ID:       "2",
+			FilePath: "tymemud/tymemud/docs/readme.md",
+		},
+	}); err != nil {
+		t.Fatalf("failed to save chunks: %v", err)
+	}
+
+	found, err := workspacePathHasIndexedFiles(ctx, mockStore, "tymemud", []string{"tymemud"}, "MM32/src")
+	if err != nil {
+		t.Fatalf("workspacePathHasIndexedFiles returned error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected matching indexed files for MM32/src")
+	}
+}
+
+func TestWorkspacePathHasIndexedFiles_should_report_no_match_for_invalid_path(t *testing.T) {
+	ctx := context.Background()
+	mockStore := NewMockMCPStore()
+	if err := mockStore.SaveChunks(ctx, []store.Chunk{
+		{
+			ID:       "1",
+			FilePath: "tymemud/tymemud/MM32/src/a.go",
+		},
+		{
+			ID:       "2",
+			FilePath: "tymemud/tymemud/docs/readme.md",
+		},
+	}); err != nil {
+		t.Fatalf("failed to save chunks: %v", err)
+	}
+
+	found, err := workspacePathHasIndexedFiles(ctx, mockStore, "tymemud", []string{"tymemud"}, "_agent_work/ubermap_agent/MM32/src")
+	if err != nil {
+		t.Fatalf("workspacePathHasIndexedFiles returned error: %v", err)
+	}
+	if found {
+		t.Fatal("expected no indexed files for invalid path prefix")
+	}
+}
+
+// TestWorkspaceIndexStatus_should_marshal_correctly verifies that WorkspaceIndexStatus
+// marshals to JSON with the expected fields.
+func TestWorkspaceIndexStatus_should_marshal_correctly(t *testing.T) {
+	status := WorkspaceIndexStatus{
+		Workspace: "my-workspace",
+		Projects: []WorkspaceProjectStatus{
+			{Name: "project-a", Path: "/home/user/project-a", SymbolsReady: true, TotalSymbols: 42},
+			{Name: "project-b", Path: "/home/user/project-b", SymbolsReady: false, TotalSymbols: 0},
+		},
+		Provider: "ollama",
+		Model:    "nomic-embed-text",
+	}
+
+	jsonBytes, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+
+	jsonStr := string(jsonBytes)
+
+	expectedFields := []string{
+		`"workspace"`,
+		`"projects"`,
+		`"provider"`,
+		`"model"`,
+		`"my-workspace"`,
+		`"project-a"`,
+		`"project-b"`,
+		`"symbols_ready"`,
+		`"total_symbols"`,
+	}
+
+	for _, field := range expectedFields {
+		if !strings.Contains(jsonStr, field) {
+			t.Errorf("expected JSON to contain %s, got: %s", field, jsonStr)
+		}
+	}
+
+	// Verify round-trip unmarshaling
+	var decoded WorkspaceIndexStatus
+	if err := json.Unmarshal(jsonBytes, &decoded); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+
+	if decoded.Workspace != "my-workspace" {
+		t.Errorf("expected workspace 'my-workspace', got %q", decoded.Workspace)
+	}
+	if len(decoded.Projects) != 2 {
+		t.Fatalf("expected 2 projects, got %d", len(decoded.Projects))
+	}
+	if decoded.Projects[0].TotalSymbols != 42 {
+		t.Errorf("expected project-a total_symbols=42, got %d", decoded.Projects[0].TotalSymbols)
+	}
+	if decoded.Projects[1].SymbolsReady {
+		t.Error("expected project-b symbols_ready=false")
+	}
+}
+
+// TestHandleTraceCallersFromStores_should_aggregate_across_stores verifies that
+// handleTraceCallersFromStores aggregates callers from multiple symbol stores.
+func TestHandleTraceCallersFromStores_should_aggregate_across_stores(t *testing.T) {
+	ctx := context.Background()
+	tmpDir1 := t.TempDir()
+	tmpDir2 := t.TempDir()
+
+	store1 := trace.NewGOBSymbolStore(filepath.Join(tmpDir1, "symbols.gob"))
+	store2 := trace.NewGOBSymbolStore(filepath.Join(tmpDir2, "symbols.gob"))
+
+	// Save a symbol "Login" to store1 with a caller "HandleAuth"
+	err := store1.SaveFile(ctx, "/project1/auth.go", []trace.Symbol{
+		{Name: "Login", Kind: "function", File: "/project1/auth.go", Line: 10, Language: "go"},
+	}, []trace.Reference{
+		{SymbolName: "Login", File: "/project1/handler.go", Line: 20, CallerName: "HandleAuth", CallerFile: "/project1/handler.go", CallerLine: 15},
+	})
+	if err != nil {
+		t.Fatalf("store1.SaveFile failed: %v", err)
+	}
+
+	// Save a symbol "Login" to store2 with a caller "ProcessAuth"
+	err = store2.SaveFile(ctx, "/project2/api.go", []trace.Symbol{
+		{Name: "Login", Kind: "function", File: "/project2/api.go", Line: 5, Language: "go"},
+	}, []trace.Reference{
+		{SymbolName: "Login", File: "/project2/service.go", Line: 30, CallerName: "ProcessAuth", CallerFile: "/project2/service.go", CallerLine: 25},
+	})
+	if err != nil {
+		t.Fatalf("store2.SaveFile failed: %v", err)
+	}
+
+	s := &Server{}
+	stores := []trace.SymbolStore{store1, store2}
+
+	result, err := s.handleTraceCallersFromStores(ctx, "", "Login", false, "json", stores)
+	if err != nil {
+		t.Fatalf("handleTraceCallersFromStores returned error: %v", err)
+	}
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	resultJSON, _ := json.Marshal(result)
+	text := string(resultJSON)
+
+	if !strings.Contains(text, "HandleAuth") {
+		t.Errorf("expected result to contain caller 'HandleAuth', got: %s", text)
+	}
+	if !strings.Contains(text, "ProcessAuth") {
+		t.Errorf("expected result to contain caller 'ProcessAuth', got: %s", text)
+	}
+}
+
+// TestHandleTraceCalleesFromStores_should_aggregate_across_stores verifies that
+// handleTraceCalleesFromStores aggregates callees from multiple symbol stores.
+func TestHandleTraceCalleesFromStores_should_aggregate_across_stores(t *testing.T) {
+	ctx := context.Background()
+	tmpDir1 := t.TempDir()
+	tmpDir2 := t.TempDir()
+
+	store1 := trace.NewGOBSymbolStore(filepath.Join(tmpDir1, "symbols.gob"))
+	store2 := trace.NewGOBSymbolStore(filepath.Join(tmpDir2, "symbols.gob"))
+
+	// In store1, "HandleRequest" calls "ValidateInput"
+	err := store1.SaveFile(ctx, "/project1/handler.go", []trace.Symbol{
+		{Name: "HandleRequest", Kind: "function", File: "/project1/handler.go", Line: 10, Language: "go"},
+		{Name: "ValidateInput", Kind: "function", File: "/project1/handler.go", Line: 30, Language: "go"},
+	}, []trace.Reference{
+		{SymbolName: "ValidateInput", File: "/project1/handler.go", Line: 15, CallerName: "HandleRequest", CallerFile: "/project1/handler.go", CallerLine: 10},
+	})
+	if err != nil {
+		t.Fatalf("store1.SaveFile failed: %v", err)
+	}
+
+	// In store2, "HandleRequest" calls "SendResponse"
+	err = store2.SaveFile(ctx, "/project2/handler.go", []trace.Symbol{
+		{Name: "HandleRequest", Kind: "function", File: "/project2/handler.go", Line: 5, Language: "go"},
+		{Name: "SendResponse", Kind: "function", File: "/project2/handler.go", Line: 25, Language: "go"},
+	}, []trace.Reference{
+		{SymbolName: "SendResponse", File: "/project2/handler.go", Line: 12, CallerName: "HandleRequest", CallerFile: "/project2/handler.go", CallerLine: 5},
+	})
+	if err != nil {
+		t.Fatalf("store2.SaveFile failed: %v", err)
+	}
+
+	s := &Server{}
+	stores := []trace.SymbolStore{store1, store2}
+
+	result, err := s.handleTraceCalleesFromStores(ctx, "", "HandleRequest", false, "json", stores)
+	if err != nil {
+		t.Fatalf("handleTraceCalleesFromStores returned error: %v", err)
+	}
+
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	resultJSON, _ := json.Marshal(result)
+	text := string(resultJSON)
+
+	if !strings.Contains(text, "ValidateInput") {
+		t.Errorf("expected result to contain callee 'ValidateInput', got: %s", text)
+	}
+	if !strings.Contains(text, "SendResponse") {
+		t.Errorf("expected result to contain callee 'SendResponse', got: %s", text)
+	}
+}
+
+// RPG tools read the graph of a workspace project (#296).
+func TestRPGProjectRootResolvesWorkspaceProject(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
+	apiPath, webPath := t.TempDir(), t.TempDir()
+	wsCfg := &config.WorkspaceConfig{Version: 1}
+	if err := wsCfg.AddWorkspace(config.Workspace{
+		Name:     "acme",
+		Projects: []config.ProjectEntry{{Name: "api", Path: apiPath}, {Name: "web", Path: webPath}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveWorkspaceConfig(wsCfg); err != nil {
+		t.Fatal(err)
+	}
+
+	s := &Server{projectRoot: "/server/project"}
+	req := func(args map[string]any) mcp.CallToolRequest {
+		return mcp.CallToolRequest{Params: mcp.CallToolParams{Arguments: args}}
+	}
+
+	if root, err := s.rpgProjectRoot(req(map[string]any{})); err != nil || root != "/server/project" {
+		t.Fatalf("without workspace: got %q, %v", root, err)
+	}
+	if root, err := s.rpgProjectRoot(req(map[string]any{"workspace": "acme", "project": "web"})); err != nil || root != webPath {
+		t.Fatalf("workspace project: got %q, %v", root, err)
+	}
+	if _, err := s.rpgProjectRoot(req(map[string]any{"workspace": "acme"})); err == nil || !strings.Contains(err.Error(), "api, web") {
+		t.Fatalf("expected an error listing the projects, got %v", err)
+	}
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Portaria Escolar Local-First",
+  "description": "Sistema desktop e web Local-First para controle ultrarrápido de portaria escolar, presença por QR Code/código de barras, contingência offline com Outbox Pattern e relatórios.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

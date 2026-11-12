@@ -1,0 +1,81 @@
+import type { SavedMap } from "@canvas/api-document";
+import type { WhiteboardData, WhiteboardHost } from "@canvas/whiteboard";
+import {
+  ReviewCommitSummarySchema,
+  type ReviewTheme,
+} from "@dev.fast/review-protocol";
+import { shareBundleSchema } from "@dev.fast/review-share-protocol";
+import { traceSchema } from "@review/review-api/trace-schema";
+import { z } from "zod";
+
+import { boardSnapshotSchema, boardView } from "./board-data";
+import { readOnlyHost } from "./share-host";
+
+export interface ShareView {
+  title: string;
+  repository?: { cloneUrl: string };
+  /** Quotes uncommitted changes, so Desktop cannot open it. */
+  frozen?: true;
+  data: WhiteboardData;
+  host: WhiteboardHost;
+  dispose(): void;
+}
+
+/** Reads a review-share/2 bundle into a board and a read-only host. */
+export async function openShare(
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Share boundary: shareBundleSchema parses it.
+  share: unknown,
+  options: { theme?: ReviewTheme; wasmUrl?: string } = {},
+): Promise<ShareView> {
+  const bundle = shareBundleSchema.parse(share);
+  const snapshot = boardSnapshotSchema.parse(bundle.snapshot);
+  const { pins } = snapshot;
+  const cloneUrl = bundle.repository?.cloneUrl;
+
+  const data = boardView(
+    {
+      ...snapshot,
+      ...(pins && { target: { kind: "commits", ...pins } }),
+      shared: { cloneUrl },
+    },
+    {
+      traces: z.record(z.string(), traceSchema).parse(bundle.traces),
+      // SAFETY: the sharer wrote these maps; a malformed one fails in its block.
+      maps: bundle.maps as Record<string, SavedMap>,
+      commits: z.array(ReviewCommitSummarySchema).parse(bundle.commits),
+      resolvedSelections: bundle.selections,
+    },
+  );
+
+  const host = readOnlyHost(options);
+
+  await host.setSources({
+    sources: bundle.sources,
+    pins,
+    alignments: bundle.alignments,
+  });
+
+  return {
+    title: bundle.title,
+    ...(bundle.repository && { repository: bundle.repository }),
+    ...(bundle.frozen && { frozen: bundle.frozen }),
+    data: {
+      ...data,
+      place: {
+        siblings: [],
+        ...(cloneUrl && { repository: repositoryLabel(cloneUrl) }),
+      },
+    },
+    host,
+    dispose() {
+      host.dispose();
+    },
+  };
+}
+
+/** "owner / repo", as Desktop names a board's repository. */
+const repositoryLabel = (cloneUrl: string) =>
+  new URL(cloneUrl).pathname
+    .slice(1)
+    .replace(/\.git$/, "")
+    .replaceAll("/", " / ");

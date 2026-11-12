@@ -1,0 +1,237 @@
+/** One reader's path through a review: every view, the Find widget, the table of contents, and the version a rename seals. */
+import assert from "node:assert/strict";
+
+import { createReview, inView, orderReviewBlocks, showView } from "../harness.mjs";
+
+export const name = "reader-navigation";
+
+export const phase = 1;
+
+export const options = {};
+
+const TITLE = "Order review";
+
+const RENAMED = "Order review v2";
+
+/** Prose whose every "stat" sits inside "status", which is what makes the whole-word search a real test. */
+const PARAGRAPH =
+  "The queue worker reads each order once, writes the new value and " +
+  "acknowledges the message only after the write lands, so a retry can never " +
+  "apply the same change twice.";
+
+/** A section long enough to push whatever follows it below the fold. */
+const longSection = (title) => ({
+  type: "section",
+  title,
+  children: Array.from({ length: 10 }, () => ({
+    type: "markdown",
+    markdown: PARAGRAPH,
+  })),
+});
+
+export async function run(ctx) {
+  const { until } = ctx;
+
+  // The contents need more than two headings and an entry below the fold, so two long sections are added.
+  const review = await createReview(ctx, {
+    title: TITLE,
+    blocks: [
+      ...orderReviewBlocks,
+      longSection("Rollout"),
+      longSection("Risks"),
+    ],
+  });
+
+  // Resolve the canvas window again: the fresh profile's workbench reload can replace the page between helpers.
+  const page = await ctx.apiCanvasFor(TITLE);
+
+  await ctx.watchPage(page);
+
+  const canvas = page.locator(".review-canvas-root [data-review-api]");
+
+  const tabLabels = () =>
+    page
+      .locator('.review-sidebar-tabs [role="tab"]:not([hidden])')
+      .evaluateAll((tabs) =>
+        tabs.map((tab) => tab.getAttribute("aria-label").split(" · ")[0]),
+      );
+
+  // A two-commit range offers Diff beside Whiteboard; Threads picks only its pane.
+  const offered = ["Whiteboard", "Diff", "Threads"];
+
+  await until(
+    async () => (await tabLabels()).join(", ") === offered.join(", "),
+    `the sidebar tabs to settle on ${offered.join(", ")}`,
+  );
+
+  // Whiteboard goes last so the reader ends on the document the rest of the journey reads.
+  for (const [label, view] of [
+    ["Diff", "diff"],
+    ["Threads", "diff"],
+    ["Whiteboard", "review"],
+  ]) {
+    await showView(ctx, label, page);
+    await inView(ctx, view, page);
+  }
+
+  ctx.check("every sidebar tab activates and shows its view");
+
+  const find = page.locator('[role="search"][aria-label="Find in session"]');
+
+  const input = find.locator('[aria-label="Find"]');
+
+  const countText = async () =>
+    (await find.locator("[aria-live]").innerText()).trim();
+
+  await page.keyboard.press("ControlOrMeta+KeyF");
+  await find.waitFor();
+  await input.fill("stat");
+
+  // Code peeks report their matches after the prose, so the count is read once it holds still for a second.
+  const plain = await until(async () => {
+    const text = await countText();
+
+    if (!/^\d+ of \d+$/.test(text)) return null;
+    await page.waitForTimeout(1000);
+
+    return (await countText()) === text ? text : null;
+  }, "a settled plain-text match count");
+
+  const wholeWord = find.getByRole("button", { name: "Match Whole Word" });
+
+  await wholeWord.click();
+  await until(
+    async () => (await wholeWord.getAttribute("aria-pressed")) === "true",
+    "the whole-word toggle to turn on",
+  );
+  await until(
+    async () => (await countText()) === "No results",
+    'whole-word "stat" to match nothing',
+  );
+  await wholeWord.click();
+  await until(
+    async () => (await countText()) === plain,
+    `the plain count (${plain}) to come back`,
+  );
+
+  await find.getByRole("button", { name: "Use Regular Expression" }).click();
+  await input.fill("stat(");
+  // An uncompilable pattern reads "Invalid expression" in the count and marks the input.
+  await until(
+    async () => (await countText()) === "Invalid expression",
+    "the invalid regular expression to be reported",
+  );
+  assert.equal(
+    await input.getAttribute("aria-invalid"),
+    "true",
+    "the Find input is not marked invalid",
+  );
+
+  await input.fill("stat.s");
+
+  const total = Number(
+    await until(
+      async () => /^1 of (\d+)$/.exec(await countText())?.[1],
+      "the regular expression to match from the first hit",
+    ),
+  );
+
+  assert.ok(
+    total >= 2,
+    `the wrap needs at least two matches, the regex found ${total}`,
+  );
+
+  // One Enter per match walks the whole list and lands back on the first.
+  for (let step = 1; step <= total; step++) {
+    const expected = `${(step % total) + 1} of ${total}`;
+
+    await input.press("Enter");
+    await until(
+      async () => (await countText()) === expected,
+      `Enter to reach ${expected}`,
+    );
+  }
+
+  await input.press("Escape");
+  await find.waitFor({ state: "hidden" });
+  ctx.check("find handles plain, whole-word, regex and invalid regex, and wraps");
+
+  // Focusing the Contents rail opens its card, as the keyboard does.
+  await page.getByRole("button", { name: "Contents", exact: true }).focus();
+
+  const links = page
+    .getByRole("menu", { name: "Contents" })
+    .getByRole("menuitem");
+
+  await links.first().waitFor();
+  assert.deepEqual(
+    (await links.allInnerTexts()).map((text) => text.trim()),
+    ["Overview", "Rollout", "Risks"],
+    "the contents must list every section of the review",
+  );
+
+  // The heading's name includes its chevron's label.
+  const target = canvas
+    .locator("h1, h2, h3, h4, h5, h6")
+    .filter({ hasText: /^Risks$/ });
+
+  const region = page.locator(".review-view-region--review");
+
+  /** How far the target heading sits below the top of the scrolling region. */
+  const offset = async () => {
+    const [heading, view] = await Promise.all([
+      target.boundingBox(),
+      region.boundingBox(),
+    ]);
+
+    return heading && view ? heading.y - view.y : null;
+  };
+
+  const beforeClick = await offset();
+
+  assert.ok(
+    beforeClick > 200,
+    `Risks starts ${beforeClick}px into the region, too near the top for ` +
+      "the scroll to prove anything",
+  );
+  await links.last().click();
+  await until(async () => {
+    const value = await offset();
+
+    return value !== null && value >= -8 && value < 120;
+  }, "Risks to scroll to the top of the review");
+  ctx.check("table of contents navigates");
+
+  const history = () => ctx.apiOk(`/reviews-api/${review.reviewId}/history`);
+
+  const before = await history();
+
+  const renamed = await ctx.api("/reviews-api/commands", "POST", {
+    operation: { type: "rename", reviewId: review.reviewId, title: RENAMED },
+  });
+
+  assert.equal(renamed.status, 200, JSON.stringify(renamed.value));
+
+  const after = await history();
+
+  // Every command seals a version, so the rename alone adds one.
+  assert.equal(
+    after.length,
+    before.length + 1,
+    "the rename did not seal a new version",
+  );
+  assert.equal(
+    after.at(-1).title,
+    RENAMED,
+    "the newest version kept the old title",
+  );
+  assert.equal(
+    after.at(-2).title,
+    TITLE,
+    "the version before the rename must keep the original title",
+  );
+
+  // The version picker is gone (#389), so the rename is proved in the store and on the live canvas.
+  await canvas.getByRole("heading", { name: RENAMED, exact: true }).waitFor();
+  ctx.check("a rename seals a new version and the canvas shows it");
+}

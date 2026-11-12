@@ -1,0 +1,204 @@
+name: Whiteboard CI
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: review-desktop-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect desktop changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      desktop: ${{ steps.changes.outputs.desktop }}
+    steps:
+      - name: Checkout
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes outside diffr
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [[ "$EVENT_NAME" != pull_request ]]; then
+            echo "desktop=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet --no-renames "$BASE_SHA...$HEAD_SHA" -- . ':(exclude)diffr/**'; then
+            echo "desktop=false" >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            # A diff exits 1 for changes; other failures must not skip CI.
+            if [[ "$status" -ne 1 ]]; then
+              exit "$status"
+            fi
+            echo "desktop=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  desktop-build:
+    name: Build and test desktop
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+
+      - name: Setup monorepo Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install monorepo dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Restore Playwright Chromium
+        id: playwright-chromium
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-${{ runner.arch }}-playwright-chromium-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Install Playwright Chromium
+        if: steps.playwright-chromium.outputs.cache-hit != 'true'
+        run: pnpm --filter @dev.fast/review-canvas exec playwright install chromium --only-shell
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Check the remote install script
+        run: shellcheck -s sh packages/review/remote/install.sh
+
+      - name: Check formatting
+        run: pnpm format:check
+
+      # Headers for the Code OSS native modules npm ci builds from source:
+      # native-keymap needs x11/xkbfile, kerberos needs krb5, and the secret
+      # storage bindings need libsecret.
+      - name: Install Code OSS native build prerequisites
+        run: |
+          # The hosted runner image lists an HTTP Azure mirror first. That
+          # mirror can accept the release file and then hang on package indexes.
+          echo 'https://archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxkbfile-dev libkrb5-dev libsecret-1-dev python3
+
+      - name: Install Playwright Chromium system dependencies
+        run: pnpm --filter @dev.fast/review-canvas exec playwright install-deps chromium
+
+      - name: Setup Code OSS Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: apps/review-desktop/code-oss/.nvmrc
+          cache: npm
+          cache-dependency-path: apps/review-desktop/code-oss/**/package-lock.json
+
+      - name: Compute Code OSS dependency digest
+        id: code-oss-dependency-digest
+        run: echo "digest=$(node apps/review-desktop/scripts/code-oss-bootstrap.mjs digest apps/review-desktop/code-oss)" >> "$GITHUB_OUTPUT"
+
+      # out/ is deliberately not cached: the build rebuilds it from scratch, so
+      # caching it only adds download/upload time. The nested extension and
+      # build-tool node_modules are cached so postinstall's per-directory npm
+      # installs become no-ops on a warm cache. review-desktop-ci-cache.yml
+      # saves it from main. restore-keys lets a lockfile bump start from the
+      # previous tree and install only the delta.
+      - name: Restore Code OSS dependencies
+        id: code-oss-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            apps/review-desktop/code-oss/node_modules
+            apps/review-desktop/code-oss/build/node_modules
+            apps/review-desktop/code-oss/extensions/node_modules
+            apps/review-desktop/code-oss/extensions/*/node_modules
+            apps/review-desktop/code-oss/extensions/*/server/node_modules
+            apps/review-desktop/code-oss/.build/distro/npm/node_modules
+            apps/review-desktop/code-oss/.build/distro/npm/remote/node_modules
+            apps/review-desktop/code-oss/.build/distro/npm/remote/web/node_modules
+            apps/review-desktop/code-oss/.build/electron
+            ~/.cache/node-gyp
+          key: ${{ runner.os }}-${{ runner.arch }}-code-oss-deps-v3-${{ steps.code-oss-dependency-digest.outputs.digest }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-code-oss-deps-v3-
+
+      - name: Build Whiteboard
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REVIEW_DESKTOP_CI_FAST: "1"
+        run: pnpm --filter @dev.fast/review-desktop app:build
+
+      - name: Validate Whiteboard build
+        run: |
+          test -d apps/review-desktop/code-oss/node_modules
+          test -f apps/review-desktop/code-oss/out/main.js
+
+      # The build already built workspace dependencies and typechecked Code OSS.
+      # Diffr Test checks diffr's packages, with the Bun and Claude Code types they need.
+      - name: Typecheck
+        run: |
+          pnpm -r --filter '!@dev.fast/review-desktop' --filter '!./diffr/**' --workspace-concurrency=1 --if-present typecheck
+
+      # Desktop's tests build a remote tarball, which starves concurrent browser
+      # tests of CPU until Chromium drops their module fetches; run them last.
+      - name: Test
+        run: |
+          node --test "scripts/**/*.test.mjs"
+          pnpm -r --filter '!./diffr/**' --filter '!@dev.fast/review-desktop' --no-sort --workspace-concurrency=3 --if-present test
+          pnpm --filter @dev.fast/review-desktop test
+
+      - name: Upload browser test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vitest-browser-diagnostics
+          path: |
+            packages/review/app/.vitest-attachments
+            packages/review/**/__screenshots__
+            packages/review/**/__traces__
+          if-no-files-found: ignore
+
+  # Keep the required check present even when diffr-only PRs skip the build.
+  review-desktop:
+    name: Review Desktop
+    needs: [changes, desktop-build]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check desktop CI result
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          DESKTOP_REQUIRED: ${{ needs.changes.outputs.desktop }}
+          BUILD_RESULT: ${{ needs.desktop-build.result }}
+        run: |
+          [[ "$CHANGES_RESULT" == success ]] || exit 1
+          if [[ "$DESKTOP_REQUIRED" == false && "$BUILD_RESULT" == skipped ]]; then
+            echo "Desktop CI is not required for diffr-only changes."
+          else
+            [[ "$DESKTOP_REQUIRED" == true && "$BUILD_RESULT" == success ]]
+          fi

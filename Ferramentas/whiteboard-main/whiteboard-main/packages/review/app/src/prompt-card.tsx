@@ -1,0 +1,114 @@
+import { Button } from "@canvas/ui/button";
+import { useCopy } from "@canvas/ui/copy";
+import { iconStyles } from "@canvas/ui/icon-styles";
+import { CopyIcon } from "@canvas/ui/icons";
+import * as stylex from "@stylexjs/stylex";
+import { useState } from "react";
+
+import { promptStyles } from "./prompt-styles";
+import { SegmentedControl } from "./ui/segmented";
+
+/** What the review covers. This is the only choice the reader makes. */
+export type PromptKind = "change" | "architecture";
+
+export const REVIEW_HOME_PROMPT_KIND_STORAGE_KEY =
+  "dev.fast.review.homePromptKind";
+
+const PROMPT_KINDS: ReadonlyArray<{ kind: PromptKind; label: string }> = [
+  { kind: "change", label: "Review a change" },
+  { kind: "architecture", label: "Architecture review" },
+];
+
+/**
+ * Prompts name the subject and stop there: Whiteboard's server gives the agent
+ * the authoring instructions, so every agent gets the same wording.
+ */
+export const PROMPTS: Record<PromptKind, string> = {
+  change:
+    "Draw a whiteboard that walks me through my current branch: what it changes compared to the branch it merges into, and why.",
+  architecture:
+    "Create a Whiteboard that sketches out the main data flows, access patterns, and code paths in this repo, so I can do a full architecture review of it. Open it in Whiteboard when you're done.",
+};
+
+/**
+ * The copy-a-prompt card. Only the user's agent can write a review of their
+ * own repo, so both the Welcome rail and the Home zero state end here.
+ *
+ * The tabs choose what the review covers.
+ */
+export function PromptCard() {
+  const [kind, setKind] = useState<PromptKind>(readStoredPromptKind);
+  const [copied, copy] = useCopy();
+
+  const selectKind = (next: PromptKind) => {
+    setKind(next);
+
+    try {
+      globalThis.localStorage?.setItem(
+        REVIEW_HOME_PROMPT_KIND_STORAGE_KEY,
+        next,
+      );
+    } catch {
+      // The desktop can disable DOM storage; the in-memory selection still works.
+    }
+  };
+
+  return (
+    <section {...stylex.props(styles.card)} aria-label="Whiteboard prompt">
+      <SegmentedControl
+        label="What to review"
+        value={kind}
+        options={PROMPT_KINDS.map(({ kind: tab, label }) => ({
+          value: tab,
+          label,
+        }))}
+        onChange={selectKind}
+        size="large"
+        xstyle={promptStyles.tabs}
+      />
+      <pre {...stylex.props(promptStyles.body)}>{PROMPTS[kind]}</pre>
+      <div {...stylex.props(promptStyles.actions)}>
+        <Button
+          variant="primary"
+          size="large"
+          xstyle={promptStyles.copy}
+          aria-live="polite"
+          aria-label={
+            copied === PROMPTS[kind] ? "Prompt copied" : "Copy prompt"
+          }
+          onClick={() => copy(PROMPTS[kind])}
+        >
+          <CopyIcon xstyle={iconStyles.inline} />
+          {copied === PROMPTS[kind] ? "Copied" : "Copy prompt"}
+        </Button>
+      </div>
+    </section>
+  );
+}
+
+function readStoredPromptKind(): PromptKind {
+  try {
+    const stored = globalThis.localStorage?.getItem(
+      REVIEW_HOME_PROMPT_KIND_STORAGE_KEY,
+    );
+
+    if (stored === "change" || stored === "architecture") {
+      return stored;
+    }
+  } catch {
+    // Fall through to the default when DOM storage is unavailable.
+  }
+
+  return "change";
+}
+
+const styles = stylex.create({
+  // It sits inside an accordion step, which already draws the surface, so it
+  // adds no frame of its own.
+  card: {
+    display: "flex",
+    flexDirection: "column",
+    width: "min(720px, 100%)",
+    margin: 0,
+  },
+});

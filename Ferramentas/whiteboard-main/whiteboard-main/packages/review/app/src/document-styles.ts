@@ -1,0 +1,298 @@
+import { codeType, documentType } from "@canvas/document-type.stylex";
+import {
+  fontWeight,
+  leading,
+  radius,
+  space,
+  tracking,
+} from "@canvas/scale.stylex";
+import * as stylex from "@stylexjs/stylex";
+
+import { appMarker, documentMarker, proseMarker } from "./markers.stylex";
+import { tokens } from "./tokens.stylex";
+
+// The review document: the article column and the prose it renders. Prose
+// styles hold only inside a document, so a renderer used elsewhere keeps the
+// browser's defaults. The article carries documentMarker, a block its
+// `data-review-node-id` and a Markdown or trace quote block proseMarker.
+
+const inDocument = () => stylex.when.ancestor(":is(*)", documentMarker);
+
+// A block's own element: it sits in the prose column. A board's Markdown
+// block is one before its first save gives it an id.
+const inDocumentBlock = () =>
+  `${inDocument()}:is([data-review-node-id] > *, [data-board-markdown] > *)`;
+
+// Inside a Markdown or trace quote block.
+const inProse = () =>
+  `${inDocument()}${stylex.when.ancestor(":is(*)", proseMarker)}`;
+
+const inDocumentLink = () => `${inDocument()}:is(a *)`;
+
+const inOpenDocumentLink = () =>
+  `${inDocument()}:is(a[data-review-anchor-open] *)`;
+
+const afterProseItem = () => `${inProse()}:is(li + *)`;
+
+const compact = "@container review-content (max-width: 1080px)";
+
+// Not :has(): it restyled the whole document on every node insertion.
+const withHeader = () =>
+  stylex.when.ancestor(":is([data-document-header])", appMarker);
+
+const withLens = () =>
+  stylex.when.ancestor(":is([data-database-lens])", appMarker);
+
+// Wide and full keep prose at a reading measure but let code, diagrams and
+// lenses fill the article. A shell too narrow for 900px prose keeps the
+// standard layout.
+const widened = () =>
+  stylex.when.ancestor(
+    ':is([data-document-width="wide"], [data-document-width="full"])',
+    appMarker,
+  );
+
+const wide = () =>
+  stylex.when.ancestor(':is([data-document-width="wide"])', appMarker);
+
+const full = () =>
+  stylex.when.ancestor(':is([data-document-width="full"])', appMarker);
+
+const roomy = "@container review-content (min-width: 1181px)";
+
+const proseColumn = `min(100%, ${tokens.reviewProseMaxWidth})`;
+
+const proseMaxWidth = `calc(100cqi - 2 * ${tokens.reviewDocumentPaddingInline})`;
+
+export const documentStyles = stylex.create({
+  article: {
+    position: "relative",
+    "--review-inline-diagram-max-width": {
+      default: "1120px",
+      [widened()]: { default: null, [roomy]: "100%" },
+    },
+    "--review-document-padding-inline": {
+      default: "clamp(20px, calc((100cqi - 720px) * 0.122 + 20px), 64px)",
+      [stylex.env.narrow]: "clamp(12px, 4vw, 20px)",
+    },
+    // With the view's own top padding, the header's first line sits 36px
+    // under the top bar.
+    "--review-document-padding-block-start": "16px",
+    "--document-scale": "var(--review-document-scale, 1)",
+    "--review-document-padding-block-end": {
+      default: "72px",
+      [stylex.env.narrow]: "48px",
+    },
+    "--review-prose-max-width": {
+      default: "720px",
+      [withHeader()]: "760px",
+      [widened()]: { default: null, [roomy]: "900px" },
+    },
+    "--review-block-max-width": {
+      default: tokens.reviewProseMaxWidth,
+      [widened()]: { default: null, [roomy]: "100%" },
+    },
+    flex: { default: "1 1 860px", [compact]: "0 1 auto" },
+    width: {
+      default: "100%",
+      [withLens()]: "min(1360px, calc(100% - 32px))",
+      [full()]: { default: null, [roomy]: "100%" },
+      [stylex.env.narrow]: "100%",
+    },
+    maxWidth: {
+      default: "860px",
+      [withHeader()]: "900px",
+      [wide()]: { default: null, [roomy]: "1360px" },
+      [full()]: { default: null, [roomy]: "1800px" },
+      [stylex.env.narrow]: { default: "none", [withHeader()]: "900px" },
+    },
+    minWidth: 0,
+    margin: {
+      default: `0 auto ${space.s96}`,
+      [compact]: { default: "0 auto", [stylex.env.narrow]: 0 },
+      [stylex.env.narrow]: 0,
+    },
+    padding: {
+      default: `${tokens.reviewDocumentPaddingBlockStart} ${tokens.reviewDocumentPaddingInline} ${tokens.reviewDocumentPaddingBlockEnd}`,
+      [compact]: `${space.s28} ${tokens.reviewDocumentPaddingInline}`,
+    },
+    backgroundColor: tokens.transparent,
+    color: tokens.ink,
+    fontFamily: tokens.fontSerif,
+    fontSize: documentType.body,
+    lineHeight: leading.relaxed,
+  },
+  // Beside an open side peek the column narrows its inline diagrams, and a
+  // database lens keeps a smaller gutter.
+  articlePeekOpen: {
+    "--review-inline-diagram-max-width": {
+      default: "1000px",
+      [widened()]: { default: null, [roomy]: "100%" },
+    },
+    width: {
+      default: "100%",
+      [withLens()]: "calc(100% - 24px)",
+      [stylex.env.narrow]: "100%",
+    },
+    maxWidth: {
+      default: "860px",
+      [withHeader()]: "900px",
+      [wide()]: { default: null, [roomy]: "1360px" },
+      [full()]: { default: null, [roomy]: "1800px" },
+      [stylex.env.narrow]: {
+        default: "none",
+        [withHeader()]: { default: "900px", [withLens()]: "none" },
+      },
+    },
+  },
+  h1: {
+    width: { default: null, [inDocument()]: proseColumn },
+    margin: { default: null, [inDocument()]: `${space.s28} auto ${space.s18}` },
+    color: { default: null, [inDocument()]: tokens.ink },
+    fontFamily: { default: null, [inDocument()]: tokens.fontSerif },
+    fontSize: { default: null, [inDocument()]: documentType.h1 },
+    fontWeight: { default: null, [inDocument()]: fontWeight.medium },
+    lineHeight: { default: null, [inDocument()]: documentType.h1Leading },
+    letterSpacing: { default: null, [inDocument()]: tracking.tight },
+    textAlign: { default: null, [inDocument()]: "left" },
+  },
+  h2: {
+    // A heading jumped to from the contents lands this far below the scroll
+    // edge: clear of the edge for scroll-synced highlighting, and the same
+    // slack the contents rail leaves under the last heading.
+    scrollMarginTop: { default: null, [inDocument()]: "24px" },
+    width: { default: null, [inDocumentBlock()]: proseColumn },
+    maxWidth: { default: null, [inDocumentBlock()]: proseMaxWidth },
+    margin: { default: null, [inDocument()]: `${space.s40} auto ${space.s12}` },
+    color: { default: null, [inDocument()]: tokens.ink },
+    fontFamily: { default: null, [inDocument()]: tokens.fontSerif },
+    fontSize: { default: null, [inDocument()]: documentType.h2 },
+    fontWeight: { default: null, [inDocument()]: fontWeight.medium },
+    lineHeight: { default: null, [inDocument()]: documentType.h2Leading },
+  },
+  h3: {
+    scrollMarginTop: { default: null, [inDocument()]: "24px" },
+    width: { default: null, [inDocumentBlock()]: proseColumn },
+    maxWidth: { default: null, [inDocumentBlock()]: proseMaxWidth },
+    margin: { default: null, [inDocument()]: `${space.s32} auto ${space.s10}` },
+    color: { default: null, [inDocument()]: tokens.ink },
+    fontFamily: { default: null, [inDocument()]: tokens.fontSerif },
+    fontSize: { default: null, [inDocument()]: documentType.h3 },
+    fontWeight: { default: null, [inDocument()]: fontWeight.medium },
+    lineHeight: { default: null, [inDocument()]: documentType.h3Leading },
+  },
+  // A block in the prose column: lists, quotes, images.
+  column: {
+    width: { default: null, [inDocumentBlock()]: proseColumn },
+    maxWidth: { default: null, [inDocumentBlock()]: proseMaxWidth },
+    marginInline: { default: null, [inDocumentBlock()]: "auto" },
+  },
+  serif: {
+    fontFamily: { default: null, [inDocument()]: tokens.fontSerif },
+  },
+  paragraph: {
+    width: { default: null, [inDocumentBlock()]: proseColumn },
+    maxWidth: { default: null, [inDocumentBlock()]: proseMaxWidth },
+    margin: { default: null, [inProse()]: `${space.s14} 0` },
+    marginInline: { default: null, [inDocumentBlock()]: "auto" },
+    color: { default: null, [inProse()]: tokens.ink },
+    fontFamily: { default: null, [inProse()]: tokens.fontSerif },
+    fontSize: { default: null, [inProse()]: documentType.reading },
+    lineHeight: { default: null, [inProse()]: leading.prose },
+    textAlign: { default: null, [inProse()]: "left" },
+  },
+  // A list item's paragraphs sit flush with the item.
+  itemParagraph: {
+    marginTop: {
+      default: null,
+      ":first-child": { default: null, [inProse()]: 0 },
+    },
+    marginBottom: {
+      default: null,
+      ":last-child": { default: null, [inProse()]: 0 },
+    },
+  },
+  item: {
+    marginTop: { default: null, [afterProseItem()]: space.s8 },
+    color: { default: null, [inProse()]: tokens.ink },
+    fontFamily: { default: null, [inProse()]: tokens.fontSerif },
+    fontSize: { default: null, [inProse()]: documentType.reading },
+    lineHeight: { default: null, [inProse()]: leading.prose },
+    textAlign: { default: null, [inProse()]: "left" },
+  },
+  // Document copy outside a Markdown block, read as its paragraphs: the
+  // stale block's notice, the fallback message.
+  note: {
+    margin: { default: null, [inDocument()]: `${space.s14} 0` },
+    color: { default: null, [inDocument()]: tokens.ink },
+    fontFamily: { default: null, [inDocument()]: tokens.fontSerif },
+    fontSize: { default: null, [inDocument()]: documentType.reading },
+    lineHeight: { default: null, [inDocument()]: leading.prose },
+    textAlign: { default: null, [inDocument()]: "left" },
+  },
+  // Links are just text in the link color, prose and code chips alike, with
+  // no visited distinction. Hover restores the plain underline, and the link
+  // whose peek is open carries a quiet wash of the same color.
+  link: {
+    color: { default: null, [inDocument()]: tokens.accent },
+    textDecoration: {
+      default: null,
+      [inDocument()]: { default: "none", ":hover": "underline" },
+    },
+    backgroundColor: {
+      default: null,
+      [inDocument()]: {
+        default: null,
+        ":is([data-review-anchor-open])": tokens.linkOpenWash,
+      },
+    },
+  },
+  code: {
+    padding: { default: null, [inDocument()]: `${space.s2} ${space.s4}` },
+    borderRadius: { default: null, [inDocument()]: radius.small },
+    backgroundColor: {
+      default: null,
+      [inDocument()]: tokens.well,
+      [inOpenDocumentLink()]: tokens.linkOpenWash,
+    },
+    color: {
+      default: null,
+      [inDocument()]: tokens.ink,
+      [inDocumentLink()]: tokens.accent,
+    },
+    fontFamily: { default: null, [inDocument()]: tokens.fontCode },
+    fontSize: { default: null, [inDocument()]: "0.85em" },
+    fontVariantLigatures: { default: null, [inDocument()]: codeType.ligatures },
+  },
+  table: {
+    width: { default: null, [inDocument()]: "min(100%, 600px)" },
+    margin: { default: null, [inDocument()]: `${space.s24} auto` },
+    borderCollapse: { default: null, [inDocument()]: "collapse" },
+    color: { default: null, [inDocument()]: tokens.ink },
+    // The board's prose face; code chips in cells keep their own.
+    fontFamily: { default: null, [inDocument()]: tokens.fontSerif },
+    fontSize: { default: null, [inDocument()]: documentType.small },
+    lineHeight: { default: null, [inDocument()]: leading.normal },
+    tableLayout: { default: null, [inDocument()]: "fixed" },
+  },
+  cell: {
+    padding: { default: null, [inDocument()]: `${space.s8} ${space.s10}` },
+    borderWidth: { default: null, [inDocument()]: "1px" },
+    borderStyle: { default: null, [inDocument()]: "solid" },
+    borderColor: { default: null, [inDocument()]: tokens.rule },
+    overflowWrap: { default: null, [inDocument()]: "anywhere" },
+    textAlign: { default: null, [inDocument()]: "left" },
+    verticalAlign: { default: null, [inDocument()]: "top" },
+  },
+  headerCell: {
+    backgroundColor: { default: null, [inDocument()]: tokens.tray },
+    color: { default: null, [inDocument()]: tokens.ink },
+    fontWeight: { default: null, [inDocument()]: fontWeight.semibold },
+  },
+  // Phrasing content, so an <img> laid out like an image block.
+  image: {
+    display: "block",
+    maxWidth: "100%",
+    height: "auto",
+  },
+});

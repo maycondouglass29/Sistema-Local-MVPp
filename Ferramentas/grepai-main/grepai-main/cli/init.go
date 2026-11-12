@@ -1,0 +1,450 @@
+package cli
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/spf13/cobra"
+	"github.com/yoanbernabeu/grepai/config"
+	"github.com/yoanbernabeu/grepai/embedder"
+	"github.com/yoanbernabeu/grepai/git"
+	"github.com/yoanbernabeu/grepai/indexer"
+)
+
+var (
+	initProvider       string
+	initModel          string
+	initBackend        string
+	initNonInteractive bool
+	initInherit        bool
+	initUI             bool
+)
+
+const (
+	lmStudioEmbeddingDimensions = 768
+)
+
+var initCmd = &cobra.Command{
+	Use:   "init",
+	Short: "Initialize grepai in the current directory",
+	Long: `Initialize grepai by creating a .grepai directory with configuration.
+
+This command will:
+- Create .grepai/config.yaml with default settings
+- Prompt for the embedding provider (ollama, lmstudio, openai, synthetic,
+  openrouter or requesty) and the storage backend (gob, postgres or qdrant)
+- Add .grepai/ to .gitignore if present
+
+Use --provider, --model and --backend to skip those prompts, or --yes to
+accept the defaults (ollama with nomic-embed-text, gob).`,
+	RunE: runInit,
+}
+
+func init() {
+	initCmd.Flags().StringVarP(&initProvider, "provider", "p", "", "Embedding provider (ollama, lmstudio, openai, synthetic, openrouter, or requesty)")
+	initCmd.Flags().StringVarP(&initModel, "model", "m", "", "Embedding model (default depends on the provider: nomic-embed-text for ollama, text-embedding-3-small for openai; openrouter also accepts text-embedding-3-large and qwen3-embedding-8b)")
+	initCmd.Flags().StringVarP(&initBackend, "backend", "b", "", "Storage backend (gob, postgres, or qdrant)")
+	initCmd.Flags().BoolVar(&initNonInteractive, "yes", false, "Use defaults without prompting")
+	initCmd.Flags().BoolVar(&initInherit, "inherit", false, "Inherit configuration from main worktree (for git worktrees)")
+	initCmd.Flags().BoolVar(&initUI, "ui", false, "Run interactive Bubble Tea UI wizard")
+}
+
+func runInit(cmd *cobra.Command, args []string) error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("failed to get current directory: %w", err)
+	}
+
+	// Check if already initialized
+	if config.Exists(cwd) {
+		fmt.Println("grepai is already initialized in this directory.")
+		fmt.Printf("Configuration: %s\n", config.GetConfigPath(cwd))
+		return nil
+	}
+
+	cfg := config.DefaultConfig()
+	skipPrompts := false
+	var detectedGitInfo *git.DetectInfo
+	var detectedMainCfg *config.Config
+
+	// Detect git worktree and offer config inheritance
+	gitInfo, gitErr := git.Detect(cwd)
+	if gitErr == nil && gitInfo.IsWorktree && config.Exists(gitInfo.MainWorktree) {
+		mainCfg, loadErr := config.Load(gitInfo.MainWorktree)
+		if loadErr == nil {
+			detectedGitInfo = gitInfo
+			detectedMainCfg = mainCfg
+			fmt.Printf("\nGit worktree detected.\n")
+			fmt.Printf("  Main worktree: %s\n", gitInfo.MainWorktree)
+			fmt.Printf("  Worktree ID:   %s\n", gitInfo.WorktreeID)
+			fmt.Printf("  Backend:       %s\n", mainCfg.Store.Backend)
+
+			shouldInherit := initInherit
+			if shouldPromptInheritChoice(shouldInherit, initNonInteractive, initUI) {
+				reader := bufio.NewReader(os.Stdin)
+				fmt.Print("\nInherit configuration from main worktree? [Y/n]: ")
+				input, _ := reader.ReadString('\n')
+				input = strings.TrimSpace(strings.ToLower(input))
+				shouldInherit = input == "" || input == "y" || input == "yes"
+			}
+
+			if shouldInherit {
+				cfg = mainCfg
+				skipPrompts = true
+
+				if cfg.Store.Backend == "gob" {
+					fmt.Println("\nNote: GOB backend creates an independent index per worktree.")
+					fmt.Println("For shared indexing across worktrees, consider using 'postgres' or 'qdrant' backend.")
+				} else {
+					fmt.Printf("\nUsing %s backend - each worktree maintains its own project scope within the shared store.\n", cfg.Store.Backend)
+				}
+			}
+		} else {
+			fmt.Printf("Warning: could not load main worktree config: %v\n", loadErr)
+		}
+	}
+
+	if initUI && !initNonInteractive {
+		uiCfg, uiErr := runInitWizardUI(cwd, cfg, detectedGitInfo, detectedMainCfg, initInherit)
+		if uiErr != nil {
+			return uiErr
+		}
+		cfg = uiCfg
+		skipPrompts = true
+	}
+
+	// Interactive mode
+	if !skipPrompts && !initNonInteractive {
+		reader := bufio.NewReader(os.Stdin)
+
+		// Provider selection
+		if initProvider == "" {
+			fmt.Println("\nSelect embedding provider:")
+			fmt.Println("  1) ollama (local, privacy-first, requires Ollama running)")
+			fmt.Println("  2) lmstudio (local, OpenAI-compatible, requires LM Studio running)")
+			fmt.Println("  3) openai (cloud, requires API key)")
+			fmt.Println("  4) synthetic (cloud, free embedding API)")
+			fmt.Println("  5) openrouter (cloud, multi-provider gateway)")
+			fmt.Println("  6) requesty (cloud, multi-provider gateway)")
+			fmt.Print("Choice [1]: ")
+
+			input, _ := reader.ReadString('\n')
+			input = strings.TrimSpace(input)
+
+			switch input {
+			case "2", "lmstudio":
+				cfg.Embedder.Provider = "lmstudio"
+				fmt.Print("LM Studio endpoint [http://127.0.0.1:1234]: ")
+				endpoint, _ := reader.ReadString('\n')
+				endpoint = strings.TrimSpace(endpoint)
+				if endpoint == "" {
+					endpoint = "http://127.0.0.1:1234"
+				}
+				cfg.Embedder.Endpoint = endpoint
+				cfg.Embedder.Model = "text-embedding-nomic-embed-text-v1.5"
+				dim := lmStudioEmbeddingDimensions
+				cfg.Embedder.Dimensions = &dim
+			case "3", "openai":
+				cfg.Embedder.Provider = "openai"
+				cfg.Embedder.Model = config.DefaultOpenAIEmbeddingModel
+				cfg.Embedder.Endpoint = "https://api.openai.com/v1"
+				cfg.Embedder.Parallelism = config.DefaultOpenAIParallelism
+				// OpenAI: leave Dimensions nil to use model's native dimensions
+			case "4", "synthetic":
+				cfg.Embedder.Provider = "synthetic"
+				cfg.Embedder.Model = "hf:nomic-ai/nomic-embed-text-v1.5"
+				cfg.Embedder.Endpoint = "https://api.synthetic.new/openai/v1"
+				dim := 768
+				cfg.Embedder.Dimensions = &dim
+			case "5", "openrouter":
+				cfg.Embedder.Provider = "openrouter"
+				cfg.Embedder.Endpoint = "https://openrouter.ai/api/v1"
+				// OpenRouter: leave Dimensions nil to use model's native dimensions
+
+				// Model selection for OpenRouter
+				fmt.Println("\nSelect OpenRouter embedding model:")
+				fmt.Println("  1) openai/text-embedding-3-small (1536 dims, fast, recommended)")
+				fmt.Println("  2) openai/text-embedding-3-large (3072 dims, most capable)")
+				fmt.Println("  3) qwen/qwen3-embedding-8b (4096 dims, 32K context, best for code)")
+				fmt.Print("Choice [1]: ")
+
+				modelInput, _ := reader.ReadString('\n')
+				modelInput = strings.TrimSpace(modelInput)
+
+				switch modelInput {
+				case "2":
+					cfg.Embedder.Model = "openai/text-embedding-3-large"
+				case "3":
+					cfg.Embedder.Model = "qwen/qwen3-embedding-8b"
+				default:
+					cfg.Embedder.Model = "openai/text-embedding-3-small"
+				}
+			case "6", "requesty":
+				cfg.Embedder.Provider = "requesty"
+				cfg.Embedder.Endpoint = "https://router.requesty.ai/v1"
+				cfg.Embedder.Model = "openai/text-embedding-3-small"
+				// Requesty: leave Dimensions nil to use model's native dimensions
+			default:
+				cfg.Embedder.Provider = "ollama"
+				fmt.Print("Ollama endpoint [http://localhost:11434]: ")
+				endpoint, _ := reader.ReadString('\n')
+				endpoint = strings.TrimSpace(endpoint)
+				if endpoint == "" {
+					endpoint = "http://localhost:11434"
+				}
+				cfg.Embedder.Endpoint = endpoint
+			}
+		} else {
+			cfg.Embedder.Provider = initProvider
+			switch initProvider {
+			case "ollama":
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
+			case "lmstudio":
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
+				cfg.Embedder.Endpoint = "http://127.0.0.1:1234"
+				dim := lmStudioEmbeddingDimensions
+				cfg.Embedder.Dimensions = &dim
+			case "openai":
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
+				cfg.Embedder.Endpoint = "https://api.openai.com/v1"
+				cfg.Embedder.Parallelism = config.DefaultOpenAIParallelism
+				// OpenAI: leave Dimensions nil to use model's native dimensions
+			case "synthetic":
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
+				cfg.Embedder.Endpoint = "https://api.synthetic.new/openai/v1"
+				dim := 768
+				cfg.Embedder.Dimensions = &dim
+			case "openrouter":
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
+				cfg.Embedder.Endpoint = "https://openrouter.ai/api/v1"
+				// OpenRouter: leave Dimensions nil to use model's native dimensions
+			case "requesty":
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
+				cfg.Embedder.Endpoint = "https://router.requesty.ai/v1"
+				// Requesty: leave Dimensions nil to use model's native dimensions
+			}
+		}
+
+		// Backend selection
+		if initBackend == "" {
+			fmt.Println("\nSelect storage backend:")
+			fmt.Println("  1) gob (local file, recommended for most projects)")
+			fmt.Println("  2) postgres (pgvector, for large monorepos or shared index)")
+			fmt.Println("  3) qdrant (Docker-based vector database)")
+			fmt.Print("Choice [1]: ")
+
+			input, _ := reader.ReadString('\n')
+			input = strings.TrimSpace(input)
+
+			switch input {
+			case "2", "postgres":
+				cfg.Store.Backend = "postgres"
+				fmt.Print("PostgreSQL DSN: ")
+				dsn, _ := reader.ReadString('\n')
+				cfg.Store.Postgres.DSN = strings.TrimSpace(dsn)
+			case "3", "qdrant":
+				cfg.Store.Backend = "qdrant"
+				fmt.Print("Qdrant endpoint [localhost]: ")
+				endpoint, _ := reader.ReadString('\n')
+				endpoint = strings.TrimSpace(endpoint)
+				if endpoint == "" {
+					endpoint = "localhost"
+				}
+				cfg.Store.Qdrant.Endpoint = endpoint
+
+				fmt.Print("Qdrant port [6334]: ")
+				port, _ := reader.ReadString('\n')
+				port = strings.TrimSpace(port)
+				if port == "" {
+					cfg.Store.Qdrant.Port = 6334
+				} else {
+					var portInt int
+					_, err := fmt.Sscanf(port, "%d", &portInt)
+					if err != nil {
+						return fmt.Errorf("invalid port number: %w", err)
+					}
+					cfg.Store.Qdrant.Port = portInt
+				}
+
+				fmt.Print("Use TLS? (y/n) [n]: ")
+				useTLS, _ := reader.ReadString('\n')
+				useTLS = strings.TrimSpace(strings.ToLower(useTLS))
+				cfg.Store.Qdrant.UseTLS = useTLS == "y" || useTLS == "yes"
+
+				fmt.Print("Collection name (optional, defaults to sanitized project path): ")
+				collection, _ := reader.ReadString('\n')
+				cfg.Store.Qdrant.Collection = strings.TrimSpace(collection)
+
+				fmt.Print("API key (optional, for Qdrant Cloud): ")
+				apiKey, _ := reader.ReadString('\n')
+				cfg.Store.Qdrant.APIKey = strings.TrimSpace(apiKey)
+			default:
+				cfg.Store.Backend = "gob"
+			}
+		} else {
+			cfg.Store = config.DefaultStoreForBackend(initBackend)
+		}
+	} else if !skipPrompts {
+		// Non-interactive with flags
+		if initProvider != "" {
+			cfg.Embedder.Provider = initProvider
+			// Apply provider-specific settings
+			switch initProvider {
+			case "ollama":
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
+			case "lmstudio":
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
+				cfg.Embedder.Endpoint = "http://127.0.0.1:1234"
+				dim := lmStudioEmbeddingDimensions
+				cfg.Embedder.Dimensions = &dim
+			case "openai":
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
+				cfg.Embedder.Endpoint = "https://api.openai.com/v1"
+				cfg.Embedder.Dimensions = nil
+				cfg.Embedder.Parallelism = config.DefaultOpenAIParallelism
+			case "synthetic":
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
+				cfg.Embedder.Endpoint = "https://api.synthetic.new/openai/v1"
+				dim := 768
+				cfg.Embedder.Dimensions = &dim
+			case "openrouter":
+				cfg.Embedder.Endpoint = "https://openrouter.ai/api/v1"
+				cfg.Embedder.Dimensions = nil
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
+			case "requesty":
+				cfg.Embedder.Endpoint = "https://router.requesty.ai/v1"
+				cfg.Embedder.Dimensions = nil
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
+			}
+		}
+		if initBackend != "" {
+			cfg.Store = config.DefaultStoreForBackend(initBackend)
+		}
+	}
+
+	// Save configuration
+	if err := cfg.Save(cwd); err != nil {
+		return fmt.Errorf("failed to save configuration: %w", err)
+	}
+
+	fmt.Printf("\nCreated configuration at %s\n", config.GetConfigPath(cwd))
+
+	// Keep .grepai/ out of git: add it to the project's .gitignore, or, when
+	// there is none, ignore the directory from inside (#186).
+	gitignorePath := cwd + "/.gitignore"
+	if _, err := os.Stat(gitignorePath); err == nil {
+		if err := indexer.AddToGitignore(cwd, ".grepai/"); err != nil {
+			fmt.Printf("Warning: could not update .gitignore: %v\n", err)
+		} else {
+			fmt.Println("Added .grepai/ to .gitignore")
+		}
+	} else if err := os.WriteFile(filepath.Join(config.GetConfigDir(cwd), ".gitignore"), []byte("*\n"), 0o600); err != nil {
+		fmt.Printf("Warning: could not create .grepai/.gitignore: %v\n", err)
+	} else {
+		fmt.Println("Created .grepai/.gitignore so the index stays out of git")
+	}
+
+	fmt.Println("\ngrepai initialized successfully!")
+	fmt.Println("\nNext steps:")
+	fmt.Println("  1. Start the indexing daemon: grepai watch")
+	fmt.Println("  2. Search your code: grepai search \"your query\"")
+
+	switch cfg.Embedder.Provider {
+	case "ollama":
+		fmt.Printf("\nMake sure Ollama is running with the %s model:\n", cfg.Embedder.Model)
+		fmt.Printf("  ollama pull %s\n", cfg.Embedder.Model)
+	case "lmstudio":
+		fmt.Println("\nMake sure LM Studio is running with an embedding model loaded.")
+		fmt.Printf("  Model: %s\n", cfg.Embedder.Model)
+		fmt.Printf("  Endpoint: %s\n", cfg.Embedder.Endpoint)
+	case "openai", "synthetic", "openrouter", "requesty":
+		if cfg.Embedder.APIKey == "" && !embedder.UsesOfficialEndpoint(cfg.Embedder.Provider, cfg.Embedder.Endpoint) {
+			fmt.Printf("\n%s is a custom endpoint: environment API keys are only sent to the\n", embedder.RedactEndpoint(cfg.Embedder.Endpoint))
+			fmt.Printf("official endpoint. Set embedder.api_key in %s.\n", config.GetConfigPath(cwd))
+			break
+		}
+		printCloudKeyHint(cfg.Embedder.Provider)
+	}
+
+	switch cfg.Embedder.Provider {
+	case "ollama", "lmstudio", "synthetic":
+		if cfg.Embedder.Model != localDefaultModel(cfg.Embedder.Provider) {
+			fmt.Printf("\nNote: embedder.dimensions is %d. If %s produces vectors of another size,\n", cfg.Embedder.GetDimensions(), cfg.Embedder.Model)
+			fmt.Printf("set embedder.dimensions in %s before indexing.\n", config.GetConfigPath(cwd))
+		}
+	}
+
+	return nil
+}
+
+// printCloudKeyHint tells where a cloud provider's API key is read from when
+// the official endpoint is used.
+func printCloudKeyHint(provider string) {
+	switch provider {
+	case "openai":
+		fmt.Println("\nMake sure OPENAI_API_KEY is set in your environment.")
+	case "synthetic":
+		fmt.Println("\nMake sure SYNTHETIC_API_KEY or OPENAI_API_KEY is set in your environment.")
+		fmt.Println("  Get your free API key at: https://api.synthetic.new")
+	case "openrouter":
+		fmt.Println("\nMake sure OPENROUTER_API_KEY or OPENAI_API_KEY is set in your environment.")
+		fmt.Println("  Get your API key at: https://openrouter.ai/keys")
+	case "requesty":
+		fmt.Println("\nMake sure REQUESTY_API_KEY or OPENAI_API_KEY is set in your environment.")
+		fmt.Println("  Get your API key at: https://app.requesty.ai/api-keys")
+	}
+}
+
+func shouldPromptInheritChoice(shouldInherit, nonInteractive, uiMode bool) bool {
+	return !shouldInherit && !nonInteractive && !uiMode
+}
+
+func resolveInitModel(provider, requestedModel string) string {
+	requestedModel = strings.TrimSpace(requestedModel)
+	switch provider {
+	case "openai":
+		if requestedModel != "" {
+			return requestedModel
+		}
+		return config.DefaultOpenAIEmbeddingModel
+	case "openrouter":
+		switch requestedModel {
+		case "text-embedding-3-large":
+			return config.OpenRouterEmbeddingModelLarge
+		case "qwen3-embedding-8b":
+			return config.OpenRouterEmbeddingModelQwen8B
+		case "text-embedding-3-small", "":
+			return config.DefaultOpenRouterEmbeddingModel
+		default:
+			return requestedModel
+		}
+	case "requesty":
+		if requestedModel != "" {
+			return requestedModel
+		}
+		return config.DefaultRequestyEmbeddingModel
+	case "ollama", "lmstudio", "synthetic":
+		if requestedModel != "" {
+			return requestedModel
+		}
+		return localDefaultModel(provider)
+	default:
+		return requestedModel
+	}
+}
+
+// localDefaultModel returns the default model of a provider that uses a
+// fixed 768-dimension default.
+func localDefaultModel(provider string) string {
+	switch provider {
+	case "lmstudio":
+		return config.DefaultLMStudioEmbeddingModel
+	case "synthetic":
+		return config.DefaultSyntheticEmbeddingModel
+	default:
+		return config.DefaultOllamaEmbeddingModel
+	}
+}

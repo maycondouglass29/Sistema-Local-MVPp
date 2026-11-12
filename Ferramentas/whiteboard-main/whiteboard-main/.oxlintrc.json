@@ -1,0 +1,269 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "oxc", "react", "jsx-a11y", "vitest"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "error"
+  },
+  "settings": {
+    "react": {
+      "version": "19.0.0"
+    },
+    "vitest": {
+      "typecheck": false
+    }
+  },
+  "env": {
+    "builtin": true
+  },
+  "globals": {},
+  "ignorePatterns": [
+    ".vite/**",
+    "dist/**",
+    "**/dist/**",
+    "**/.vite/**",
+    "apps/review-desktop/code-oss/**",
+    "diffr/**",
+    ".agent/**",
+    ".agents/**",
+    ".claude/**",
+    ".codex/**",
+    ".continue/**",
+    ".cursor/**",
+    ".gemini/**",
+    ".opencode/**",
+    ".pi/**",
+    ".roo/**",
+    ".windsurf/**",
+    "tools/oxlint/anti-slop/**"
+  ],
+  "rules": {
+    "sort-imports": [
+      "error",
+      {
+        "ignoreDeclarationSort": true,
+        "ignoreMemberSort": false,
+        "ignoreCase": false,
+        "memberSyntaxSortOrder": ["none", "all", "multiple", "single"]
+      }
+    ],
+    "jsx-a11y/label-has-associated-control": [
+      "error",
+      {
+        "controlComponents": [
+          "Checkbox",
+          "Select",
+          "Switch",
+          "TextArea",
+          "TextField"
+        ]
+      }
+    ],
+    "typescript/no-explicit-any": "off",
+    "typescript/no-non-null-assertion": "off",
+    "typescript/array-type": "off",
+    "typescript/no-this-alias": "off",
+    "react/react-in-jsx-scope": "off",
+    "react/exhaustive-deps": "off",
+    "react/no-array-index-key": "off",
+    "react/no-danger": "off",
+    "no-await-in-loop": "off",
+    "no-control-regex": "off",
+    "no-shadow": "off",
+    "no-underscore-dangle": "off",
+    "no-unused-vars": "off",
+    "no-useless-escape": "off",
+    "no-unsafe-optional-chaining": "off",
+    "prefer-destructuring": "off",
+    "preserve-caught-error": "off",
+    "require-yield": "off",
+    "max-lines": "off",
+    "oxc/no-map-spread": "off",
+    "oxc/only-used-in-recursion": "off",
+    "jsx-a11y/no-static-element-interactions": "off",
+    "jsx-a11y/click-events-have-key-events": "off",
+    "jsx-a11y/no-autofocus": "off",
+    "jsx-a11y/no-noninteractive-tabindex": "off",
+    "jsx-a11y/prefer-tag-over-role": "off",
+    "jsx-a11y/role-has-required-aria-props": "off",
+    "no-unmodified-loop-condition": "off",
+    "oxc/no-accumulating-spread": "error",
+    "anti-slop/no-array-filter-map": "error",
+    "anti-slop/no-reduce-accumulator-copy": "error",
+    "anti-slop/require-readable-spacing": "error",
+    "anti-slop/no-chained-type-assertions": "error",
+    "anti-slop/no-conditional-empty-object-spread": "error",
+    "anti-slop/no-known-value-widening": "error",
+    "anti-slop/no-module-mocking": "error",
+    "anti-slop/no-object-parameters": "error",
+    "anti-slop/no-reflect-apply": "error",
+    "anti-slop/no-reflect-get": "error",
+    "anti-slop/no-runtime-typeof": "error",
+    "anti-slop/no-shape-in-symbol-names": "error",
+    "anti-slop/no-unknown-parameters": "error",
+    "anti-slop/no-unknown-returns": "error",
+    "anti-slop/no-unknown-type-aliases": "error",
+    "anti-slop/no-unsafe-dictionary-type": "error",
+    "anti-slop/no-widen-then-assert": "error",
+    "anti-slop/require-safety-comment-for-type-assertion": "error"
+  },
+  "jsPlugins": [
+    {
+      "name": "anti-slop",
+      "specifier": "./tools/oxlint/anti-slop/index.ts"
+    },
+    {
+      "name": "canvas-styles",
+      "specifier": "./tools/oxlint/canvas-styles/index.ts"
+    },
+    {
+      "name": "stylex",
+      "specifier": "@stylexjs/eslint-plugin"
+    }
+  ],
+  "overrides": [
+    {
+      "files": ["**/*.test.ts", "**/*.test.tsx"],
+      "rules": {
+        "anti-slop/require-safety-comment-for-type-assertion": "off"
+      }
+    },
+    {
+      "files": ["packages/json/src/runtime-value.ts"],
+      "rules": {
+        "anti-slop/no-runtime-typeof": "off"
+      }
+    },
+    {
+      "files": ["packages/review/src/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": [
+                  "../**",
+                  "!**/test/fixtures/**",
+                  "!**/test-config*",
+                  "!**/desktop-css-scope",
+                  "!**/agent-plugins/**"
+                ],
+                "message": "Import through @review/* or @canvas/*; run scripts/rewrite-relative-imports.mjs."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["packages/trace-core/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": ["@dev.fast/whiteboard"],
+            "patterns": ["@dev.fast/whiteboard/*", "**/review/**"]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["packages/review/app/src/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["../**", "!**/desktop-css-scope"],
+                "message": "Import through @canvas/*; run scripts/rewrite-relative-imports.mjs."
+              },
+              {
+                "group": [
+                  "vs/**",
+                  "@vscode/**",
+                  "monaco-editor",
+                  "monaco-editor/**"
+                ],
+                "message": "Keep Code OSS imports out of the canvas; go through session.bridge."
+              }
+            ]
+          }
+        ],
+        "react/forbid-elements": [
+          "error",
+          {
+            "forbid": [
+              {
+                "element": "select",
+                "message": "Use Select from ui/text-field."
+              }
+            ]
+          }
+        ],
+        "canvas-styles/scale-literals": "error",
+        "canvas-styles/no-important": "error",
+        "canvas-styles/no-bare-transparent": "error",
+        "canvas-styles/no-raw-colors": "error",
+        "canvas-styles/no-glyph-icons": "error",
+        "stylex/enforce-extension": "error",
+        "stylex/no-legacy-contextual-styles": "error",
+        "stylex/no-unused": "error"
+      }
+    },
+    {
+      "files": ["packages/review/app/src/theme-styles.ts"],
+      "rules": {
+        "canvas-styles/no-bare-transparent": "off",
+        "canvas-styles/no-raw-colors": "off"
+      }
+    },
+    {
+      "files": ["packages/review/app/src/ui/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["../**", "!**/desktop-css-scope"],
+                "message": "Import through @canvas/*; run scripts/rewrite-relative-imports.mjs."
+              },
+              {
+                "group": [
+                  "vs/**",
+                  "@vscode/**",
+                  "monaco-editor",
+                  "monaco-editor/**"
+                ],
+                "message": "Keep Code OSS imports out of the canvas; go through session.bridge."
+              },
+              {
+                "group": [
+                  "@canvas/**",
+                  "!@canvas/ui/**",
+                  "!@canvas/*.stylex",
+                  "!@canvas/stylex-props",
+                  "!@canvas/host/**"
+                ],
+                "message": "Kit modules never import app code; move the piece into src/ui or pass it in."
+              }
+            ]
+          }
+        ],
+        "react/forbid-elements": "off"
+      }
+    },
+    {
+      "files": [
+        "packages/review/app/src/ui/**/*.test.ts",
+        "packages/review/app/src/ui/**/*.test.tsx"
+      ],
+      "rules": {
+        "no-restricted-imports": "off"
+      }
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+import { REVIEW_CANVAS_RESUME_EVENT } from "@dev.fast/review-protocol";
+import {
+  type ReactNode,
+  type RefObject,
+  createContext,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { useStore } from "zustand";
+
+import {
+  type ReviewPanelRestore,
+  type ReviewPanelStore,
+  type ReviewPanelStoreState,
+  createReviewPanelStore,
+} from "./review-panel-store";
+import { useHydrated } from "./use-hydrated";
+
+const ReviewPanelContext = createContext<ReviewPanelStore | null>(null);
+
+/** The open Ask a component renders in: what it opens, opens there. */
+export const AskKeyContext = createContext<number | null>(null);
+
+/** The key of the open Ask this renders in, for `AskOpenOptions.from`. */
+export function useAskKey(): number | undefined {
+  return useContext(AskKeyContext) ?? undefined;
+}
+
+const fallbackReviewPanelStore = createReviewPanelStore();
+
+export function ReviewPanelProvider({
+  children,
+  restore,
+}: {
+  children: ReactNode;
+  /** Called once, when the provider mounts: the canvas re-renders often, and
+   * restoring reads storage. */
+  restore?: () => ReviewPanelRestore;
+}) {
+  // A hydrating page shows what its server rendered, so it skips restoring.
+  const hydrated = useHydrated();
+
+  const [store] = useState(() =>
+    createReviewPanelStore(hydrated ? restore?.() : undefined),
+  );
+
+  return (
+    <ReviewPanelContext.Provider value={store}>
+      {children}
+    </ReviewPanelContext.Provider>
+  );
+}
+
+export function useReviewPanel<T>(
+  selector: (state: ReviewPanelStoreState) => T,
+): T {
+  return useStore(useReviewPanelStore(), selector);
+}
+
+export function useOptionalReviewPanelStore(): ReviewPanelStore | null {
+  return useContext(ReviewPanelContext);
+}
+
+export function useOptionalReviewPanel<T>(
+  selector: (state: ReviewPanelStoreState) => T,
+): T | undefined {
+  const store = useContext(ReviewPanelContext);
+  const selected = useStore(store ?? fallbackReviewPanelStore, selector);
+
+  return store ? selected : undefined;
+}
+
+export function useReviewPanelStore(): ReviewPanelStore {
+  const store = useContext(ReviewPanelContext);
+
+  if (!store) {
+    throw new Error(
+      "Review panel components must render inside ReviewPanelProvider",
+    );
+  }
+
+  return store;
+}
+
+export function useSuppressPanelMotionOnCanvasResume(
+  appRef: RefObject<HTMLElement | null>,
+): void {
+  const store = useReviewPanelStore();
+  useEffect(() => {
+    const canvasRoot = appRef.current?.closest(".review-canvas-root");
+
+    if (!canvasRoot) return;
+    const suppressMotion = () => store.getState().suppressMotion();
+    canvasRoot.addEventListener(REVIEW_CANVAS_RESUME_EVENT, suppressMotion);
+
+    return () =>
+      canvasRoot.removeEventListener(
+        REVIEW_CANVAS_RESUME_EVENT,
+        suppressMotion,
+      );
+  }, [appRef, store]);
+}

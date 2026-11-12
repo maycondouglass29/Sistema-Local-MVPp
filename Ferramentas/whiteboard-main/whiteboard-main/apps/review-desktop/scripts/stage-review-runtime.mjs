@@ -1,0 +1,417 @@
+import { execFile } from "node:child_process";
+import {
+  access,
+  cp,
+  open,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+} from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+
+import { pruneReviewRuntime } from "./prune-review-runtime.mjs";
+
+const execFileAsync = promisify(execFile);
+
+export const RUNTIME_DIFFR_ENTRY = `node_modules/@dev.fast/diffr-${process.platform}-${process.arch}/${process.platform === "win32" ? "diffr.exe" : "diffr"}`;
+
+const appDirectory = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+);
+
+const monorepoRoot = path.resolve(appDirectory, "../..");
+
+/**
+ * The installed application must not reach back into the build checkout, so the
+ * Review server ships as a self-contained production dependency closure rather
+ * than as a single bundled file: the runtime intentionally depends on native
+ * binaries and external Node libraries. The canvas is built and copied separately.
+ */
+export const RUNTIME_DIRECTORY_NAME = "review-runtime";
+
+export const RUNTIME_SERVER_ENTRY = "dist/server/desktop-host.js";
+
+export const RUNTIME_CLI_ENTRY = "dist/cli.js";
+
+export const REQUIRED_RUNTIME_ENTRIES = [
+  "package.json",
+  "LICENSE",
+  "THIRD_PARTY_NOTICES.md",
+  RUNTIME_SERVER_ENTRY,
+  RUNTIME_CLI_ENTRY,
+  RUNTIME_DIFFR_ENTRY,
+  "dist/cli.js",
+  // The build's commit; without it the server reports `commit: null`.
+  "dist/build-info.json",
+  "instructions/authoring.md",
+  "remote/install.sh",
+  "node_modules",
+];
+
+export function runtimeRootForPackagedRoot(packagedRoot) {
+  const resolved = path.resolve(packagedRoot);
+
+  if (resolved === path.parse(resolved).root) {
+    throw new Error("The packaged Review root cannot be a filesystem root.");
+  }
+
+  const packagedAppRoot = resolved.endsWith(".app")
+    ? path.join(resolved, "Contents/Resources/app")
+    : path.join(resolved, "resources/app");
+
+  return path.join(packagedAppRoot, RUNTIME_DIRECTORY_NAME);
+}
+
+export function requiredPackagedArtifacts(packagedRoot) {
+  const runtimeRoot = runtimeRootForPackagedRoot(packagedRoot);
+  const packagedAppRoot = path.dirname(runtimeRoot);
+
+  const entries = [
+    "out/vs/review/review.desktop.main.js",
+    "out/vs/review/review.desktop.main.css",
+    "out/vs/review/electron-utility/reviewDesktopHostMain.js",
+    "out/vs/review/node/reviewSshAskpassMain.js",
+    "out/vs/review/canvas/canvas-loader.js",
+    ...REQUIRED_RUNTIME_ENTRIES.map((entry) =>
+      path.join(RUNTIME_DIRECTORY_NAME, entry),
+    ),
+  ];
+
+  if (!path.resolve(packagedRoot).endsWith(".app")) {
+    entries.push("extensions/vscodevim.vim/package.json");
+  }
+
+  return entries.map((entry) => path.join(packagedAppRoot, entry));
+}
+
+export async function assertPackagedArtifacts(packagedRoot) {
+  await assertNoRuntimeBundler(packagedRoot);
+
+  for (const artifact of requiredPackagedArtifacts(packagedRoot)) {
+    try {
+      await access(artifact);
+    } catch {
+      throw new Error(`Review Desktop package is missing ${artifact}.`);
+    }
+  }
+}
+
+export async function stageReviewRuntime(packagedRoot) {
+  const runtimeRoot = runtimeRootForPackagedRoot(packagedRoot);
+  const packagedAppRoot = path.dirname(runtimeRoot);
+
+  if (!(await isDirectory(packagedAppRoot))) {
+    throw new Error(
+      `Refusing to stage the Review runtime outside a packaged app: ${packagedAppRoot}`,
+    );
+  }
+
+  await rm(runtimeRoot, { recursive: true, force: true });
+
+  const pnpmScript =
+    process.platform === "win32" ? process.env.npm_execpath : undefined;
+
+  if (process.platform === "win32" && !pnpmScript) {
+    throw new Error("Run Windows packaging through pnpm app:package:windows.");
+  }
+
+  await execFileAsync(
+    pnpmScript ? process.execPath : "pnpm",
+    [
+      ...(pnpmScript ? [pnpmScript] : []),
+      // This workspace pins `nodeLinker: hoisted`, under which a plain deploy
+      // links workspace dependencies back to the checkout and never resolves
+      // their own dependency graphs. Injecting copies them in with their deps.
+      "--config.inject-workspace-packages=true",
+      "--filter",
+      "@dev.fast/whiteboard",
+      "--prod",
+      "deploy",
+      "--legacy",
+      // Keeps the root prepare/Husky lifecycle out of packaging.
+      "--ignore-scripts",
+      runtimeRoot,
+    ],
+    { cwd: monorepoRoot, maxBuffer: 64 * 1024 * 1024 },
+  );
+
+  await stageReviewDocs(runtimeRoot);
+  console.log("[runtime pruning]", await pruneReviewRuntime(runtimeRoot));
+  await assertRuntimeClosure(runtimeRoot);
+
+  return runtimeRoot;
+}
+
+export async function stageReviewDocs(
+  runtimeRoot,
+  sourceDocsRoot = path.join(monorepoRoot, "docs"),
+) {
+  if (!(await isDirectory(sourceDocsRoot))) {
+    throw new Error(
+      `Review documentation source is missing: ${sourceDocsRoot}`,
+    );
+  }
+
+  const destination = path.join(runtimeRoot, "docs");
+  await rm(destination, { recursive: true, force: true });
+  await cp(sourceDocsRoot, destination, { recursive: true });
+  await assertMatchingFileTrees(sourceDocsRoot, destination);
+
+  return destination;
+}
+
+async function assertMatchingFileTrees(sourceRoot, destinationRoot) {
+  const [sourceFiles, destinationFiles] = await Promise.all([
+    listRelativeFiles(sourceRoot),
+    listRelativeFiles(destinationRoot),
+  ]);
+
+  if (sourceFiles.join("\n") !== destinationFiles.join("\n")) {
+    throw new Error(
+      "The staged Review documentation file list does not match.",
+    );
+  }
+
+  for (const relative of sourceFiles) {
+    const [source, destination] = await Promise.all([
+      readFile(path.join(sourceRoot, relative)),
+      readFile(path.join(destinationRoot, relative)),
+    ]);
+
+    if (!source.equals(destination)) {
+      throw new Error(
+        `The staged Review documentation differs at ${relative}.`,
+      );
+    }
+  }
+}
+
+async function listRelativeFiles(root) {
+  const files = [];
+
+  const walk = async (directory) => {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+
+    for (const entry of entries) {
+      const absolute = path.join(directory, entry.name);
+
+      if (entry.isDirectory()) {
+        await walk(absolute);
+      } else if (entry.isFile()) {
+        files.push(path.relative(root, absolute));
+      } else {
+        throw new Error(
+          `Review documentation contains an unsupported entry: ${absolute}`,
+        );
+      }
+    }
+  };
+
+  await walk(root);
+
+  return files;
+}
+
+export async function assertRuntimeClosure(runtimeRoot) {
+  for (const entry of REQUIRED_RUNTIME_ENTRIES) {
+    const target = path.join(runtimeRoot, entry);
+
+    try {
+      await access(target);
+    } catch {
+      throw new Error(`The staged Review runtime is missing ${entry}.`);
+    }
+  }
+
+  await assertRuntimeContents(runtimeRoot);
+}
+
+/** Final package verification includes files outside the staged runtime, such
+ * as extension dependencies and ASAR archives, after all package mutations. */
+export async function assertNoRuntimeBundler(runtimeRoot) {
+  await inspectRuntimeTree(runtimeRoot, false);
+}
+
+/** Validate the staged dependency closure in one traversal. */
+export async function assertRuntimeContents(runtimeRoot) {
+  await inspectRuntimeTree(runtimeRoot, true);
+}
+
+async function inspectRuntimeTree(root, checkCheckoutReferences) {
+  const runtimeRoot = await realpath(root);
+  const offenders = [];
+
+  const visit = async (directory) => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const absolute = path.join(directory, entry.name);
+
+      if (entry.name === "esbuild" || entry.name === "esbuild.exe") {
+        throw new Error(
+          `The Review runtime must not ship esbuild: ${path.relative(runtimeRoot, absolute)}`,
+        );
+      }
+
+      if (entry.isSymbolicLink()) {
+        if (checkCheckoutReferences) {
+          const real = await realpathOrNull(absolute);
+
+          if (!real) {
+            offenders.push(
+              `${path.relative(runtimeRoot, absolute)} (broken link)`,
+            );
+          } else if (
+            real !== runtimeRoot &&
+            !real.startsWith(runtimeRoot + path.sep)
+          ) {
+            offenders.push(
+              `${path.relative(runtimeRoot, absolute)} -> ${real} (escapes runtime)`,
+            );
+          }
+        }
+
+        continue;
+      }
+
+      if (entry.isDirectory()) {
+        await visit(absolute);
+        continue;
+      }
+
+      if (!entry.isFile()) continue;
+
+      if (entry.name.endsWith(".asar")) {
+        await assertNoArchivedBundler(absolute);
+        continue;
+      }
+
+      const isManifest = entry.name === "package.json";
+
+      // Declarations and source maps can embed checkout paths just as emitted
+      // JavaScript can. Read manifests once for both closure checks.
+      const checkContents =
+        checkCheckoutReferences &&
+        (isManifest ||
+          /\.[cm]?js\.map$/.test(entry.name) ||
+          (/\.(?:[cm]?js|d\.[cm]?ts)$/.test(entry.name) &&
+            absolute.includes(`${path.sep}dist${path.sep}`)));
+
+      if (!isManifest && !checkContents) continue;
+      const contents = await readFile(absolute, "utf8");
+
+      if (isManifest) {
+        const manifest = JSON.parse(contents);
+
+        if (
+          manifest.name === "esbuild" ||
+          manifest.name?.startsWith("@esbuild/")
+        )
+          throw new Error(
+            `The Review runtime must not ship ${manifest.name}: ${path.relative(runtimeRoot, absolute)}`,
+          );
+      }
+
+      if (checkContents && contents.includes(monorepoRoot)) {
+        offenders.push(
+          `${path.relative(runtimeRoot, absolute)} (build checkout path)`,
+        );
+      }
+    }
+  };
+
+  await visit(runtimeRoot);
+
+  if (offenders.length > 0) {
+    throw new Error(
+      `The staged Review runtime is not relocatable:\n  ${offenders.join("\n  ")}`,
+    );
+  }
+}
+
+// ASAR headers are two Chromium pickles: an 8-byte size pickle followed by
+// a string pickle containing the JSON tree. Inspect the directory without
+// extracting the app or requiring an archive tool in the installed runtime.
+async function assertNoArchivedBundler(archive) {
+  const file = await open(archive, "r");
+
+  try {
+    const prefix = Buffer.alloc(16);
+
+    if ((await file.read(prefix, 0, 16, 0)).bytesRead !== 16)
+      throw new Error(`Invalid ASAR header: ${archive}`);
+    const headerBytes = prefix.readUInt32LE(4);
+    const jsonBytes = prefix.readUInt32LE(12);
+
+    if (jsonBytes > headerBytes - 8 || headerBytes > 64 * 1024 * 1024)
+      throw new Error(`Invalid ASAR header size: ${archive}`);
+    const contents = Buffer.alloc(jsonBytes);
+
+    if ((await file.read(contents, 0, jsonBytes, 16)).bytesRead !== jsonBytes)
+      throw new Error(`Truncated ASAR header: ${archive}`);
+
+    const visit = (node, parent = "") => {
+      for (const [name, child] of Object.entries(node.files ?? {})) {
+        const relative = `${parent}/${name}`;
+
+        if (name === "esbuild" || name === "esbuild.exe" || name === "@esbuild")
+          throw new Error(
+            `The Review runtime must not ship esbuild: ${archive}:${relative}`,
+          );
+        visit(child, relative);
+      }
+    };
+
+    visit(JSON.parse(contents.toString("utf8")));
+  } finally {
+    await file.close();
+  }
+}
+
+async function realpathOrNull(target) {
+  try {
+    return await realpath(target);
+  } catch {
+    return null;
+  }
+}
+
+async function isDirectory(candidate) {
+  try {
+    return (await stat(candidate)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
+) {
+  const args = process.argv.slice(2);
+  const verifyOnly = args[0] === "--verify";
+  const packagedRootIndex = verifyOnly ? 1 : 0;
+
+  if (
+    args.length !== packagedRootIndex + 2 ||
+    args[packagedRootIndex] !== "--packaged-root"
+  ) {
+    throw new Error(
+      "usage: stage-review-runtime.mjs [--verify] --packaged-root <packaged-app-root>",
+    );
+  }
+
+  const packagedRoot = args[packagedRootIndex + 1];
+
+  if (verifyOnly) {
+    await assertPackagedArtifacts(packagedRoot);
+    process.stdout.write(`Verified the Review package at ${packagedRoot}\n`);
+  } else {
+    const runtimeRoot = await stageReviewRuntime(packagedRoot);
+    process.stdout.write(`Staged the Review runtime at ${runtimeRoot}\n`);
+  }
+}

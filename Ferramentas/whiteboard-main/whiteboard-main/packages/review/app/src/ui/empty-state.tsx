@@ -1,0 +1,102 @@
+import {
+  fontSize,
+  fontWeight,
+  leading,
+  radius,
+  space,
+} from "@canvas/scale.stylex";
+import { type StyleArg, withClass } from "@canvas/stylex-props";
+import { tokens } from "@canvas/tokens.stylex";
+import * as stylex from "@stylexjs/stylex";
+import type { ComponentProps, ReactElement, ReactNode } from "react";
+
+type EmptyStateProps = Omit<
+  ComponentProps<"div">,
+  "className" | "style" | "title" | "role"
+> & {
+  // Inline is a quiet note in a pane; boxed stands in for a figure.
+  variant?: "inline" | "boxed";
+  title?: ReactNode;
+  message: ReactNode;
+  role?: "alert" | "status";
+  action?: ReactNode;
+  className?: string;
+  xstyle?: StyleArg;
+};
+
+export function EmptyState({
+  variant = "inline",
+  title,
+  message,
+  role = "status",
+  action,
+  className,
+  xstyle,
+  ...props
+}: EmptyStateProps): ReactElement {
+  const boxed = variant === "boxed";
+  const Title = boxed ? "h3" : "p";
+
+  return (
+    <div
+      role={role}
+      {...props}
+      {...withClass(className, styles[variant], xstyle)}
+    >
+      {title ? (
+        <Title {...stylex.props(styles.title, boxed && styles.boxedTitle)}>
+          {title}
+        </Title>
+      ) : null}
+      <p {...stylex.props(styles.message, boxed && styles.boxedMessage)}>
+        {message}
+      </p>
+      {action}
+    </div>
+  );
+}
+
+const styles = stylex.create({
+  inline: {
+    display: "flex",
+    flexDirection: "column",
+    gap: space.s4,
+    // Aligned to the pane's own content edge.
+    paddingBlock: space.s16,
+    color: tokens.inkMuted,
+    fontSize: fontSize.ui,
+    lineHeight: leading.normal,
+  },
+  boxed: {
+    boxSizing: "border-box",
+    display: "grid",
+    placeContent: "center",
+    justifyItems: "center",
+    padding: space.s32,
+    borderWidth: "1px",
+    borderStyle: "solid",
+    borderColor: tokens.ruleSoft,
+    borderRadius: radius.surface,
+    backgroundColor: tokens.tray,
+    color: tokens.inkMuted,
+    textAlign: "center",
+  },
+  title: {
+    margin: 0,
+    color: tokens.ink,
+    fontWeight: fontWeight.medium,
+  },
+  message: {
+    margin: 0,
+  },
+  boxedTitle: {
+    marginBottom: space.s8,
+    fontSize: fontSize.reading,
+    lineHeight: leading.tight,
+  },
+  boxedMessage: {
+    maxWidth: "540px",
+    fontSize: fontSize.ui,
+    lineHeight: leading.normal,
+  },
+});
