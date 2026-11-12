@@ -232,15 +232,15 @@ export const OutboxSyncView: React.FC = () => {
       const constraints: MediaStreamConstraints = {
         video: targetId
           ? {
-              deviceId: { exact: targetId },
-              width: { ideal: resLimits.width },
-              height: { ideal: resLimits.height },
-            }
+            deviceId: { exact: targetId },
+            width: { ideal: resLimits.width },
+            height: { ideal: resLimits.height },
+          }
           : {
-              facingMode: 'environment',
-              width: { ideal: resLimits.width },
-              height: { ideal: resLimits.height },
-            },
+            facingMode: 'environment',
+            width: { ideal: resLimits.width },
+            height: { ideal: resLimits.height },
+          },
       };
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
@@ -258,7 +258,7 @@ export const OutboxSyncView: React.FC = () => {
     } catch (err: any) {
       showNotification(
         'Erro ao acessar câmera: ' +
-          (err.message || 'Verifique se o dispositivo está em uso.')
+        (err.message || 'Verifique se o dispositivo está em uso.')
       );
       stopCameraTest();
     }
@@ -466,9 +466,8 @@ export const OutboxSyncView: React.FC = () => {
         detail:
           student?.status === 'active'
             ? `Estudante com matrícula ativa (${student.enrollment_code}) e dentro do período letivo.`
-            : `Estudante com status '${student?.status}': ${
-                student?.block_reason || 'Acesso bloqueado pela coordenação'
-              }.`,
+            : `Estudante com status '${student?.status}': ${student?.block_reason || 'Acesso bloqueado pela coordenação'
+            }.`,
       },
       {
         label: 'Passo 3: Janela Anti-Passback e Duplicidade',
@@ -482,15 +481,13 @@ export const OutboxSyncView: React.FC = () => {
         ok: true,
         detail:
           hasMedical || hasGuardians
-            ? `Recuperadas ${
-                hasMedical
-                  ? `alertas médicos ("${student?.medical_notes}")`
-                  : ''
-              } ${
-                hasGuardians
-                  ? `e autorizações de terceiros (${student?.pickup_authorized_names || student?.guardian_name})`
-                  : ''
-              }.`
+            ? `Recuperadas ${hasMedical
+              ? `alertas médicos ("${student?.medical_notes}")`
+              : ''
+            } ${hasGuardians
+              ? `e autorizações de terceiros (${student?.pickup_authorized_names || student?.guardian_name})`
+              : ''
+            }.`
             : 'Nenhum alerta crítico médico ou de custódia associado.',
       },
     ];
@@ -500,8 +497,8 @@ export const OutboxSyncView: React.FC = () => {
       decision: res.allowed
         ? 'ACCESS_GRANTED'
         : isBlocked
-        ? 'ACCESS_BLOCKED'
-        : 'ANOMALY_DUPLICATE_SCAN',
+          ? 'ACCESS_BLOCKED'
+          : 'ANOMALY_DUPLICATE_SCAN',
       reason: res.message,
       latencyMs: latency,
       confidence: 0.999,
@@ -544,19 +541,18 @@ export const OutboxSyncView: React.FC = () => {
             <span className="text-neutral-500">Operador ativo:</span>
             <strong className="text-neutral-900">{currentOperator.name}</strong>
             <span
-              className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${
-                isAdmin
+              className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${isAdmin
                   ? 'bg-purple-50 text-purple-700 border border-purple-200'
                   : isCoordinator
-                  ? 'bg-amber-50 text-amber-700 border border-amber-200'
-                  : 'bg-neutral-100 text-neutral-700 border border-neutral-200'
-              }`}
+                    ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                    : 'bg-neutral-100 text-neutral-700 border border-neutral-200'
+                }`}
             >
               {isAdmin
                 ? 'Administrador'
                 : isCoordinator
-                ? 'Coordenação'
-                : 'Operador'}
+                  ? 'Coordenação'
+                  : 'Operador'}
             </span>
           </div>
 
@@ -570,11 +566,10 @@ export const OutboxSyncView: React.FC = () => {
                   : 'Simulação: Conexão desativada (Modo Offline Estrito).'
               );
             }}
-            className={`border px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs ${
-              isOnline
+            className={`border px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs ${isOnline
                 ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
                 : 'bg-neutral-100 border-neutral-300 text-neutral-600'
-            }`}
+              }`}
           >
             {isOnline ? (
               <>
@@ -618,11 +613,10 @@ export const OutboxSyncView: React.FC = () => {
       <div className="bg-neutral-100 p-1 rounded-xl inline-flex flex-wrap gap-1 border border-neutral-200 text-xs font-medium">
         <button
           onClick={() => setActivePersona('operador')}
-          className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors duration-150 cursor-pointer ${
-            activePersona === 'operador'
+          className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors duration-150 cursor-pointer ${activePersona === 'operador'
               ? 'bg-white text-neutral-900 border border-neutral-300 shadow-2xs font-semibold'
               : 'text-neutral-600 hover:text-neutral-900'
-          }`}
+            }`}
         >
           <Zap className="w-3.5 h-3.5 text-[#0f766e]" />
           <span>Operador de portaria</span>
@@ -630,11 +624,10 @@ export const OutboxSyncView: React.FC = () => {
 
         <button
           onClick={() => setActivePersona('hardware')}
-          className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors duration-150 cursor-pointer ${
-            activePersona === 'hardware'
+          className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors duration-150 cursor-pointer ${activePersona === 'hardware'
               ? 'bg-white text-neutral-900 border border-neutral-300 shadow-2xs font-semibold'
               : 'text-neutral-600 hover:text-neutral-900'
-          }`}
+            }`}
         >
           <Camera className="w-3.5 h-3.5 text-[#0f766e]" />
           <span>Hardware & Câmeras</span>
@@ -647,11 +640,10 @@ export const OutboxSyncView: React.FC = () => {
 
         <button
           onClick={() => setActivePersona('coordenacao')}
-          className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors duration-150 cursor-pointer ${
-            activePersona === 'coordenacao'
+          className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors duration-150 cursor-pointer ${activePersona === 'coordenacao'
               ? 'bg-white text-neutral-900 border border-neutral-300 shadow-2xs font-semibold'
               : 'text-neutral-600 hover:text-neutral-900'
-          }`}
+            }`}
         >
           <Sliders className="w-3.5 h-3.5 text-amber-600" />
           <span>Coordenação pedagógica</span>
@@ -665,11 +657,10 @@ export const OutboxSyncView: React.FC = () => {
         {/* TAB DE DESTAQUE DIDÁTICO: LAYA DECISION ENGINE */}
         <button
           onClick={() => setActivePersona('laya')}
-          className={`px-3.5 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors duration-150 cursor-pointer ${
-            activePersona === 'laya'
+          className={`px-3.5 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors duration-150 cursor-pointer ${activePersona === 'laya'
               ? 'bg-[#0f766e] text-white shadow-2xs font-semibold'
               : 'text-neutral-700 hover:text-neutral-900 bg-emerald-50/70 border border-emerald-200'
-          }`}
+            }`}
         >
           <Cpu className="w-3.5 h-3.5 text-emerald-400" />
           <span>Laya Decision Engine</span>
@@ -680,11 +671,10 @@ export const OutboxSyncView: React.FC = () => {
 
         <button
           onClick={() => setActivePersona('ti')}
-          className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors duration-150 cursor-pointer ${
-            activePersona === 'ti'
+          className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors duration-150 cursor-pointer ${activePersona === 'ti'
               ? 'bg-white text-neutral-900 border border-neutral-300 shadow-2xs font-semibold'
               : 'text-neutral-600 hover:text-neutral-900'
-          }`}
+            }`}
         >
           <HardDrive className="w-3.5 h-3.5 text-neutral-600" />
           <span>Administração TI & SQLite</span>
@@ -731,8 +721,8 @@ export const OutboxSyncView: React.FC = () => {
                   {hwConfig.cameraSourceType === 'usb_webrtc'
                     ? 'USB / UVC'
                     : hwConfig.cameraSourceType === 'ip_stream'
-                    ? 'Stream IP'
-                    : 'Desativada'}
+                      ? 'Stream IP'
+                      : 'Desativada'}
                 </span>
               </div>
               <h3
@@ -884,11 +874,10 @@ export const OutboxSyncView: React.FC = () => {
                     return (
                       <div
                         key={cam.deviceId}
-                        className={`p-3.5 rounded-xl border flex flex-col justify-between space-y-2 ${
-                          isPreferred
+                        className={`p-3.5 rounded-xl border flex flex-col justify-between space-y-2 ${isPreferred
                             ? 'border-[#0f766e] bg-[#0f766e]/5 ring-1 ring-[#0f766e]/30'
                             : 'border-neutral-200 bg-white hover:border-neutral-300'
-                        }`}
+                          }`}
                       >
                         <div className="flex items-start justify-between gap-2">
                           <div>
@@ -900,11 +889,10 @@ export const OutboxSyncView: React.FC = () => {
                             </div>
                           </div>
                           <span
-                            className={`px-2 py-0.5 rounded text-[10px] font-medium border ${
-                              cam.isExternal
+                            className={`px-2 py-0.5 rounded text-[10px] font-medium border ${cam.isExternal
                                 ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
                                 : 'bg-neutral-100 text-neutral-700 border-neutral-200'
-                            }`}
+                              }`}
                           >
                             {cam.isExternal ? 'USB Externa' : 'Integrada'}
                           </span>
@@ -922,13 +910,12 @@ export const OutboxSyncView: React.FC = () => {
                           <button
                             disabled={!isAdmin || isPreferred}
                             onClick={() => handleSelectDefaultCamera(cam)}
-                            className={`px-2.5 py-1 rounded text-xs font-medium cursor-pointer transition-colors ${
-                              isPreferred
+                            className={`px-2.5 py-1 rounded text-xs font-medium cursor-pointer transition-colors ${isPreferred
                                 ? 'bg-[#0f766e] text-white'
                                 : !isAdmin
-                                ? 'opacity-40 cursor-not-allowed bg-neutral-100 text-neutral-500'
-                                : 'bg-white border border-neutral-300 hover:bg-neutral-50 text-neutral-800'
-                            }`}
+                                  ? 'opacity-40 cursor-not-allowed bg-neutral-100 text-neutral-500'
+                                  : 'bg-white border border-neutral-300 hover:bg-neutral-50 text-neutral-800'
+                              }`}
                           >
                             {isPreferred ? 'Câmera Primária' : 'Definir como padrão'}
                           </button>
@@ -1276,17 +1263,15 @@ export const OutboxSyncView: React.FC = () => {
                 <div className="flex rounded-lg border border-neutral-300 p-0.5 text-xs bg-neutral-50">
                   <button
                     onClick={() => setSimEventType('entry')}
-                    className={`px-2 py-1 rounded text-xs font-medium cursor-pointer ${
-                      simEventType === 'entry' ? 'bg-[#0f766e] text-white' : 'text-neutral-600'
-                    }`}
+                    className={`px-2 py-1 rounded text-xs font-medium cursor-pointer ${simEventType === 'entry' ? 'bg-[#0f766e] text-white' : 'text-neutral-600'
+                      }`}
                   >
                     Entrada
                   </button>
                   <button
                     onClick={() => setSimEventType('exit')}
-                    className={`px-2 py-1 rounded text-xs font-medium cursor-pointer ${
-                      simEventType === 'exit' ? 'bg-[#0f766e] text-white' : 'text-neutral-600'
-                    }`}
+                    className={`px-2 py-1 rounded text-xs font-medium cursor-pointer ${simEventType === 'exit' ? 'bg-[#0f766e] text-white' : 'text-neutral-600'
+                      }`}
                   >
                     Saída
                   </button>
@@ -1309,11 +1294,10 @@ export const OutboxSyncView: React.FC = () => {
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-neutral-200">
                   <div className="flex items-center gap-3">
                     <span
-                      className={`px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider ${
-                        simResult.allowed
+                      className={`px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider ${simResult.allowed
                           ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
                           : 'bg-rose-100 text-rose-800 border border-rose-300'
-                      }`}
+                        }`}
                     >
                       {simResult.decision}
                     </span>
@@ -1346,11 +1330,10 @@ export const OutboxSyncView: React.FC = () => {
                     {simResult.steps.map((step, idx) => (
                       <div
                         key={idx}
-                        className={`p-2.5 rounded-lg border flex items-start gap-2 ${
-                          step.ok
+                        className={`p-2.5 rounded-lg border flex items-start gap-2 ${step.ok
                             ? 'bg-white border-neutral-200 text-neutral-800'
                             : 'bg-rose-50 border-rose-200 text-rose-900'
-                        }`}
+                          }`}
                       >
                         {step.ok ? (
                           <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
@@ -2031,11 +2014,10 @@ export const OutboxSyncView: React.FC = () => {
                           Resultado da Query:
                         </span>
                         <span
-                          className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold uppercase ${
-                            sqlResult.error
+                          className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold uppercase ${sqlResult.error
                               ? 'bg-rose-100 text-rose-800 border border-rose-200'
                               : 'bg-emerald-100 text-emerald-800 border border-emerald-200'
-                          }`}
+                            }`}
                         >
                           {sqlResult.commandType}
                         </span>

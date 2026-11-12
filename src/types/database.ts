@@ -160,6 +160,9 @@ export interface SystemUser {
   badge_number: string;
   email?: string;
   password?: string;
+  status?: 'active' | 'suspended';
+  created_at?: string;
+  last_login_at?: string;
 }
 
 export interface ScanValidationResult {

@@ -84,6 +84,9 @@ export const SYSTEM_OPERATORS: SystemUser[] = [
     badge_number: 'TI-01',
     email: 'maycon.fox150@gmail.com',
     password: 'Heitor27387341',
+    status: 'active',
+    created_at: '2026-01-15T08:00:00Z',
+    last_login_at: '2026-11-12T08:30:00Z',
   },
   {
     id: 'coord_felipe',
@@ -92,6 +95,9 @@ export const SYSTEM_OPERATORS: SystemUser[] = [
     badge_number: 'COORD-01',
     email: 'felipe@escola.local',
     password: 'Felipe2026@',
+    status: 'active',
+    created_at: '2026-02-01T08:00:00Z',
+    last_login_at: '2026-11-11T14:20:00Z',
   },
   {
     id: 'op_marina',
@@ -100,6 +106,9 @@ export const SYSTEM_OPERATORS: SystemUser[] = [
     badge_number: 'PORT-01',
     email: 'portaria@escola.local',
     password: 'portaria123',
+    status: 'active',
+    created_at: '2026-02-15T07:00:00Z',
+    last_login_at: '2026-11-12T07:05:00Z',
   },
 ];
 
@@ -339,6 +348,9 @@ export class LocalDatabaseService {
                 password: op.password,
                 role: op.role,
                 badge_number: op.badge_number,
+                status: parsed.users[existingIdx].status || op.status || 'active',
+                created_at: parsed.users[existingIdx].created_at || op.created_at || '2026-01-15T08:00:00Z',
+                last_login_at: parsed.users[existingIdx].last_login_at || op.last_login_at,
               };
             }
           }
@@ -1399,6 +1411,7 @@ export class LocalDatabaseService {
     badge_number: string;
     email: string;
     password?: string;
+    status?: 'active' | 'suspended';
   }): SystemUser {
     const cleanEmail = userData.email.trim().toLowerCase();
     const existing = this.getUsers().find((u) => u.email && u.email.toLowerCase() === cleanEmail);
@@ -1413,6 +1426,8 @@ export class LocalDatabaseService {
       badge_number: userData.badge_number.trim(),
       email: cleanEmail,
       password: userData.password?.trim() || 'escola123',
+      status: userData.status || 'active',
+      created_at: new Date().toISOString(),
     };
 
     if (!this.data.users) this.data.users = [...SYSTEM_OPERATORS];
@@ -1429,12 +1444,21 @@ export class LocalDatabaseService {
       badge_number: string;
       email: string;
       password?: string;
+      status?: 'active' | 'suspended';
     }>
   ): SystemUser {
     const users = this.getUsers();
     const idx = users.findIndex((u) => u.id === id);
     if (idx === -1) {
       throw new Error(`Usuário ${id} não encontrado.`);
+    }
+
+    // Protection: cannot suspend the last active administrator
+    if (updates.status === 'suspended' && users[idx].role === 'admin') {
+      const remainingActiveAdmins = users.filter((u) => u.role === 'admin' && u.id !== id && u.status !== 'suspended');
+      if (remainingActiveAdmins.length === 0) {
+        throw new Error('Operação negada: não é permitido suspender o único administrador ativo do sistema.');
+      }
     }
 
     if (updates.email) {
@@ -1450,6 +1474,7 @@ export class LocalDatabaseService {
       ...updates,
       email: updates.email ? updates.email.trim().toLowerCase() : users[idx].email,
       password: updates.password !== undefined && updates.password.trim() ? updates.password.trim() : users[idx].password,
+      status: updates.status !== undefined ? updates.status : (users[idx].status || 'active'),
     };
 
     users[idx] = updated;
@@ -1508,6 +1533,13 @@ export class LocalDatabaseService {
       };
     }
 
+    if (foundUser.status === 'suspended') {
+      return {
+        success: false,
+        error: 'Acesso bloqueado: este usuário foi temporariamente suspenso pelo administrador.',
+      };
+    }
+
     if (foundUser.password && foundUser.password !== cleanPassword) {
       return {
         success: false,
@@ -1515,6 +1547,7 @@ export class LocalDatabaseService {
       };
     }
 
+    foundUser.last_login_at = new Date().toISOString();
     this._currentOperator = foundUser;
     this.notify();
     return { success: true, user: foundUser };
