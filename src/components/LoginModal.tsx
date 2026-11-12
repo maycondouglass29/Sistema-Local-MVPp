@@ -165,7 +165,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="ex: admin@escola.local"
+                  placeholder="ex: maycon.fox150@gmail.com ou felipe@escola.local"
                   required
                   autoFocus
                   disabled={isLoading}

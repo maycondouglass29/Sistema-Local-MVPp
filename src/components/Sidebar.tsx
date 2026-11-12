@@ -272,7 +272,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </button>
             </div>
             <div className="space-y-1.5 pt-1">
-              {SYSTEM_OPERATORS.map((u) => {
+              {localDb.getUsers().map((u) => {
                 const isSelected = u.id === currentOperator.id;
                 return (
                   <button

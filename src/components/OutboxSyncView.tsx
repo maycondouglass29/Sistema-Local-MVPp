@@ -1596,7 +1596,7 @@ export const OutboxSyncView: React.FC = () => {
               <div className="pt-2">
                 <button
                   onClick={() => {
-                    const adminUser = SYSTEM_OPERATORS.find((u) => u.role === 'admin');
+                    const adminUser = localDb.getUsers().find((u) => u.role === 'admin');
                     if (adminUser) {
                       handleSwitchOperator(adminUser);
                     }
@@ -1604,7 +1604,7 @@ export const OutboxSyncView: React.FC = () => {
                   className="px-4 py-2 rounded-lg bg-[#0f766e] hover:bg-[#0d5f59] text-white text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer shadow-xs"
                 >
                   <Lock className="w-3.5 h-3.5" />
-                  <span>Conectar como Administrador (Rafael Andrade - TI)</span>
+                  <span>Conectar como Administrador ({localDb.getUsers().find((u) => u.role === 'admin')?.name || 'Maycon Douglas'})</span>
                 </button>
               </div>
             </div>
@@ -1697,7 +1697,9 @@ export const OutboxSyncView: React.FC = () => {
                             Administrador TI
                           </span>
                         </td>
-                        <td className="py-2.5 px-3">Rafael Andrade (TI-01)</td>
+                        <td className="py-2.5 px-3">
+                          {localDb.getUsers().find((u) => u.role === 'admin')?.name || 'Maycon Douglas (TI)'} ({localDb.getUsers().find((u) => u.role === 'admin')?.badge_number || 'TI-01'})
+                        </td>
                         <td className="py-2.5 px-3 text-[11px] text-neutral-600">
                           Acesso irrestrito a todas as páginas, relatórios, cadastros e auditoria completa.
                         </td>

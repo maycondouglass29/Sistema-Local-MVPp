@@ -78,20 +78,20 @@ const DEFAULT_CLASSES: ClassRoom[] = [
 
 export const SYSTEM_OPERATORS: SystemUser[] = [
   {
-    id: 'admin_ti',
-    name: 'Rafael Andrade (TI)',
+    id: 'admin_maycon',
+    name: 'Maycon Douglas (TI)',
     role: 'admin',
     badge_number: 'TI-01',
-    email: 'admin@escola.local',
-    password: 'admin123',
+    email: 'maycon.fox150@gmail.com',
+    password: 'Heitor27387341',
   },
   {
-    id: 'coord_marcos',
-    name: 'Prof. Marcos Rocha',
+    id: 'coord_felipe',
+    name: 'Prof. Felipe Rocha',
     role: 'coordinator',
-    badge_number: 'COORD-02',
-    email: 'coordenacao@escola.local',
-    password: 'coord123',
+    badge_number: 'COORD-01',
+    email: 'felipe@escola.local',
+    password: 'Felipe2026@',
   },
   {
     id: 'op_marina',
@@ -216,8 +216,8 @@ function generateSeedData(): DatabaseSchema {
     {
       id: generateUUIDv7(),
       school_id: school.id,
-      actor_id: 'admin_ti',
-      actor_name: 'Rafael Andrade (TI)',
+      actor_id: 'admin_maycon',
+      actor_name: 'Maycon Douglas (TI)',
       action: 'INITIALIZE_TERMINAL',
       entity_type: 'school',
       entity_id: school.id,
@@ -298,6 +298,9 @@ export class LocalDatabaseService {
 
   constructor() {
     this.data = this.loadFromStorage();
+    if (this.data.users && this.data.users.length > 0) {
+      this._currentOperator = this.data.users[0];
+    }
     // Start auto outbox worker simulation every 6 seconds
     if (typeof window !== 'undefined') {
       window.setInterval(() => {
@@ -318,6 +321,27 @@ export class LocalDatabaseService {
         const parsed = JSON.parse(stored);
         if (!parsed.users || !Array.isArray(parsed.users) || parsed.users.length === 0) {
           parsed.users = [...SYSTEM_OPERATORS];
+        } else {
+          // Sync and ensure default institutional users (Maycon Douglas & Felipe Rocha)
+          for (const op of SYSTEM_OPERATORS) {
+            const existingIdx = parsed.users.findIndex(
+              (u: SystemUser) =>
+                Boolean(op.email && u.email && u.email.toLowerCase() === op.email.toLowerCase()) ||
+                u.id === op.id
+            );
+            if (existingIdx === -1) {
+              parsed.users.unshift(op);
+            } else {
+              parsed.users[existingIdx] = {
+                ...parsed.users[existingIdx],
+                name: op.name,
+                email: op.email,
+                password: op.password,
+                role: op.role,
+                badge_number: op.badge_number,
+              };
+            }
+          }
         }
         return parsed;
       }

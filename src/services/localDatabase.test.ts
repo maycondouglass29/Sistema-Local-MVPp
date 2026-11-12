@@ -188,22 +188,29 @@ test('LocalDatabaseService executes SQL console queries with real-time feedback'
 test('LocalDatabaseService executes user RBAC CRUD and password authentication', () => {
   const db = new LocalDatabaseService();
 
-  // 1. Authenticate with seeded user
-  const authSuccess = db.authenticate('admin@escola.local', 'admin123');
-  assert.equal(authSuccess.success, true);
-  assert.equal(authSuccess.user?.role, 'admin');
+  // 1. Authenticate with seeded Maycon Douglas (Admin)
+  const authMaycon = db.authenticate('maycon.fox150@gmail.com', 'Heitor27387341');
+  assert.equal(authMaycon.success, true);
+  assert.equal(authMaycon.user?.role, 'admin');
+  assert.equal(authMaycon.user?.name, 'Maycon Douglas (TI)');
 
-  // 2. Reject invalid password
-  const authWrongPass = db.authenticate('admin@escola.local', 'senhaerrada');
+  // 2. Authenticate with seeded Felipe Rocha (Coordinator)
+  const authFelipe = db.authenticate('felipe@escola.local', 'Felipe2026@');
+  assert.equal(authFelipe.success, true);
+  assert.equal(authFelipe.user?.role, 'coordinator');
+  assert.equal(authFelipe.user?.name, 'Prof. Felipe Rocha');
+
+  // 3. Reject invalid password
+  const authWrongPass = db.authenticate('maycon.fox150@gmail.com', 'senhaerrada');
   assert.equal(authWrongPass.success, false);
   assert.ok(authWrongPass.error?.includes('Senha incorreta'));
 
-  // 3. Reject non-existent user
+  // 4. Reject non-existent user
   const authNotFound = db.authenticate('naocadastrado@escola.local', '1234');
   assert.equal(authNotFound.success, false);
   assert.ok(authNotFound.error?.includes('não cadastrado'));
 
-  // 4. Create new user
+  // 5. Create new user
   const newUser = db.addUser({
     name: 'Operador Teste',
     email: 'novo.operador@escola.local',
@@ -214,19 +221,19 @@ test('LocalDatabaseService executes user RBAC CRUD and password authentication',
   assert.ok(newUser.id);
   assert.equal(newUser.email, 'novo.operador@escola.local');
 
-  // 5. Authenticate with newly created user
+  // 6. Authenticate with newly created user
   const authNew = db.authenticate('novo.operador@escola.local', 'senha_forte_123');
   assert.equal(authNew.success, true);
   assert.equal(authNew.user?.name, 'Operador Teste');
 
-  // 6. Update user
+  // 7. Update user
   const updatedUser = db.updateUser(newUser.id, {
     name: 'Operador Teste Atualizado',
     badge_number: 'PORT-99-B',
   });
   assert.equal(updatedUser.name, 'Operador Teste Atualizado');
 
-  // 7. Delete user
+  // 8. Delete user
   db.deleteUser(newUser.id);
   const afterDelete = db.authenticate('novo.operador@escola.local', 'senha_forte_123');
   assert.equal(afterDelete.success, false);
