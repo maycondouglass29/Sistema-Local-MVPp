@@ -5,29 +5,25 @@
 
 import React, { useState } from 'react';
 import {
-  ShieldCheck,
-  User,
-  KeyRound,
+  Lock,
+  Mail,
   Eye,
   EyeOff,
-  Sparkles,
-  ArrowRight,
-  CheckCircle2,
-  Lock,
-  DoorOpen,
-  GraduationCap,
-  HardDrive,
   AlertCircle,
+  CheckCircle2,
   X,
+  Building2,
+  Shield,
+  ArrowRight,
 } from 'lucide-react';
-import { SYSTEM_OPERATORS, localDb } from '../services/localDatabase';
+import { localDb } from '../services/localDatabase';
 import { SystemUser } from '../types/database';
 
 interface LoginModalProps {
   isOpen: boolean;
   onClose?: () => void;
   canDismiss?: boolean;
-  /** When true, renders as a full-screen auth gate instead of a floating modal */
+  /** When true, renders as full-screen institutional gate blocking the dashboard */
   isGate?: boolean;
 }
 
@@ -37,271 +33,210 @@ export const LoginModal: React.FC<LoginModalProps> = ({
   canDismiss = true,
   isGate = false,
 }) => {
-  const [email, setEmail] = useState<string>('admin@escola.local');
-  const [password, setPassword] = useState<string>('admin123');
+  const [email, setEmail] = useState<string>('');
+  const [password, setPassword] = useState<string>('');
   const [showPassword, setShowPassword] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successNotice, setSuccessNotice] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState<boolean>(false);
 
   if (!isOpen) return null;
 
-  const handleLoginSubmit = (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
+  const school = localDb.getSchool();
+
+  const handleLoginSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
     setErrorMessage(null);
+    setIsLoading(true);
 
-    const targetUser = SYSTEM_OPERATORS.find(
-      (u) =>
-        (u.email && u.email.toLowerCase() === email.trim().toLowerCase()) ||
-        u.id.toLowerCase() === email.trim().toLowerCase()
-    );
+    const result = localDb.authenticate(email, password);
 
-    if (!targetUser) {
-      setErrorMessage('Usuário não encontrado. Use uma das credenciais de teste abaixo.');
+    if (!result.success || !result.user) {
+      setIsLoading(false);
+      setErrorMessage(result.error || 'Credenciais inválidas. Verifique seu e-mail e senha.');
       return;
     }
 
-    if (targetUser.password && targetUser.password !== password.trim()) {
-      setErrorMessage('Senha incorreta para este usuário de teste.');
-      return;
-    }
-
-    // Authenticate
-    localDb.currentOperator = targetUser;
-    setSuccessNotice(`Autenticado com sucesso como ${targetUser.name} (${targetUser.role.toUpperCase()})`);
+    const authenticatedUser: SystemUser = result.user;
+    setSuccessNotice(`Sessão autorizada: ${authenticatedUser.name}`);
 
     setTimeout(() => {
+      setIsLoading(false);
       setSuccessNotice(null);
       if (onClose) onClose();
-    }, 450);
+    }, 350);
   };
 
-  const handleQuickLogin = (user: SystemUser) => {
-    setEmail(user.email || '');
-    setPassword(user.password || '');
-    setErrorMessage(null);
-
-    localDb.currentOperator = user;
-    setSuccessNotice(`Sessão iniciada como ${user.name} (${user.role.toUpperCase()})`);
-
-    setTimeout(() => {
-      setSuccessNotice(null);
-      if (onClose) onClose();
-    }, 400);
-  };
-
-  // ── Gate mode: full-screen auth wall ──────────────────────────
   const wrapperCls = isGate
-    ? 'fixed inset-0 z-50 flex items-center justify-center bg-[#0d1f24] p-4 min-h-screen select-none'
-    : 'fixed inset-0 bg-neutral-950/70 backdrop-blur-sm z-50 flex items-center justify-center p-4';
+    ? 'fixed inset-0 z-50 flex items-center justify-center bg-[#142024] p-4 min-h-screen select-none'
+    : 'fixed inset-0 bg-neutral-950/70 backdrop-blur-xs z-50 flex items-center justify-center p-4';
 
-  const cardCls = isGate
-    ? 'relative bg-white rounded-2xl border border-neutral-200 w-full max-w-md shadow-2xl overflow-hidden z-10 animate-in fade-in zoom-in-95 duration-200'
-    : 'bg-white rounded-2xl border border-neutral-200 max-w-md w-full shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-200';
+  const cardCls =
+    'relative bg-white rounded-xl border border-neutral-200/90 w-full max-w-md shadow-xl overflow-hidden z-10 transition-all';
 
   return (
     <div className={wrapperCls}>
-      {/* Background decorations for gate mode */}
+      {/* Subtle institutional backdrop lines for gate mode */}
       {isGate && (
-        <div className="pointer-events-none absolute inset-0 overflow-hidden">
-          <div className="absolute -top-32 -left-32 w-96 h-96 bg-[#0f766e]/20 rounded-full blur-3xl" />
-          <div className="absolute -bottom-32 -right-32 w-96 h-96 bg-[#0f766e]/15 rounded-full blur-3xl" />
-          <div className="absolute top-1/4 right-1/4 w-64 h-64 bg-teal-900/20 rounded-full blur-2xl" />
-          <div className="absolute bottom-6 left-1/2 -translate-x-1/2 text-center text-[11px] text-neutral-400 font-mono select-none">
-            Escola Horizonte &bull; Portaria Local-First &bull; MVP Demo &bull; Vercel
-          </div>
-        </div>
+        <div
+          className="pointer-events-none absolute inset-0 opacity-[0.04]"
+          style={{
+            backgroundImage:
+              'radial-gradient(#ffffff 1px, transparent 1px), radial-gradient(#ffffff 1px, #142024 1px)',
+            backgroundSize: '32px 32px',
+            backgroundPosition: '0 0, 16px 16px',
+          }}
+        />
       )}
+
       <div className={cardCls}>
         {/* Institutional Header */}
-        <div className="bg-gradient-to-r from-neutral-900 to-[#14282e] p-6 text-white relative">
+        <div className="bg-[#0f171a] px-6 py-5 text-white border-b border-[#1f2d32] relative">
           {canDismiss && onClose && (
             <button
+              type="button"
               onClick={onClose}
-              className="absolute top-4 right-4 text-neutral-400 hover:text-white p-1 rounded-lg cursor-pointer transition-colors"
+              className="absolute top-4 right-4 text-neutral-400 hover:text-white p-1 rounded-md cursor-pointer transition-colors"
               title="Fechar"
+              aria-label="Fechar janela de login"
             >
               <X className="w-4 h-4" />
             </button>
           )}
 
-          <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-[11px] font-mono font-medium mb-3">
-            <Sparkles className="w-3 h-3 text-emerald-400" />
-            <span>Ambiente Virtual de Demonstração &bull; Vercel MVP</span>
-          </div>
-
-          <h2 className="text-xl font-bold tracking-tight text-white flex items-center gap-2">
-            <span>Escola Horizonte</span>
-          </h2>
-          <p className="text-xs text-neutral-300 mt-1">
-            Sistema Local-First de Portaria Escolar e Emissão de Carteirinhas
-          </p>
-        </div>
-
-        <div className="p-6 space-y-5">
-          {/* 1-Click Quick Demo Access Card */}
-          <div className="space-y-2">
-            <span className="text-[11px] font-semibold uppercase tracking-wider text-neutral-500 block">
-              Acesso Rápido de Demonstração (1 Clique):
-            </span>
-            <div className="grid grid-cols-1 gap-2">
-              {/* Profile 1: Admin */}
-              <button
-                type="button"
-                onClick={() =>
-                  handleQuickLogin(SYSTEM_OPERATORS.find((u) => u.role === 'admin')!)
-                }
-                className="p-2.5 rounded-xl border border-purple-200 bg-purple-50/60 hover:bg-purple-100/80 transition-colors flex items-center justify-between text-left cursor-pointer group"
-              >
-                <div className="flex items-center gap-2.5">
-                  <div className="w-8 h-8 rounded-lg bg-purple-600 text-white flex items-center justify-center font-bold text-xs shrink-0 shadow-xs">
-                    TI
-                  </div>
-                  <div>
-                    <div className="text-xs font-semibold text-neutral-900 flex items-center gap-1.5">
-                      <span>Rafael Andrade (TI)</span>
-                      <span className="text-[10px] bg-purple-200 text-purple-900 font-mono px-1.5 py-0.2 rounded font-bold">
-                        ADMIN
-                      </span>
-                    </div>
-                    <div className="text-[11px] text-neutral-500 font-mono">
-                      admin@escola.local &bull; admin123
-                    </div>
-                  </div>
-                </div>
-                <ArrowRight className="w-4 h-4 text-purple-700 opacity-60 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all" />
-              </button>
-
-              {/* Profile 2: Coordinator */}
-              <button
-                type="button"
-                onClick={() =>
-                  handleQuickLogin(SYSTEM_OPERATORS.find((u) => u.role === 'coordinator')!)
-                }
-                className="p-2.5 rounded-xl border border-amber-200 bg-amber-50/60 hover:bg-amber-100/80 transition-colors flex items-center justify-between text-left cursor-pointer group"
-              >
-                <div className="flex items-center gap-2.5">
-                  <div className="w-8 h-8 rounded-lg bg-amber-600 text-white flex items-center justify-center font-bold text-xs shrink-0 shadow-xs">
-                    CP
-                  </div>
-                  <div>
-                    <div className="text-xs font-semibold text-neutral-900 flex items-center gap-1.5">
-                      <span>Prof. Marcos Rocha</span>
-                      <span className="text-[10px] bg-amber-200 text-amber-900 font-mono px-1.5 py-0.2 rounded font-bold">
-                        COORD
-                      </span>
-                    </div>
-                    <div className="text-[11px] text-neutral-500 font-mono">
-                      coordenacao@escola.local &bull; coord123
-                    </div>
-                  </div>
-                </div>
-                <ArrowRight className="w-4 h-4 text-amber-700 opacity-60 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all" />
-              </button>
-
-              {/* Profile 3: Operator */}
-              <button
-                type="button"
-                onClick={() =>
-                  handleQuickLogin(SYSTEM_OPERATORS.find((u) => u.role === 'operator')!)
-                }
-                className="p-2.5 rounded-xl border border-emerald-200 bg-emerald-50/60 hover:bg-emerald-100/80 transition-colors flex items-center justify-between text-left cursor-pointer group"
-              >
-                <div className="flex items-center gap-2.5">
-                  <div className="w-8 h-8 rounded-lg bg-emerald-600 text-white flex items-center justify-center font-bold text-xs shrink-0 shadow-xs">
-                    OP
-                  </div>
-                  <div>
-                    <div className="text-xs font-semibold text-neutral-900 flex items-center gap-1.5">
-                      <span>Marina Azevedo</span>
-                      <span className="text-[10px] bg-emerald-200 text-emerald-900 font-mono px-1.5 py-0.2 rounded font-bold">
-                        PORTARIA
-                      </span>
-                    </div>
-                    <div className="text-[11px] text-neutral-500 font-mono">
-                      portaria@escola.local &bull; portaria123
-                    </div>
-                  </div>
-                </div>
-                <ArrowRight className="w-4 h-4 text-emerald-700 opacity-60 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all" />
-              </button>
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-lg bg-[#0f766e] text-white flex items-center justify-center shrink-0 border border-teal-500/30 shadow-xs">
+              <Building2 className="w-5 h-5 text-teal-50" />
+            </div>
+            <div>
+              <h2 className="text-base font-semibold tracking-tight text-white leading-tight">
+                {school.name || 'Escola Horizonte'}
+              </h2>
+              <p className="text-[11px] text-neutral-400 mt-0.5 font-medium">
+                Controle de Portaria &bull; Sistema Local-First
+              </p>
             </div>
           </div>
+        </div>
 
-          <div className="relative flex py-1 items-center">
-            <div className="flex-grow border-t border-neutral-200" />
-            <span className="shrink-0 mx-3 text-[10px] font-mono text-neutral-400 uppercase">
-              Ou digite manualmente
-            </span>
-            <div className="flex-grow border-t border-neutral-200" />
+        {/* Login Form Body */}
+        <div className="p-6">
+          <div className="mb-5">
+            <h3 className="text-sm font-semibold text-neutral-900 tracking-tight">
+              Acesso ao Sistema
+            </h3>
+            <p className="text-xs text-neutral-500 mt-0.5">
+              Informe seu e-mail institucional e senha previamente cadastrados.
+            </p>
           </div>
 
-          {/* Manual Form */}
-          <form onSubmit={handleLoginSubmit} className="space-y-3.5">
+          <form onSubmit={handleLoginSubmit} className="space-y-4">
             {errorMessage && (
-              <div className="p-2.5 rounded-lg bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-center gap-2">
-                <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
-                <span>{errorMessage}</span>
+              <div
+                role="alert"
+                className="p-3 rounded-lg bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-start gap-2.5 animate-in fade-in duration-150"
+              >
+                <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                <span className="leading-relaxed">{errorMessage}</span>
               </div>
             )}
 
             {successNotice && (
-              <div className="p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center gap-2">
+              <div
+                role="status"
+                className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center gap-2 animate-in fade-in duration-150"
+              >
                 <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                <span>{successNotice}</span>
+                <span className="font-medium">{successNotice}</span>
               </div>
             )}
 
-            <div className="space-y-1">
-              <label className="block text-xs font-medium text-neutral-700">
-                Email institucional ou identificador:
+            {/* Email Field */}
+            <div className="space-y-1.5">
+              <label
+                htmlFor="user-email"
+                className="block text-xs font-medium text-neutral-700"
+              >
+                E-mail institucional
               </label>
               <div className="relative">
                 <input
-                  type="text"
+                  id="user-email"
+                  type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   placeholder="ex: admin@escola.local"
                   required
-                  className="w-full bg-white border border-neutral-300 rounded-lg px-3 py-2 text-xs text-neutral-900 focus:outline-none focus:border-[#0f766e] focus:ring-1 focus:ring-[#0f766e]"
+                  autoFocus
+                  disabled={isLoading}
+                  autoComplete="username"
+                  className="w-full bg-white border border-neutral-300 rounded-lg pl-9 pr-3 py-2 text-xs text-neutral-900 placeholder:text-neutral-400 focus:outline-none focus:border-[#0f766e] focus:ring-1 focus:ring-[#0f766e] transition-colors disabled:bg-neutral-50"
                 />
+                <Mail className="w-4 h-4 text-neutral-400 absolute left-3 top-2.5 pointer-events-none" />
               </div>
             </div>
 
-            <div className="space-y-1">
-              <label className="block text-xs font-medium text-neutral-700">
-                Senha de acesso:
-              </label>
+            {/* Password Field */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <label
+                  htmlFor="user-password"
+                  className="block text-xs font-medium text-neutral-700"
+                >
+                  Senha de acesso
+                </label>
+              </div>
               <div className="relative">
                 <input
+                  id="user-password"
                   type={showPassword ? 'text' : 'password'}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="••••••••"
                   required
-                  className="w-full bg-white border border-neutral-300 rounded-lg pl-3 pr-9 py-2 text-xs text-neutral-900 focus:outline-none focus:border-[#0f766e] focus:ring-1 focus:ring-[#0f766e]"
+                  disabled={isLoading}
+                  autoComplete="current-password"
+                  className="w-full bg-white border border-neutral-300 rounded-lg pl-9 pr-9 py-2 text-xs text-neutral-900 placeholder:text-neutral-400 focus:outline-none focus:border-[#0f766e] focus:ring-1 focus:ring-[#0f766e] transition-colors disabled:bg-neutral-50"
                 />
+                <Lock className="w-4 h-4 text-neutral-400 absolute left-3 top-2.5 pointer-events-none" />
                 <button
                   type="button"
                   onClick={() => setShowPassword(!showPassword)}
-                  className="absolute right-2.5 top-2 text-neutral-400 hover:text-neutral-700 cursor-pointer"
+                  tabIndex={-1}
+                  className="absolute right-2.5 top-2 text-neutral-400 hover:text-neutral-600 p-0.5 rounded cursor-pointer transition-colors"
+                  aria-label={showPassword ? 'Ocultar senha' : 'Exibir senha'}
                 >
-                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  {showPassword ? (
+                    <EyeOff className="w-3.5 h-3.5" />
+                  ) : (
+                    <Eye className="w-3.5 h-3.5" />
+                  )}
                 </button>
               </div>
             </div>
 
+            {/* Submit Button */}
             <button
               type="submit"
-              className="w-full bg-[#0f766e] hover:bg-[#0d5f59] text-white text-xs font-semibold py-2.5 rounded-lg transition-colors cursor-pointer shadow-xs flex items-center justify-center gap-1.5 mt-2"
+              disabled={isLoading}
+              className="w-full bg-[#0f766e] hover:bg-[#0d5f59] active:bg-[#0b4e49] text-white text-xs font-semibold py-2.5 rounded-lg transition-colors cursor-pointer shadow-xs flex items-center justify-center gap-2 mt-3 disabled:opacity-70 disabled:cursor-not-allowed"
             >
-              <Lock className="w-3.5 h-3.5" />
-              <span>Entrar no Sistema</span>
+              {isLoading ? (
+                <span>Validando acesso...</span>
+              ) : (
+                <>
+                  <Shield className="w-3.5 h-3.5" />
+                  <span>Entrar no Sistema</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </>
+              )}
             </button>
           </form>
 
-          {/* Footer note */}
-          <div className="pt-2 text-center text-[11px] text-neutral-400">
-            Escola Horizonte &bull; Modo Local-First &bull; SQLite WAL &bull; Laya Engine
+          {/* Institutional Security Notice */}
+          <div className="mt-5 pt-4 border-t border-neutral-100 flex items-center justify-between text-[11px] text-neutral-400">
+            <span>Terminal Local-First</span>
+            <span className="font-mono text-neutral-400">SQLite WAL &bull; RBAC</span>
           </div>
         </div>
       </div>

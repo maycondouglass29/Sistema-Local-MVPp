@@ -184,3 +184,50 @@ test('LocalDatabaseService executes SQL console queries with real-time feedback'
   assert.equal(resInvalid.commandType, 'ERROR');
   assert.ok(resInvalid.error);
 });
+
+test('LocalDatabaseService executes user RBAC CRUD and password authentication', () => {
+  const db = new LocalDatabaseService();
+
+  // 1. Authenticate with seeded user
+  const authSuccess = db.authenticate('admin@escola.local', 'admin123');
+  assert.equal(authSuccess.success, true);
+  assert.equal(authSuccess.user?.role, 'admin');
+
+  // 2. Reject invalid password
+  const authWrongPass = db.authenticate('admin@escola.local', 'senhaerrada');
+  assert.equal(authWrongPass.success, false);
+  assert.ok(authWrongPass.error?.includes('Senha incorreta'));
+
+  // 3. Reject non-existent user
+  const authNotFound = db.authenticate('naocadastrado@escola.local', '1234');
+  assert.equal(authNotFound.success, false);
+  assert.ok(authNotFound.error?.includes('não cadastrado'));
+
+  // 4. Create new user
+  const newUser = db.addUser({
+    name: 'Operador Teste',
+    email: 'novo.operador@escola.local',
+    password: 'senha_forte_123',
+    badge_number: 'PORT-99',
+    role: 'operator',
+  });
+  assert.ok(newUser.id);
+  assert.equal(newUser.email, 'novo.operador@escola.local');
+
+  // 5. Authenticate with newly created user
+  const authNew = db.authenticate('novo.operador@escola.local', 'senha_forte_123');
+  assert.equal(authNew.success, true);
+  assert.equal(authNew.user?.name, 'Operador Teste');
+
+  // 6. Update user
+  const updatedUser = db.updateUser(newUser.id, {
+    name: 'Operador Teste Atualizado',
+    badge_number: 'PORT-99-B',
+  });
+  assert.equal(updatedUser.name, 'Operador Teste Atualizado');
+
+  // 7. Delete user
+  db.deleteUser(newUser.id);
+  const afterDelete = db.authenticate('novo.operador@escola.local', 'senha_forte_123');
+  assert.equal(afterDelete.success, false);
+});

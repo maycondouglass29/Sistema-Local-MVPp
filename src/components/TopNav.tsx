@@ -32,7 +32,7 @@ export const TopNav: React.FC<TopNavProps> = ({ currentTabTitle, onOpenTour, onO
   const formattedDate = `${day} de ${monthShort}.`;
 
   const handleRoleChange = (userId: string) => {
-    const op = SYSTEM_OPERATORS.find((u) => u.id === userId);
+    const op = localDb.getUsers().find((u) => u.id === userId);
     if (op) {
       localDb.currentOperator = op;
       setCurrentOperator(op);
@@ -61,14 +61,14 @@ export const TopNav: React.FC<TopNavProps> = ({ currentTabTitle, onOpenTour, onO
           <span className="hidden sm:inline">Ajuda</span>
         </button>
 
-        {/* Login Modal & MVP Demo Access */}
+        {/* Change User / Auth Modal */}
         <button
           onClick={onOpenLogin}
-          className="text-[#0f766e] bg-emerald-50 hover:bg-emerald-100 border border-emerald-200/80 px-2.5 py-1 rounded-md transition-colors duration-150 cursor-pointer flex items-center gap-1.5 text-xs font-semibold"
-          title="Abrir tela de login e credenciais de teste MVP na Vercel"
+          className="text-[#0f766e] bg-teal-50 hover:bg-teal-100/80 border border-teal-200/80 px-2.5 py-1 rounded-md transition-colors duration-150 cursor-pointer flex items-center gap-1.5 text-xs font-medium"
+          title="Autenticar como outro usuário cadastrado"
         >
           <Lock className="w-3.5 h-3.5 text-[#0f766e]" />
-          <span>Login / MVP</span>
+          <span>Trocar Usuário</span>
         </button>
 
         <div className="h-4 w-px bg-neutral-200" />
@@ -82,13 +82,9 @@ export const TopNav: React.FC<TopNavProps> = ({ currentTabTitle, onOpenTour, onO
             onChange={(e) => handleRoleChange(e.target.value)}
             className="bg-transparent text-xs font-medium text-neutral-800 focus:outline-none cursor-pointer pr-4 appearance-none"
           >
-            {SYSTEM_OPERATORS.map((u) => (
+            {localDb.getUsers().map((u) => (
               <option key={u.id} value={u.id}>
-                {u.role === 'admin'
-                  ? 'Administrador'
-                  : u.role === 'coordinator'
-                  ? 'Coordenação'
-                  : 'Operador'}
+                {u.name} ({u.role === 'admin' ? 'Admin' : u.role === 'coordinator' ? 'Coord' : 'Portaria'})
               </option>
             ))}
           </select>

@@ -10,6 +10,7 @@ import {
   EventType,
   EventSource,
   SystemUser,
+  UserRole,
   Guardian,
   SystemTechnicalSettings,
 } from '../types/database';
@@ -37,6 +38,7 @@ interface DatabaseSchema {
   client_sequence: number;
   sync_version: number;
   system_settings?: SystemTechnicalSettings;
+  users?: SystemUser[];
 }
 
 const DEFAULT_SCHOOL: School = {
@@ -271,6 +273,8 @@ function generateSeedData(): DatabaseSchema {
     audit_logs,
     client_sequence: 4,
     sync_version: 1,
+    system_settings: { ...DEFAULT_SYSTEM_SETTINGS },
+    users: [...SYSTEM_OPERATORS],
   };
 }
 
@@ -311,7 +315,11 @@ export class LocalDatabaseService {
     try {
       const stored = localStorage.getItem(STORAGE_KEY);
       if (stored) {
-        return JSON.parse(stored);
+        const parsed = JSON.parse(stored);
+        if (!parsed.users || !Array.isArray(parsed.users) || parsed.users.length === 0) {
+          parsed.users = [...SYSTEM_OPERATORS];
+        }
+        return parsed;
       }
     } catch {
       // fallback to seed
@@ -1266,10 +1274,19 @@ export class LocalDatabaseService {
         } else if (lower.includes('from school')) {
           targetTable = 'school';
           dataset = [this.data.school];
+        } else if (lower.includes('from users') || lower.includes('from user')) {
+          targetTable = 'users';
+          dataset = this.getUsers().map((u) => ({
+            id: u.id,
+            name: u.name,
+            role: u.role,
+            badge_number: u.badge_number,
+            email: u.email,
+          }));
         }
 
         if (!targetTable) {
-          throw new Error('Tabela não reconhecida. Tabelas suportadas: students, classrooms, guardians, attendance_events, outbox, school.');
+          throw new Error('Tabela não reconhecida. Tabelas suportadas: students, classrooms, guardians, attendance_events, outbox, school, users.');
         }
 
         // Group By
@@ -1342,6 +1359,141 @@ export class LocalDatabaseService {
         commandType: 'ERROR',
       };
     }
+  }
+
+  // --- USERS MANAGEMENT & AUTH (RBAC) ---
+  public getUsers(): SystemUser[] {
+    if (!this.data.users || !Array.isArray(this.data.users) || this.data.users.length === 0) {
+      this.data.users = [...SYSTEM_OPERATORS];
+    }
+    return this.data.users;
+  }
+
+  public addUser(userData: {
+    name: string;
+    role: UserRole;
+    badge_number: string;
+    email: string;
+    password?: string;
+  }): SystemUser {
+    const cleanEmail = userData.email.trim().toLowerCase();
+    const existing = this.getUsers().find((u) => u.email && u.email.toLowerCase() === cleanEmail);
+    if (existing) {
+      throw new Error(`Já existe um usuário cadastrado com o e-mail "${userData.email}".`);
+    }
+
+    const newUser: SystemUser = {
+      id: `usr_${generateUUIDv7().slice(0, 8)}`,
+      name: userData.name.trim(),
+      role: userData.role,
+      badge_number: userData.badge_number.trim(),
+      email: cleanEmail,
+      password: userData.password?.trim() || 'escola123',
+    };
+
+    if (!this.data.users) this.data.users = [...SYSTEM_OPERATORS];
+    this.data.users.push(newUser);
+    this.notify();
+    return newUser;
+  }
+
+  public updateUser(
+    id: string,
+    updates: Partial<{
+      name: string;
+      role: UserRole;
+      badge_number: string;
+      email: string;
+      password?: string;
+    }>
+  ): SystemUser {
+    const users = this.getUsers();
+    const idx = users.findIndex((u) => u.id === id);
+    if (idx === -1) {
+      throw new Error(`Usuário ${id} não encontrado.`);
+    }
+
+    if (updates.email) {
+      const cleanEmail = updates.email.trim().toLowerCase();
+      const duplicate = users.find((u) => u.id !== id && u.email && u.email.toLowerCase() === cleanEmail);
+      if (duplicate) {
+        throw new Error(`O e-mail "${updates.email}" já está em uso por outro usuário.`);
+      }
+    }
+
+    const updated: SystemUser = {
+      ...users[idx],
+      ...updates,
+      email: updates.email ? updates.email.trim().toLowerCase() : users[idx].email,
+      password: updates.password !== undefined && updates.password.trim() ? updates.password.trim() : users[idx].password,
+    };
+
+    users[idx] = updated;
+    this.data.users = users;
+
+    if (this._currentOperator.id === id) {
+      this._currentOperator = updated;
+    }
+
+    this.notify();
+    return updated;
+  }
+
+  public deleteUser(id: string): void {
+    const users = this.getUsers();
+    const target = users.find((u) => u.id === id);
+    if (!target) return;
+
+    if (target.role === 'admin') {
+      const remainingAdmins = users.filter((u) => u.role === 'admin' && u.id !== id);
+      if (remainingAdmins.length === 0) {
+        throw new Error('Operação negada: não é permitido excluir o único administrador do sistema.');
+      }
+    }
+
+    this.data.users = users.filter((u) => u.id !== id);
+    if (this._currentOperator.id === id) {
+      this._currentOperator = this.data.users[0] || SYSTEM_OPERATORS[0];
+    }
+    this.notify();
+  }
+
+  public authenticate(email: string, password: string): { success: boolean; user?: SystemUser; error?: string } {
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanPassword = password.trim();
+
+    if (!cleanEmail) {
+      return { success: false, error: 'Informe o e-mail institucional do usuário cadastrado.' };
+    }
+    if (!cleanPassword) {
+      return { success: false, error: 'Informe a senha de acesso.' };
+    }
+
+    const users = this.getUsers();
+    const foundUser = users.find(
+      (u) =>
+        (u.email && u.email.toLowerCase() === cleanEmail) ||
+        u.id.toLowerCase() === cleanEmail ||
+        u.badge_number.toLowerCase() === cleanEmail
+    );
+
+    if (!foundUser) {
+      return {
+        success: false,
+        error: 'Usuário não cadastrado. Apenas operadores e coordenadores previamente registrados no sistema podem acessar.',
+      };
+    }
+
+    if (foundUser.password && foundUser.password !== cleanPassword) {
+      return {
+        success: false,
+        error: 'Senha incorreta. Verifique os caracteres e tente novamente.',
+      };
+    }
+
+    this._currentOperator = foundUser;
+    this.notify();
+    return { success: true, user: foundUser };
   }
 
   public exportDatabaseJson(): string {
